@@ -1,0 +1,34 @@
+{
+  "name": "github-cx",
+  "version": "1.0.0",
+  "description": "Account segmentation model for customer experience leadership.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bryanrossello-collab/github_cx.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/bryanrossello-collab/github_cx/issues"
+  },
+  "homepage": "https://github.com/bryanrossello-collab/github_cx#readme",
+  "dependencies": {
+    "lucide-react": "^1.14.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.0",
+    "@vitejs/plugin-react": "^6.0.1",
+    "tailwindcss": "^4.3.0",
+    "vite": "^8.0.12"
+  }
+}
