@@ -1,0 +1,19 @@
+{
+  "name": "Renewals Intelligence Studio",
+  "short_name": "Renewals",
+  "description": "Renewal momentum, risk and KPI achievement.",
+  "start_url": "../Renewals Intelligence Studio.html",
+  "scope": "../",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#4f46e5",
+  "background_color": "#0f172a",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

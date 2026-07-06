@@ -1,0 +1,154 @@
+# =============================================================================
+# Renewals Studio — App Foundry / Vibe RunService manifest
+# =============================================================================
+# This file is a template. Copy it into your Vibe project (or paste into the
+# App Foundry UI) and replace the marked placeholders.
+#
+# What Vibe does when this manifest is applied:
+#   1. Provisions a Cloud SQL Postgres 15 instance named "renewals-studio-db".
+#   2. Creates a service account with the right Cloud SQL Client / Invoker
+#      bindings.
+#   3. Builds the container from the repository's Dockerfile.
+#   4. Deploys it to Cloud Run with the env vars below.
+#   5. Injects DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD automatically
+#      — DO NOT hand-set them here. Vibe handles credential rotation through
+#      Secret Manager.
+#
+# Cloud Run + Cloud SQL connectivity:
+#   * `DB_HOST` is injected as a unix-socket path of the form
+#     `/cloudsql/<project>:<region>:<instance>` when Cloud Run is using the
+#     Cloud SQL connector. The app auto-detects this (config.py
+#     `is_unix_socket`) and disables SSL accordingly.
+#   * If you switch to a TCP IP-based connection (less common), set
+#     `DB_SSLMODE=require` as an extra env var.
+# =============================================================================
+
+apiVersion: vibe.appfoundry.dev/v1
+kind: RunService
+metadata:
+  name: renewals-studio
+  labels:
+    team: customer-success
+    component: renewals-dashboard
+
+spec:
+  # ---- Database dependency ------------------------------------------------
+  # Vibe provisions the Cloud SQL instance and injects DB_* env vars into
+  # every container in this manifest. No need to wire them by hand below.
+  database:
+    name: renewals-studio-db
+    type: postgres
+    version: "15"
+    # Adjust based on expected load. Start small; Cloud SQL scales the
+    # underlying instance vertically without a downtime restart.
+    tier: db-f1-micro    # <-- BUMP for production (db-custom-2-7680 is a sensible default)
+    storageGb: 10
+    backups:
+      enabled: true
+      retentionDays: 7
+
+  # ---- Container ---------------------------------------------------------
+  containers:
+    - name: app
+      image: <REGISTRY>/<PROJECT>/renewals-studio:<TAG>    # <-- FILL ME IN
+      ports:
+        - containerPort: 8080
+          name: http
+
+      # Resource sizing. Cloud Run scales horizontally by spawning more
+      # instances. These are per-instance limits.
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "1000m"
+          memory: "1Gi"
+
+      # ---- Environment ----------------------------------------------------
+      # DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD are injected by
+      # Vibe based on the `spec.database` block above. DO NOT set them here.
+      env:
+        - name: PORT
+          value: "8080"
+        - name: LOG_LEVEL
+          value: "INFO"
+
+        # ADMIN_TOKEN guards /admin/* and /api/renewals/upload-csv. If
+        # unset, those endpoints return 503 — the app refuses to operate
+        # admin actions without auth.
+        - name: ADMIN_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: renewals-studio-secrets
+              key: admin-token
+
+        # Optional overrides — uncomment to tune.
+        # - name: DB_POOL_MAX
+        #   value: "20"
+        # - name: DB_COMMAND_TIMEOUT_SEC
+        #   value: "60"
+        # - name: SEED_ON_FIRST_BOOT
+        #   value: "true"
+
+      # ---- Probes ---------------------------------------------------------
+      # /healthz is always-200 once the process is alive. Cloud Run uses
+      # this as the LIVENESS probe — it won't restart the container as
+      # long as the process is breathing.
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: 8080
+        initialDelaySeconds: 5
+        periodSeconds: 30
+        timeoutSeconds: 5
+        failureThreshold: 3
+
+      # /readyz returns 200 only when the DB pool is connected AND the
+      # schema has been applied. Cloud Run uses this as the READINESS
+      # probe — traffic isn't routed to the container until /readyz is
+      # green, but the container isn't killed if it goes red (we want
+      # transient DB hiccups to gracefully fail-open with 503s).
+      readinessProbe:
+        httpGet:
+          path: /readyz
+          port: 8080
+        # Generous startup grace: the DB pool can take up to 30s on a
+        # cold instance, especially when Cloud SQL is itself warming up.
+        initialDelaySeconds: 5
+        periodSeconds: 10
+        timeoutSeconds: 5
+        # failureThreshold * periodSeconds = 60s before traffic is held back.
+        failureThreshold: 6
+
+  # ---- Autoscaling -------------------------------------------------------
+  scaling:
+    minInstances: 1     # keep 1 warm so cold starts don't bite during the day
+    maxInstances: 10
+    # Concurrency: FastAPI is async, so a single uvicorn worker can handle
+    # many concurrent requests. 80 is the Cloud Run default and a good
+    # starting point.
+    concurrency: 80
+
+  # ---- Network -----------------------------------------------------------
+  ingress:
+    # PUBLIC = allow unauthenticated invocations. This is what avoids the
+    # Cloud Run "Your client does not have permission to get URL /" 403.
+    # Set to INTERNAL if you have a load balancer / IAP fronting this.
+    type: PUBLIC
+
+  # ---- Secrets bundle ----------------------------------------------------
+  # Declare the secrets this service needs. Vibe creates / mounts them via
+  # Secret Manager. The values themselves are NEVER stored in this YAML.
+  secrets:
+    - name: renewals-studio-secrets
+      keys:
+        - key: admin-token
+          description: "Guards /admin/* and /api/renewals/upload-csv"
+          # Generate once via: openssl rand -hex 32
+
+  # ---- Shutdown ----------------------------------------------------------
+  # uvicorn's --timeout-graceful-shutdown=25 in the Dockerfile gives us up
+  # to 25s to drain in-flight requests on SIGTERM. Cloud Run's default
+  # terminationGracePeriodSeconds is 10s; bump it so the drain has time.
+  terminationGracePeriodSeconds: 30

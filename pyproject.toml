@@ -1,0 +1,22 @@
+[project]
+name = "renewals-studio"
+version = "3.0.0"
+description = "Renewals Intelligence Studio container build — FastAPI + asyncpg + Cloud SQL Postgres"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi==0.115.5",
+    "uvicorn[standard]==0.32.1",
+    "asyncpg==0.30.0",
+    "pydantic==2.9.2",
+    "pydantic-settings==2.6.1",
+    "python-multipart==0.0.19",
+    "structlog==24.4.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["app", "app.routes"]

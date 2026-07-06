@@ -1,0 +1,1102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Renewals Studio — Admin</title>
+  <meta name="theme-color" content="#0f172a" />
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f7fb;
+      --surface: #ffffff;
+      --surface-muted: #eef0f6;
+      --border: #e3e6ee;
+      --text: #1e1f2c;
+      --text-muted: #5d6172;
+      --accent: #4f46e5;
+      --accent-hover: #4338ca;
+      --green: #16a34a;
+      --green-soft: rgba(22,163,74,0.12);
+      --red: #dc2626;
+      --red-soft: rgba(220,38,38,0.12);
+      --amber: #d97706;
+      --shadow: 0 1px 2px rgba(15,23,42,.06), 0 1px 3px rgba(15,23,42,.08);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b0f1a; --surface: #131826; --surface-muted: #1a1f30;
+        --border: #232a3d; --text: #e6e8ef; --text-muted: #9ea3b6;
+        --accent: #818cf8; --accent-hover: #a5b4fc;
+        --green: #34d399; --green-soft: rgba(52,211,153,.15);
+        --red: #f87171;   --red-soft: rgba(248,113,113,.15);
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
+    }
+    .topbar {
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 14px 28px; display: flex; align-items: center; justify-content: space-between;
+      position: sticky; top: 0; z-index: 10;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark {
+      width: 34px; height: 34px; border-radius: 9px;
+      background: linear-gradient(135deg, #4f46e5, #06b6d4);
+      display: grid; place-items: center; color: #fff; font-weight: 700;
+    }
+    .brand-name { font-weight: 600; font-size: 16px; }
+    .brand-sub { font-size: 12px; color: var(--text-muted); }
+    .topbar a { color: var(--accent); text-decoration: none; font-size: 13px; }
+    .topbar a:hover { color: var(--accent-hover); }
+
+    main { max-width: 1100px; margin: 0 auto; padding: 24px 28px 64px; }
+
+    .card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+      box-shadow: var(--shadow); padding: 20px; margin-bottom: 18px;
+    }
+    h1 { margin: 0 0 4px; font-size: 20px; font-weight: 600; }
+    h2 { margin: 0 0 12px; font-size: 16px; font-weight: 600; }
+    .muted { color: var(--text-muted); font-size: 13px; }
+
+    label { display: block; font-size: 12px; font-weight: 600; color: var(--text-muted);
+            margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
+    input[type=password], input[type=text], select, textarea {
+      width: 100%; padding: 8px 12px; border: 1px solid var(--border);
+      border-radius: 8px; background: var(--surface); color: var(--text);
+      font-family: inherit; font-size: 14px; outline: none;
+    }
+    input:focus, select:focus, textarea:focus {
+      border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79,70,229,.12);
+    }
+    textarea { min-height: 60px; resize: vertical; }
+
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 8px 16px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--surface); color: var(--text); cursor: pointer;
+      font-weight: 500; font-size: 14px; font-family: inherit;
+    }
+    .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+    .btn-danger { color: var(--red); border-color: var(--red); }
+    .btn-danger:hover { background: var(--red-soft); }
+    .btn-ghost { background: transparent; border-color: transparent; }
+    .btn-sm { padding: 5px 10px; font-size: 12px; }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+    .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+    .field { margin-bottom: 12px; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid var(--border); text-align: left; }
+    th { background: var(--surface-muted); font-weight: 600; font-size: 11px;
+         text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    tr:last-child td { border-bottom: none; }
+
+    .pill {
+      display: inline-block; padding: 2px 10px; border-radius: 999px;
+      font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em;
+    }
+    .pill-active     { background: var(--green-soft); color: var(--green); }
+    .pill-historical { background: rgba(79,70,229,.12); color: var(--accent); }
+    .pill-warn       { background: rgba(217,119,6,.12); color: var(--amber); }
+    .pill-error      { background: var(--red-soft); color: var(--red); }
+    .pill-ok         { background: var(--green-soft); color: var(--green); }
+
+    .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+    .status-item { padding: 10px 12px; background: var(--surface-muted); border-radius: 8px; }
+    .status-label { font-size: 10px; text-transform: uppercase; color: var(--text-muted); font-weight: 600; }
+    .status-value { font-size: 14px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+
+    .toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      background: var(--text); color: var(--surface);
+      padding: 10px 18px; border-radius: 8px; font-size: 13px;
+      box-shadow: var(--shadow); z-index: 100;
+    }
+    .hidden { display: none !important; }
+    .login-shell {
+      max-width: 480px; margin: 80px auto;
+    }
+    .admin-badge {
+      display: inline-block; padding: 2px 10px; border-radius: 999px;
+      font-size: 11px; font-weight: 600; text-transform: uppercase;
+      background: var(--green-soft); color: var(--green); margin-left: 8px;
+    }
+    .owner-badge {
+      display: inline-block; padding: 2px 10px; border-radius: 999px;
+      font-size: 11px; font-weight: 600; text-transform: uppercase;
+      background: rgba(79,70,229,.12); color: var(--accent); margin-left: 8px;
+    }
+    @keyframes upload-spin {
+      to { transform: rotate(360deg); }
+    }
+    .upload-overlay {
+      position: fixed; inset: 0; z-index: 200;
+      display: flex; align-items: center; justify-content: center;
+      padding: 24px;
+      background: rgba(15, 23, 42, 0.45);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+    }
+    .upload-overlay-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      padding: 28px 32px;
+      max-width: 360px;
+      width: 100%;
+      text-align: center;
+    }
+    .upload-spinner {
+      width: 44px; height: 44px;
+      margin: 0 auto 16px;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: upload-spin 0.85s linear infinite;
+    }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <div id="gate-screen" class="login-shell">
+    <div class="card">
+      <h1>Renewals Studio Admin</h1>
+      <p id="gate-message" class="muted">Checking your sign-in…</p>
+      <div id="gate-user" style="margin-top:16px;"></div>
+      <div id="gate-detail" class="muted" style="margin-top:12px;font-size:12px;"></div>
+      <div style="margin-top:16px;">
+        <a href="/">← Back to dashboard</a>
+      </div>
+    </div>
+  </div>
+
+  <div id="app" class="hidden">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">R</div>
+        <div>
+          <div class="brand-name">Renewals Studio — Admin</div>
+          <div class="brand-sub">CSV uploads &middot; database status</div>
+        </div>
+      </div>
+      <div>
+        <span id="user-badge" class="muted" style="margin-right:12px;"></span>
+        <a href="/">← Back to dashboard</a>
+      </div>
+    </header>
+
+    <main>
+      <section class="card" data-section="admin">
+        <h2>Database status</h2>
+        <div id="db-status" class="status-grid"></div>
+        <div style="margin-top: 14px;">
+          <button class="btn btn-sm" id="refresh-status">Refresh</button>
+        </div>
+      </section>
+
+      <section class="card" data-section="owner">
+        <h2>Upload a new CSV</h2>
+        <p class="muted">
+          Every upload becomes a versioned snapshot. The dashboard uses the snapshot
+          with the latest <strong>effective date</strong> (parsed from the filename when
+          possible). Duplicate account/quarter rows within a snapshot are deduplicated.
+        </p>
+        <form id="upload-form" style="margin-top: 12px;">
+          <div class="field-row">
+            <div>
+              <label for="upload-file">File</label>
+              <input type="file" id="upload-file" accept=".csv,text/csv,text/plain" required />
+            </div>
+            <div>
+              <label for="upload-slot">Slot</label>
+              <select id="upload-slot" required>
+                <option value="">— auto-detect from filename —</option>
+                <option value="active">Active</option>
+                <option value="historical">Historical</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label for="upload-name">Filename (optional override)</label>
+            <input type="text" id="upload-name" placeholder="Leave blank to use the file's own name" />
+          </div>
+          <div class="field">
+            <label for="upload-note">Note (optional)</label>
+            <textarea id="upload-note" placeholder="e.g. Q2 refresh after data fix"></textarea>
+          </div>
+          <div style="display:flex; gap:8px; justify-content: flex-end;">
+            <button class="btn btn-primary" type="submit" id="upload-submit-btn">Upload</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="card" data-section="owner">
+        <h2>Snapshot history</h2>
+        <p class="muted">
+          Every CSV upload is stored as an immutable snapshot. The dashboard
+          reads the snapshot with the max effective date per slot; older snapshots
+          power the Trending tab and WoW / MoM reporting. Newest effective date first.
+        </p>
+        <div style="margin: 10px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+          <label for="filter-slot" style="display: inline-block; margin: 0;">Filter:</label>
+          <select id="filter-slot" style="width: auto; display: inline-block;">
+            <option value="">All slots</option>
+            <option value="active">Active</option>
+            <option value="historical">Historical</option>
+          </select>
+          <button class="btn btn-sm" id="refresh-list">Refresh</button>
+          <span style="flex: 1;"></span>
+          <button class="btn btn-sm btn-danger" id="wipe-all">Wipe all uploads</button>
+        </div>
+        <div style="overflow-x: auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>Effective</th>
+                <th>Slot</th>
+                <th>Filename</th>
+                <th class="num">Rows</th>
+                <th class="num">Accounts</th>
+                <th class="num">Total ATR</th>
+                <th class="num">CSV size</th>
+                <th>By</th>
+                <th>Note</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="uploads-tbody">
+              <tr><td colspan="10" class="muted" style="text-align:center;padding:24px;">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" data-section="admin">
+        <h2>User access</h2>
+        <p class="muted">
+          Provision colleagues before their first SSO sign-in. <strong>Admin</strong> users can
+          open this panel and manage users; <strong>Standard</strong> users edit notes on the dashboard.
+          <strong>Owner</strong> (platform super-user) controls CSV uploads and notes import.
+        </p>
+        <form id="user-add-form" style="margin-top:12px;display:grid;grid-template-columns:1.4fr 1fr 140px auto;gap:8px;align-items:end;">
+          <div>
+            <label for="user-email">Email</label>
+            <input type="text" id="user-email" placeholder="name@zendesk.com" required />
+          </div>
+          <div>
+            <label for="user-display">Display name</label>
+            <input type="text" id="user-display" placeholder="Optional" />
+          </div>
+          <div>
+            <label for="user-role">Role</label>
+            <select id="user-role">
+              <option value="standard">Standard</option>
+              <option value="admin">Admin</option>
+            </select>
+          </div>
+          <button class="btn btn-primary" type="submit">Add / update</button>
+        </form>
+        <div style="margin:14px 0 8px;display:flex;gap:8px;align-items:center;">
+          <button class="btn btn-sm" id="refresh-users" type="button">Refresh</button>
+          <span class="muted" id="users-count"></span>
+        </div>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>Email</th>
+                <th>Name</th>
+                <th>Role</th>
+                <th>Updated</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="users-tbody">
+              <tr><td colspan="5" class="muted" style="text-align:center;padding:24px;">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" data-section="owner">
+        <h2>Dashboard tab access</h2>
+        <p class="muted">
+          Control which dashboard tabs each role can see. Owners always have access to
+          all tabs regardless of this matrix — use this to hide work-in-progress tabs
+          (e.g. Trending) from admins and standard users.
+        </p>
+        <div id="tab-access-matrix" style="margin-top:12px;overflow-x:auto;"></div>
+        <div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end;">
+          <button class="btn btn-sm" type="button" id="tab-access-reset">Reset defaults</button>
+          <button class="btn btn-primary btn-sm" type="button" id="tab-access-save">Save tab access</button>
+        </div>
+        <div id="tab-access-result" class="muted text-sm" style="margin-top:8px;"></div>
+      </section>
+
+      <section class="card" data-section="owner">
+        <h2>Notes — import JSON</h2>
+        <p class="muted">
+          Replay a notes-export JSON file from another deployment. Uses
+          the same UPSERT logic as the dashboard's own save; existing
+          notes are merged newer-wins.
+        </p>
+        <form id="notes-import-form" style="margin-top: 12px;">
+          <div class="field">
+            <label for="notes-file">JSON file</label>
+            <input type="file" id="notes-file" accept=".json,application/json" required />
+          </div>
+          <div style="display:flex; gap:8px; justify-content: flex-end;">
+            <button class="btn btn-primary" type="submit">Import notes</button>
+          </div>
+        </form>
+        <div id="notes-import-result" class="muted text-sm" style="margin-top:8px;"></div>
+      </section>
+
+      <section class="card" data-section="admin">
+        <h2>Account history (WoW / MoM)</h2>
+        <p class="muted">
+          Look up one account across every snapshot it appears in. Drives
+          risk-change-over-time reporting. Type a Salesforce account ID
+          (e.g. <code>001PC00000RBQsUYAX</code>) and hit Look up.
+        </p>
+        <form id="account-history-form" style="display:flex; gap:8px; align-items: flex-end;">
+          <div class="field" style="flex:1; margin:0;">
+            <label for="account-id-input">Account ID</label>
+            <input type="text" id="account-id-input" placeholder="001PC00000RBQsUYAX" />
+          </div>
+          <button class="btn btn-primary" type="submit">Look up</button>
+        </form>
+        <div id="account-history-result" style="margin-top: 12px;"></div>
+        <div id="call-history-result" style="margin-top: 16px;"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <div id="upload-overlay" class="upload-overlay hidden" role="alertdialog" aria-modal="true" aria-labelledby="upload-overlay-title" aria-busy="true">
+    <div class="upload-overlay-card">
+      <div class="upload-spinner" aria-hidden="true"></div>
+      <div id="upload-overlay-title" style="font-weight:600;font-size:15px">Processing CSV</div>
+      <p id="upload-overlay-message" class="muted" style="margin:8px 0 0;font-size:13px">Uploading and parsing rows on the server…</p>
+    </div>
+  </div>
+
+  <script src="vendor/vibe-session-lock.js"></script>
+  <script>
+    let currentUser = null;
+    let whoamiPayload = null;
+
+    const SLOT_LABELS = { active: 'Active', historical: 'Historical' };
+    function slotLabel(slot) {
+      return SLOT_LABELS[slot] || slot || '—';
+    }
+
+    const $ = (id) => document.getElementById(id);
+    const fmtBytes = (n) => {
+      if (n == null) return '—';
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + ' MB';
+      if (n >= 1_000) return (n / 1_000).toFixed(1) + ' KB';
+      return n + ' B';
+    };
+    const fmtDate = (iso) => {
+      if (!iso) return '—';
+      try { return new Date(iso).toLocaleString(); } catch (_) { return iso; }
+    };
+    const fmtShortHash = (h) => h ? `${h.slice(0,7)}…${h.slice(-4)}` : '—';
+
+    function showToast(msg, kind) {
+      const el = $('toast');
+      el.textContent = msg;
+      el.className = 'toast';
+      if (kind === 'error') el.style.background = 'var(--red)';
+      else if (kind === 'ok') el.style.background = 'var(--green)';
+      else el.style.background = 'var(--text)';
+      el.classList.remove('hidden');
+      setTimeout(() => el.classList.add('hidden'), 2800);
+    }
+
+    function setUploadLoading(active, message) {
+      const overlay = $('upload-overlay');
+      const msgEl = $('upload-overlay-message');
+      const btn = $('upload-submit-btn');
+      const form = $('upload-form');
+      if (overlay) overlay.classList.toggle('hidden', !active);
+      if (msgEl && message) msgEl.textContent = message;
+      if (btn) {
+        btn.disabled = active;
+        btn.textContent = active ? 'Uploading…' : 'Upload';
+      }
+      if (form) {
+        form.querySelectorAll('input, select, textarea').forEach(function (el) {
+          el.disabled = active;
+        });
+      }
+    }
+
+    async function api(path, opts = {}) {
+      const res = await fetch(path, opts);
+      if (res.status === 401 || res.status === 403) {
+        await bootAuth();
+        throw new Error(res.status === 403 ? 'Admin access required.' : 'Sign in required.');
+      }
+      let body = null;
+      const ct = res.headers.get('content-type') || '';
+      if (ct.includes('application/json')) body = await res.json();
+      if (!res.ok) {
+        const msg = (body && (body.detail || body.error)) || `${res.status} ${res.statusText}`;
+        throw new Error(typeof msg === 'object' ? (msg.detail || JSON.stringify(msg)) : msg);
+      }
+      return body;
+    }
+
+    function renderGate(message, detailHtml) {
+      $('app').classList.add('hidden');
+      $('gate-screen').classList.remove('hidden');
+      $('gate-message').textContent = message || '';
+      $('gate-detail').innerHTML = detailHtml || '';
+      const badge = $('user-badge');
+      if (badge) badge.textContent = '';
+    }
+
+    function roleBadge(role) {
+      if (role === 'owner') return ' <span class="owner-badge">Owner</span>';
+      if (role === 'admin') return ' <span class="admin-badge">Admin</span>';
+      return '';
+    }
+
+    function applyAdminVisibility() {
+      const isOwner = currentUser && currentUser.role === 'owner';
+      const isAdmin = currentUser && (currentUser.role === 'admin' || currentUser.role === 'owner');
+      document.querySelectorAll('[data-section="owner"]').forEach(function (el) {
+        el.style.display = isOwner ? '' : 'none';
+      });
+      document.querySelectorAll('[data-section="admin"]').forEach(function (el) {
+        el.style.display = isAdmin ? '' : 'none';
+      });
+    }
+
+    function renderGateUser(user) {
+      const el = $('gate-user');
+      if (!user || !user.email) {
+        el.innerHTML = '<div class="muted">No SSO identity detected on this request.</div>';
+        return;
+      }
+      const label = user.displayName || user.email;
+      el.innerHTML = `<strong>${label}</strong> <span class="muted">(${user.email})</span>` + roleBadge(user.role);
+    }
+
+    function renderApp() {
+      $('gate-screen').classList.add('hidden');
+      $('app').classList.remove('hidden');
+      applyAdminVisibility();
+      const badge = $('user-badge');
+      if (currentUser && currentUser.email) {
+        const name = currentUser.displayName || currentUser.email;
+        badge.innerHTML = name + roleBadge(currentUser.role);
+      } else {
+        badge.textContent = '';
+      }
+      refreshStatus();
+      if (currentUser && currentUser.role === 'owner') {
+        refreshList();
+        loadTabAccessConfig();
+      }
+      if (currentUser && (currentUser.role === 'admin' || currentUser.role === 'owner')) refreshUsers();
+    }
+
+    const TAB_LABELS = {
+      region: 'Region',
+      trending: 'Trending',
+      partner: 'Partner',
+      accounts: 'Accounts',
+      notes: 'Notes',
+      historical: 'Historical',
+      targets: 'Targets',
+    };
+    let _tabAccessAllTabs = [];
+    let _tabAccessMatrix = null;
+
+    function defaultTabMatrix() {
+      return {
+        owner: ['region', 'trending', 'partner', 'accounts', 'notes', 'historical', 'targets'],
+        admin: ['region', 'partner', 'accounts', 'notes', 'historical', 'targets'],
+        standard: ['region', 'partner', 'accounts', 'notes', 'targets'],
+      };
+    }
+
+    function renderTabAccessMatrix() {
+      const host = $('tab-access-matrix');
+      if (!host || !_tabAccessMatrix) return;
+      const roles = ['admin', 'standard'];
+      const tabs = _tabAccessAllTabs.length ? _tabAccessAllTabs : Object.keys(TAB_LABELS);
+      let html = '<table><thead><tr><th>Tab</th>';
+      roles.forEach(function (role) {
+        html += '<th style="text-align:center">' + role + '</th>';
+      });
+      html += '</tr></thead><tbody>';
+      tabs.forEach(function (tab) {
+        html += '<tr><td><strong>' + (TAB_LABELS[tab] || tab) + '</strong><div class="muted" style="font-size:11px">' + tab + '</div></td>';
+        roles.forEach(function (role) {
+          const checked = (_tabAccessMatrix[role] || []).indexOf(tab) >= 0;
+          html += '<td style="text-align:center"><input type="checkbox" data-tab-role="' + role + '" data-tab-id="' + tab + '"' + (checked ? ' checked' : '') + ' /></td>';
+        });
+        html += '</tr>';
+      });
+      html += '</tbody></table>';
+      html += '<p class="muted" style="margin-top:8px;font-size:12px">Owner role always sees every tab. Changes apply on next dashboard load or tab refresh.</p>';
+      host.innerHTML = html;
+    }
+
+    async function loadTabAccessConfig() {
+      const resultEl = $('tab-access-result');
+      try {
+        const data = await api('/api/renewals/tab-access/config');
+        _tabAccessAllTabs = data.all_tabs || Object.keys(TAB_LABELS);
+        _tabAccessMatrix = data.matrix || defaultTabMatrix();
+        renderTabAccessMatrix();
+        if (resultEl) resultEl.textContent = '';
+      } catch (err) {
+        if (resultEl) resultEl.textContent = 'Could not load tab access: ' + err.message;
+      }
+    }
+
+    async function saveTabAccessConfig() {
+      const resultEl = $('tab-access-result');
+      const matrix = { owner: _tabAccessAllTabs.slice() };
+      ['admin', 'standard'].forEach(function (role) {
+        matrix[role] = [];
+        document.querySelectorAll('input[data-tab-role="' + role + '"]:checked').forEach(function (cb) {
+          matrix[role].push(cb.getAttribute('data-tab-id'));
+        });
+      });
+      try {
+        const data = await api('/api/renewals/tab-access/config', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ matrix: matrix }),
+        });
+        _tabAccessMatrix = data.matrix || matrix;
+        renderTabAccessMatrix();
+        if (resultEl) resultEl.textContent = 'Saved. Users may need to refresh the dashboard to see changes.';
+        showToast('Tab access updated', 'ok');
+      } catch (err) {
+        if (resultEl) resultEl.textContent = 'Save failed: ' + err.message;
+        showToast('Save failed: ' + err.message, 'error');
+      }
+    }
+
+    $('tab-access-save') && $('tab-access-save').addEventListener('click', saveTabAccessConfig);
+    $('tab-access-reset') && $('tab-access-reset').addEventListener('click', function () {
+      _tabAccessMatrix = defaultTabMatrix();
+      renderTabAccessMatrix();
+      if ($('tab-access-result')) $('tab-access-result').textContent = 'Reset to defaults — click Save to persist.';
+    });
+
+    async function fetchWhoami() {
+      const res = await fetch('/api/whoami', { cache: 'no-store' });
+      if (!res.ok) return null;
+      return await res.json();
+    }
+
+    async function bootAuth() {
+      renderGate('Checking your sign-in…', '');
+      try {
+        whoamiPayload = await fetchWhoami();
+      } catch (_) {
+        renderGate('Could not reach the server.', 'Try refreshing in a moment.');
+        return false;
+      }
+      if (!whoamiPayload) {
+        renderGate('Could not load your identity.', '');
+        return false;
+      }
+      currentUser = whoamiPayload.user || null;
+      renderGateUser(currentUser);
+
+      if (currentUser && (currentUser.role === 'admin' || currentUser.role === 'owner')) {
+        if (whoamiPayload.identity && whoamiPayload.identity.displayName && !currentUser.displayName) {
+          currentUser.displayName = whoamiPayload.identity.displayName;
+        }
+        if (window.RenewalsSessionLock) RenewalsSessionLock.onWhoami(whoamiPayload);
+        renderApp();
+        return true;
+      }
+
+      if (!currentUser || currentUser.role === 'guest') {
+        const headers = whoamiPayload.proxy_headers_received || {};
+        const headerList = Object.keys(headers).length
+          ? Object.keys(headers).map(function (k) { return k + ': ' + headers[k]; }).join('<br>')
+          : '(none — access this app through your company SSO / Pomerium gateway)';
+        renderGate(
+          'Admin access requires company SSO.',
+          'Your browser session did not include identity headers from the gateway.<br><br>' +
+          '<strong>Headers received:</strong><br>' + headerList + '<br><br>' +
+          'Open this app from the same SSO URL as the main dashboard (Pomerium / company gateway).'
+        );
+        return false;
+      }
+
+      renderGate(
+        `Signed in as ${currentUser.email}, but this account is not an admin or owner.`,
+        'Ask an admin to promote you, or an owner to add your email to <code>BOOTSTRAP_ADMINS</code>.'
+      );
+      return false;
+    }
+
+    async function refreshStatus() {
+      try {
+        const data = await api('/admin/db-status');
+        // Field names match the new explicit /admin/db-status payload.
+        // The server returns booleans + canonical field names so the UI
+        // doesn't have to derive anything.
+        const items = [
+          ['DB connected',     data.db_connected ? '✓ yes' : '✗ no', data.db_connected ? 'pill-ok' : 'pill-error'],
+          ['Schema ready',     data.schema_ready ? '✓ yes' : '✗ no', data.schema_ready ? 'pill-ok' : 'pill-error'],
+          ['DB status',        data.db_status || 'unknown'],
+          ['Connection via',   data.via || '—'],
+          ['Target host',      data.host || data.target_host || '—'],
+          ['Database',         data.database || data.db_name || '—'],
+          ['User',             data.user || data.db_user || '—'],
+          ['SSL mode',         data.ssl || data.db_sslmode || '—'],
+          ['Pool size',        `${data.pool_in_use ?? '?'} in use / ${data.pool_size ?? '?'} total`],
+          ['Connect attempts', data.connect_attempts ?? 0],
+          ['Last error',       data.last_error || data.db_last_error || '—',
+                               (data.last_error || data.db_last_error) ? 'pill-error' : ''],
+          ['DB version',       data.db_version || '—'],
+          ['Seed on startup',  data.seed_on_startup ? 'enabled' : 'disabled'],
+        ];
+        const rowCounts = data.row_counts || {};
+        for (const t of ['notes', 'note_tombstones', 'csv_uploads', 'account_snapshots', 'schema_migrations']) {
+          items.push([`${t}`, rowCounts[t] ?? '?']);
+        }
+        $('db-status').innerHTML = items.map(([label, value, pill]) => `
+          <div class="status-item">
+            <div class="status-label">${label}</div>
+            <div class="status-value">
+              ${pill ? `<span class="pill ${pill}">${value}</span>` : value}
+            </div>
+          </div>
+        `).join('');
+      } catch (err) {
+        showToast(`Status load failed: ${err.message}`, 'error');
+      }
+    }
+
+    async function handleWipeAll() {
+      if (!confirm('This will DELETE every CSV upload and parsed snapshot row. The dashboard will go back to the splash gate until you upload a fresh CSV.\n\nThis cannot be undone. Proceed?')) {
+        return;
+      }
+      try {
+        const res = await fetch('/admin/wipe-all-uploads?confirm=yes', {
+          method: 'POST',
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          throw new Error(data.detail || data.error || `${res.status} ${res.statusText}`);
+        }
+        showToast(`Wiped ${data.deleted_uploads} upload(s) + ${data.deleted_snapshots} snapshot row(s)`, 'ok');
+        refreshStatus();
+        refreshList();
+      } catch (err) {
+        showToast(`Wipe failed: ${err.message}`, 'error');
+      }
+    }
+
+    function fmtCurrency(n) {
+      if (n == null) return '—';
+      if (Math.abs(n) >= 1_000_000) return '$' + (n / 1_000_000).toFixed(2) + 'M';
+      if (Math.abs(n) >= 1_000) return '$' + (n / 1_000).toFixed(1) + 'K';
+      return '$' + Math.round(n);
+    }
+
+    async function refreshList() {
+      const tbody = $('uploads-tbody');
+      tbody.innerHTML = '<tr><td colspan="10" class="muted" style="text-align:center;padding:24px;">Loading…</td></tr>';
+      try {
+        // Use the new /api/renewals/snapshots which adds row_count + atr_total
+        const data = await api('/api/renewals/snapshots?limit=100');
+        let items = data.items || [];
+        const slot = $('filter-slot').value;
+        if (slot) items = items.filter(it => it.slot === slot);
+        if (!items.length) {
+          tbody.innerHTML = '<tr><td colspan="10" class="muted" style="text-align:center;padding:24px;">No uploads yet.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = items.map(it => `
+          <tr>
+            <td>${fmtDate(it.effective_date || it.uploaded_at)}</td>
+            <td><span class="pill pill-${it.slot}">${slotLabel(it.slot)}</span></td>
+            <td title="${it.filename}">${it.filename}</td>
+            <td class="num">${(it.row_count || 0).toLocaleString()}</td>
+            <td class="num">${(it.distinct_accounts || 0).toLocaleString()}</td>
+            <td class="num">${fmtCurrency(it.atr_total)}</td>
+            <td class="num muted">${fmtBytes(it.size_bytes)}</td>
+            <td class="muted">${it.uploaded_by || '—'}</td>
+            <td class="muted">${(it.note || '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</td>
+            <td>
+              <button class="btn btn-sm" data-download="${it.id}" data-filename="${(it.filename || '').replace(/"/g, '&quot;')}">Download</button>
+              <button class="btn btn-sm btn-danger" data-delete="${it.id}">Delete</button>
+            </td>
+          </tr>
+        `).join('');
+        tbody.querySelectorAll('[data-download]').forEach(btn => {
+          btn.addEventListener('click', () => downloadUpload(btn.dataset.download, btn.dataset.filename));
+        });
+        tbody.querySelectorAll('[data-delete]').forEach(btn => {
+          btn.addEventListener('click', () => deleteUpload(btn.dataset.delete));
+        });
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="10" class="muted" style="text-align:center;padding:24px;color:var(--red);">${err.message}</td></tr>`;
+      }
+    }
+
+    async function refreshUsers() {
+      const tbody = $('users-tbody');
+      const countEl = $('users-count');
+      if (!tbody) return;
+      tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center;padding:24px;">Loading…</td></tr>';
+      try {
+        const data = await api('/api/users');
+        const users = data.users || [];
+        if (countEl) countEl.textContent = users.length + ' user(s)';
+        if (!users.length) {
+          tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center;padding:24px;">No users yet. Add an email above.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = users.map(function (u) {
+          const email = u.email || '';
+          const safeEmail = email.replace(/"/g, '&quot;');
+          const role = u.role === 'owner' ? 'owner' : (u.role === 'admin' ? 'admin' : 'standard');
+          const isSelf = currentUser && currentUser.email && currentUser.email.toLowerCase() === email.toLowerCase();
+          const rolePill = role === 'owner' ? 'owner-badge' : (role === 'admin' ? 'pill-ok' : '');
+          return '<tr data-user-email="' + safeEmail + '">' +
+            '<td><code>' + email + '</code></td>' +
+            '<td>' + (u.displayName || '—') + '</td>' +
+            '<td><span class="pill ' + rolePill + '">' + role + '</span></td>' +
+            '<td class="muted">' + (u.updatedAt ? fmtDate(u.updatedAt) : '—') + '</td>' +
+            '<td style="white-space:nowrap">' +
+              (role === 'owner'
+                ? '<span class="muted">Owner (env only)</span>'
+                : role === 'admin'
+                  ? (isSelf ? '<span class="muted">You</span>'
+                    : '<button class="btn btn-sm" data-demote="' + safeEmail + '">Make standard</button>')
+                  : '<button class="btn btn-sm btn-primary" data-promote="' + safeEmail + '">Make admin</button>') +
+              (isSelf || role === 'owner' ? '' : ' <button class="btn btn-sm btn-danger" data-remove-user="' + safeEmail + '">Remove</button>') +
+            '</td>' +
+          '</tr>';
+        }).join('');
+        tbody.querySelectorAll('[data-promote]').forEach(function (btn) {
+          btn.addEventListener('click', function () { changeUserRole(btn.dataset.promote, 'admin'); });
+        });
+        tbody.querySelectorAll('[data-demote]').forEach(function (btn) {
+          btn.addEventListener('click', function () { changeUserRole(btn.dataset.demote, 'standard'); });
+        });
+        tbody.querySelectorAll('[data-remove-user]').forEach(function (btn) {
+          btn.addEventListener('click', function () { removeUser(btn.dataset.removeUser); });
+        });
+      } catch (err) {
+        tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center;padding:24px;color:var(--red);">' + err.message + '</td></tr>';
+      }
+    }
+
+    async function changeUserRole(email, role) {
+      if (!email) return;
+      try {
+        await api('/api/users/' + encodeURIComponent(email) + '/role', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role: role }),
+        });
+        showToast((role === 'admin' ? 'Promoted ' : 'Updated ') + email, 'ok');
+        refreshUsers();
+      } catch (err) {
+        showToast('Role update failed: ' + err.message, 'error');
+      }
+    }
+
+    async function removeUser(email) {
+      if (!email) return;
+      if (!confirm('Remove ' + email + '? They will need to be re-provisioned before accessing the app.')) return;
+      try {
+        await api('/api/users/' + encodeURIComponent(email), { method: 'DELETE' });
+        showToast('Removed ' + email, 'ok');
+        refreshUsers();
+      } catch (err) {
+        showToast('Remove failed: ' + err.message, 'error');
+      }
+    }
+
+    async function handleUserAdd(event) {
+      event.preventDefault();
+      const email = $('user-email').value.trim().toLowerCase();
+      const displayName = $('user-display').value.trim();
+      const role = $('user-role').value;
+      if (!email || email.indexOf('@') < 0) {
+        showToast('Enter a valid email', 'error');
+        return;
+      }
+      try {
+        await api('/api/users', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: email, display_name: displayName, role: role }),
+        });
+        showToast('Saved ' + email + ' (' + role + ')', 'ok');
+        $('user-add-form').reset();
+        refreshUsers();
+      } catch (err) {
+        showToast('Save failed: ' + err.message, 'error');
+      }
+    }
+
+    // ---- Notes JSON import ----
+    async function handleNotesImport(event) {
+      event.preventDefault();
+      const file = $('notes-file').files[0];
+      const out = $('notes-import-result');
+      if (!file) return;
+      out.textContent = 'Reading…';
+      try {
+        const text = await file.text();
+        let body;
+        try { body = JSON.parse(text); }
+        catch (err) { throw new Error('Not valid JSON: ' + err.message); }
+        if (!body || typeof body !== 'object') {
+          throw new Error('Expected an object {notes, noteDeletes}');
+        }
+        if (!body.notes) body.notes = {};
+        if (!body.noteDeletes) body.noteDeletes = {};
+        const data = await api('/api/renewals/notes/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        out.innerHTML = `<span style="color:var(--green)">✓ Imported. ${data.noteCount} notes total, ${data.deleteCount} tombstones. Saved at ${fmtDate(data.savedAt)}.</span>`;
+        showToast('Notes imported', 'ok');
+      } catch (err) {
+        out.innerHTML = `<span style="color:var(--red)">Import failed: ${err.message}</span>`;
+        showToast('Notes import failed', 'error');
+      }
+    }
+
+    // ---- Account history (WoW / MoM lookup) ----
+    async function handleAccountHistory(event) {
+      event.preventDefault();
+      const id = $('account-id-input').value.trim();
+      const out = $('account-history-result');
+      if (!id) {
+        out.innerHTML = '';
+        const ch = $('call-history-result');
+        if (ch) ch.innerHTML = '';
+        return;
+      }
+      out.innerHTML = '<div class="muted">Looking up…</div>';
+      try {
+        const data = await api(`/api/renewals/account-history/${encodeURIComponent(id)}`);
+        if (!data.history || !data.history.length) {
+          out.innerHTML = '<div class="muted">No snapshots found for that account.</div>';
+          await loadCallHistory(id);
+          return;
+        }
+        const rows = data.history.map(h => `
+          <tr>
+            <td>${fmtDate(h.effective_date)}</td>
+            <td>${h.year_quarter || '—'}</td>
+            <td>${h.account_name || '—'}</td>
+            <td class="num">${fmtCurrency(h.atr)}</td>
+            <td class="num">${fmtCurrency(h.bu_fc)}</td>
+            <td class="num">${fmtCurrency(h.cc)}</td>
+            <td>${h.health_status || '—'}</td>
+            <td class="muted">${h.region || '—'} ${h.market_segment ? '· ' + h.market_segment : ''}</td>
+            <td class="muted">${h.csm_owner || '—'}</td>
+          </tr>
+        `).join('');
+        out.innerHTML = `
+          <div style="overflow-x:auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Effective</th>
+                  <th>FQ</th>
+                  <th>Account</th>
+                  <th class="num">ATR</th>
+                  <th class="num">BU FC</th>
+                  <th class="num">CC</th>
+                  <th>Health</th>
+                  <th>Region / Segment</th>
+                  <th>CSM</th>
+                </tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+          <div class="muted text-sm" style="margin-top:6px;">${data.history.length} snapshot row(s) for <code>${id}</code></div>
+        `;
+        await loadCallHistory(id);
+      } catch (err) {
+        out.innerHTML = `<div style="color:var(--red)">${err.message}</div>`;
+        const ch = $('call-history-result');
+        if (ch) ch.innerHTML = '';
+      }
+    }
+
+    async function loadCallHistory(accountId) {
+      const out = $('call-history-result');
+      if (!out) return;
+      out.innerHTML = '<div class="muted">Loading call history…</div>';
+      try {
+        const data = await api('/api/renewals/calls/history?account_id=' + encodeURIComponent(accountId));
+        if (!data.history || !data.history.length) {
+          out.innerHTML = '<div class="muted">No call commits found for this account.</div>';
+          return;
+        }
+        const rows = data.history.map(function (h) {
+          const cs = h.cs_forecast != null ? fmtCurrency(h.cs_forecast) : '—';
+          const rn = h.renewals_forecast != null ? fmtCurrency(h.renewals_forecast) : '—';
+          const elt = h.elt_forecast != null ? fmtCurrency(h.elt_forecast) : '—';
+          const who = h.edited_by_display || h.edited_by_email || '—';
+          return '<tr>' +
+            '<td>' + fmtDate(h.effective_date) + '</td>' +
+            '<td>' + (h.year_quarter || '—') + '</td>' +
+            '<td class="num">' + (h.rounded_atr != null ? Number(h.rounded_atr).toLocaleString() : '—') + '</td>' +
+            '<td class="num">' + cs + '</td>' +
+            '<td class="num">' + rn + '</td>' +
+            '<td class="num">' + elt + '</td>' +
+            '<td>' + who + '</td>' +
+            '<td class="muted">' + (h.source || '') + '</td>' +
+          '</tr>';
+        }).join('');
+        out.innerHTML = `
+          <h3 style="font-size:13px;font-weight:600;margin:0 0 8px;">Call history (CS / Renewals commits)</h3>
+          <div style="overflow-x:auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Committed</th>
+                  <th>FQ</th>
+                  <th class="num">ATR</th>
+                  <th class="num">CS</th>
+                  <th class="num">Renewals</th>
+                  <th class="num">ELT</th>
+                  <th>By</th>
+                  <th>Source</th>
+                </tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>`;
+      } catch (err) {
+        out.innerHTML = '<div class="muted" style="color:var(--red)">Call history: ' + err.message + '</div>';
+      }
+    }
+
+    async function downloadUpload(id, filename) {
+      try {
+        const res = await fetch(`/admin/csv-uploads/${id}/download`);
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename || `upload-${id}.csv`;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(a.href);
+        showToast('Downloaded', 'ok');
+      } catch (err) {
+        showToast(`Download failed: ${err.message}`, 'error');
+      }
+    }
+
+    async function deleteUpload(id) {
+      if (!confirm(`Delete upload #${id}? This is permanent.`)) return;
+      try {
+        await api(`/admin/csv-uploads/${id}`, { method: 'DELETE' });
+        showToast('Deleted', 'ok');
+        refreshList();
+      } catch (err) {
+        showToast(`Delete failed: ${err.message}`, 'error');
+      }
+    }
+
+    // Boot — SSO admin only (no shared password)
+    $('refresh-status').addEventListener('click', refreshStatus);
+    $('refresh-list').addEventListener('click', refreshList);
+    $('refresh-users').addEventListener('click', refreshUsers);
+    $('user-add-form').addEventListener('submit', handleUserAdd);
+    $('filter-slot').addEventListener('change', refreshList);
+    $('notes-import-form').addEventListener('submit', handleNotesImport);
+    $('account-history-form').addEventListener('submit', handleAccountHistory);
+    $('wipe-all').addEventListener('click', handleWipeAll);
+
+    $('upload-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const file = $('upload-file').files[0];
+      if (!file) return;
+      const slot = $('upload-slot').value;
+      const nameOverride = $('upload-name').value.trim();
+      const noteText = $('upload-note').value.trim();
+      const fd = new FormData();
+      fd.append('file', file);
+      if (slot) fd.append('slot', slot);
+      if (noteText) fd.append('note', noteText);
+
+      const params = new URLSearchParams();
+      if (nameOverride) params.set('name', nameOverride);
+      const url = '/api/renewals/upload-csv' + (params.toString() ? `?${params.toString()}` : '');
+
+      const sizeLabel = file.size >= 1_000_000
+        ? (file.size / 1_000_000).toFixed(1) + ' MB'
+        : Math.round(file.size / 1000) + ' KB';
+      setUploadLoading(true, 'Uploading ' + file.name + ' (' + sizeLabel + ') and parsing rows on the server…');
+
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          body: fd,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || `${res.status} ${res.statusText}`);
+        const rows = data.parsed_rows != null ? ` · ${Number(data.parsed_rows).toLocaleString()} rows parsed` : '';
+        showToast(`Uploaded ${data.filename} (${slotLabel(data.slot)}, ${fmtBytes(data.size)})${rows}`, 'ok');
+        $('upload-form').reset();
+        refreshList();
+        refreshStatus();
+      } catch (err) {
+        showToast(`Upload failed: ${err.message}`, 'error');
+      } finally {
+        setUploadLoading(false);
+      }
+    });
+
+    if (window.RenewalsSessionLock) {
+      RenewalsSessionLock.start({
+        onWhoami: function (data) {
+          if (!data) return;
+          whoamiPayload = data;
+          currentUser = data.user || null;
+          if (currentUser && (currentUser.role === 'admin' || currentUser.role === 'owner')) {
+            const badge = $('user-badge');
+            if (badge && currentUser.email) {
+              const name = currentUser.displayName || currentUser.email;
+              badge.innerHTML = name + roleBadge(currentUser.role);
+            }
+          }
+        },
+      });
+    }
+
+    bootAuth();
+  </script>
+</body>
+</html>
