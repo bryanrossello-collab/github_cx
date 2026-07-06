@@ -7012,41 +7012,7 @@ function RegionQuarterTable() {
   const attainColor = (a) => a >= 1 ? "text-emerald-600 dark:text-emerald-400" : a >= 0.9 ? "text-amber-600 dark:text-amber-400" : "text-red-500 dark:text-red-400";
   const _mobileBandLabel = selectedBand && selectedBand !== "all" ? BAND_OPTIONS.find((b) => b.value === selectedBand)?.label || selectedBand : "All accounts";
   const _mobileFqLabel = !selectedFQ ? "Pick a quarter" : selectedFQ === "__ALL_FQ__" ? "All quarters" : selectedFQ;
-  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", { className: "hidden" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5 -mx-1 px-1 overflow-x-auto scroll-hide" }, /* @__PURE__ */ React.createElement("span", { className: "text-[10px] font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider shrink-0 mr-0.5" }, "FQ"), rowsView.map((r) => {
-    const active = r.fq === selectedFQ;
-    return /* @__PURE__ */ React.createElement(
-      "button",
-      {
-        key: r.fq,
-        onClick: () => React.startTransition(() => setSelectedFQ(active ? null : r.fq)),
-        className: `shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium border transition-colors min-h-[32px] ${active ? "border-indigo-400 dark:border-indigo-500 bg-indigo-50/70 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300" : "border-gray-200 dark:border-gray-700 bg-white/40 dark:bg-white/[0.06] text-gray-600 dark:text-gray-300"}`
-      },
-      r.fq,
-      /* @__PURE__ */ React.createElement("span", { className: "ml-1 text-[10px] tabular-nums opacity-70" }, r.accounts.toLocaleString())
-    );
-  }), rowsView.length > 1 && /* @__PURE__ */ React.createElement(
-    "button",
-    {
-      onClick: () => React.startTransition(() => setSelectedFQ("__ALL_FQ__")),
-      className: `shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium border transition-colors min-h-[32px] ${selectedFQ === "__ALL_FQ__" ? "border-indigo-400 dark:border-indigo-500 bg-indigo-50/70 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300" : "border-gray-200 dark:border-gray-700 bg-white/40 dark:bg-white/[0.06] text-gray-600 dark:text-gray-300"}`
-    },
-    "All"
-  )), selectedFQ && /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5 -mx-1 px-1 overflow-x-auto scroll-hide" }, /* @__PURE__ */ React.createElement("span", { className: "text-[10px] font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider shrink-0 mr-0.5" }, "Band"), bandRows.filter((b) => b.accounts > 0 || b.value === "all").map((opt) => {
-    const active = selectedBand === opt.value;
-    return /* @__PURE__ */ React.createElement(
-      "button",
-      {
-        key: opt.value,
-        onClick: () => React.startTransition(() => {
-          setSelectedBand(opt.value);
-          setSelectedSubregions(/* @__PURE__ */ new Set());
-        }),
-        className: `shrink-0 px-2.5 py-1 rounded-full text-[11px] font-medium border transition-colors min-h-[32px] ${active ? "border-emerald-400 dark:border-emerald-500 bg-emerald-50/70 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300" : "border-gray-200 dark:border-gray-700 bg-white/40 dark:bg-white/[0.06] text-gray-600 dark:text-gray-300"}`
-      },
-      opt.label,
-      opt.value !== "all" && /* @__PURE__ */ React.createElement("span", { className: "ml-1 text-[10px] tabular-nums opacity-70" }, opt.accounts.toLocaleString())
-    );
-  }))), /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500 dark:text-gray-400 px-1 tabular-nums lg:hidden" }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, _mobileFqLabel), selectedFQ && /* @__PURE__ */ React.createElement(React.Fragment, null, " \xB7 ", _mobileBandLabel), focusRows.length > 0 && /* @__PURE__ */ React.createElement(React.Fragment, null, " \xB7 ", focusRows.length.toLocaleString(), " accounts")), /* @__PURE__ */ React.createElement("div", { className: "region-filter-bar" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-bar-head glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "region-filter-bar-toggle", onClick: () => setFiltersCollapsed((p) => !p), "aria-expanded": !filtersCollapsed }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${filtersCollapsed ? "" : "is-open"}` }, "\u25BC"), /* @__PURE__ */ React.createElement("span", { className: "region-filter-bar-title" }, "Filters")), /* @__PURE__ */ React.createElement("div", { className: "region-filter-summary" }, /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip" }, _mobileFqLabel), selectedBand !== "all" && /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip region-filter-chip-emerald" }, BAND_OPTIONS.find((b) => b.value === selectedBand)?.label || selectedBand), selectedSubregions.size > 0 && /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip" }, selectedSubregions.size === 1 ? Array.from(selectedSubregions)[0] : selectedSubregions.size + " sub-regions"), selectedCsManager !== "__ALL_CSM__" && /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip" }, selectedCsManager), focusRows.length > 0 && /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip region-filter-chip-muted" }, focusRows.length.toLocaleString(), " accounts"))), !filtersCollapsed && /* @__PURE__ */ React.createElement("div", { className: "region-filter-sections" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-section region-filter-section-primary glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setFqOpen((p) => !p), className: "region-filter-section-head" }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${fqOpen ? "is-open" : ""}` }, "\u25BC"), /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-title" }, "Fiscal Quarters"), selectedFQ && /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-badge" }, selectedFQ === "__ALL_FQ__" ? "All quarters" : selectedFQ)), fqOpen && /* @__PURE__ */ React.createElement("div", { className: "region-filter-section-body" }, /* @__PURE__ */ React.createElement("div", { className: "region-fq-scroll" }, (() => {
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-bar" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-bar-head glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "region-filter-bar-toggle", onClick: () => setFiltersCollapsed((p) => !p), "aria-expanded": !filtersCollapsed }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${filtersCollapsed ? "" : "is-open"}` }, "\u25BC"), /* @__PURE__ */ React.createElement("span", { className: "region-filter-bar-title" }, "Filters")), /* @__PURE__ */ React.createElement("div", { className: "region-filter-summary" }, /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip" }, _mobileFqLabel), selectedBand !== "all" && /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip region-filter-chip-emerald" }, BAND_OPTIONS.find((b) => b.value === selectedBand)?.label || selectedBand), selectedSubregions.size > 0 && /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip" }, selectedSubregions.size === 1 ? Array.from(selectedSubregions)[0] : selectedSubregions.size + " sub-regions"), selectedCsManager !== "__ALL_CSM__" && /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip" }, selectedCsManager), focusRows.length > 0 && /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip region-filter-chip-muted" }, focusRows.length.toLocaleString(), " accounts"))), !filtersCollapsed && /* @__PURE__ */ React.createElement("div", { className: "region-filter-sections" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-section region-filter-section-primary glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setFqOpen((p) => !p), className: "region-filter-section-head" }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${fqOpen ? "is-open" : ""}` }, "\u25BC"), /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-title" }, "Fiscal Quarters"), selectedFQ && /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-badge" }, selectedFQ === "__ALL_FQ__" ? "All quarters" : selectedFQ)), fqOpen && /* @__PURE__ */ React.createElement("div", { className: "region-filter-section-body" }, /* @__PURE__ */ React.createElement("div", { className: "region-fq-scroll" }, (() => {
     const COLOR_BOOKED = "#6366f1";
     const COLOR_BU = "#d97706";
     const COLOR_DJ = "#8b5cf6";
@@ -7104,7 +7070,7 @@ function RegionQuarterTable() {
       ].join(" ")
     },
     "All Quarters"
-  ))))), selectedFQ && /* @__PURE__ */ React.createElement("div", { className: "region-filter-section glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setBandOpen((p) => !p), className: "region-filter-section-head" }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${bandOpen ? "is-open" : ""}` }, "\u25BC"), /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-title" }, "Bands"), selectedBand !== "all" && /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-badge region-filter-section-badge-emerald" }, BAND_OPTIONS.find((b) => b.value === selectedBand)?.label || selectedBand)), bandOpen && /* @__PURE__ */ React.createElement("div", { className: "region-filter-section-body max-h-40" }, bandRows.filter((b) => b.accounts > 0 || b.value === "all").map((opt) => {
+  )))), selectedFQ && /* @__PURE__ */ React.createElement("div", { className: "region-filter-section glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setBandOpen((p) => !p), className: "region-filter-section-head" }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${bandOpen ? "is-open" : ""}` }, "\u25BC"), /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-title" }, "Bands"), selectedBand !== "all" && /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-badge region-filter-section-badge-emerald" }, BAND_OPTIONS.find((b) => b.value === selectedBand)?.label || selectedBand)), bandOpen && /* @__PURE__ */ React.createElement("div", { className: "region-filter-section-body max-h-40" }, bandRows.filter((b) => b.accounts > 0 || b.value === "all").map((opt) => {
     const active = selectedBand === opt.value;
     return /* @__PURE__ */ React.createElement(
       "button",
@@ -7318,7 +7284,7 @@ function RegionQuarterTable() {
         actions.setNote(key, null);
       }
     }
-  ));
+  )));
 }
 function NoteHistoryPanel({ history }) {
   const [open, setOpen] = React.useState(false);

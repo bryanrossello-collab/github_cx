@@ -932,6 +932,68 @@
         -webkit-appearance: none;
         margin: 0;
       }
+
+      /* ARR range control rendered inside the top-bar Filters modal.
+         Matches the modal's field styling; presets render as inline pills. */
+      .vibe-arr-modal .vibe-arr-modal-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .vibe-arr-modal .vibe-arr-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0;
+        width: auto;
+        margin: 0;
+        padding: 4px 10px;
+        border-radius: 9999px;
+        border: 1px solid var(--border);
+        background: var(--surface-muted);
+        font-size: 11px;
+        font-weight: 500;
+        line-height: 1.2;
+        cursor: pointer;
+        transition: border-color 0.15s ease, background 0.15s ease;
+      }
+      .vibe-arr-modal .vibe-arr-chip .vibe-arr-check {
+        display: none;
+      }
+      .vibe-arr-modal .vibe-arr-chip:hover {
+        border-color: rgba(99, 102, 241, 0.4);
+      }
+      .vibe-arr-modal .vibe-arr-chip.active {
+        border-color: #6366f1;
+        background: rgba(99, 102, 241, 0.12);
+        color: #4f46e5;
+        font-weight: 600;
+      }
+      html.dark .vibe-arr-modal .vibe-arr-chip.active {
+        color: #a5b4fc;
+      }
+      .vibe-arr-modal .vibe-arr-custom {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+        margin-top: 6px;
+      }
+      .vibe-arr-modal input.vibe-money-input {
+        width: 100%;
+        padding: 6px 8px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        font-size: 12px;
+        text-align: right;
+        -moz-appearance: textfield;
+      }
+      .vibe-arr-modal .vibe-arr-summary {
+        font-size: 11px;
+        color: var(--text-muted);
+        margin-top: 4px;
+      }
+      .vibe-arr-modal .vibe-arr-summary:empty {
+        display: none;
+      }
       input[data-vibe-money-input] { -moz-appearance: textfield; }
       input[data-vibe-elt-readonly] {
         background: #f3f4f6 !important;
@@ -1974,6 +2036,7 @@
         grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: 10px;
         width: 100%;
+        align-items: start;
       }
       @media (max-width: 1100px) {
         .region-filter-sections { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -2136,7 +2199,7 @@
     <script src="vendor/vibe-session-lock.js"></script>
 
     <!-- App (compiled from app.jsx by ./build.sh) -->
-    <script src="vendor/app.js?v=20260706m"></script>
+    <script src="vendor/app.js?v=20260706r"></script>
 
     <!--
       Container-mode toolbar tweaks. Mounted after the React app so we can
@@ -2462,6 +2525,24 @@
           updateArrSummary(panel);
         }
 
+        // The ARR filter can render in more than one place at once (the
+        // Region accordion + the top-bar Filters modal). These helpers keep
+        // every mounted panel visually in sync with the shared selection.
+        function allArrPanels() {
+          return document.querySelectorAll('[data-vibe-arr-panel]');
+        }
+        function syncAllArrPanels() {
+          allArrPanels().forEach(function (p) { syncArrChipUI(p); });
+        }
+        function clearAllArrCustomInputs() {
+          allArrPanels().forEach(function (p) {
+            const mn = p.querySelector('[data-vibe-arr-min]');
+            const mx = p.querySelector('[data-vibe-arr-max]');
+            if (mn) mn.value = '';
+            if (mx) mx.value = '';
+          });
+        }
+
         function pushArrFilters(ranges) {
           const actions = window.__renewalsActions;
           if (!actions || typeof actions.setFilters !== 'function') return;
@@ -2493,17 +2574,14 @@
           if (id === 'all') {
             _arrSelectedIds.clear();
             _arrSelectedIds.add('all');
-            panel.querySelector('[data-vibe-arr-min]').value = '';
-            panel.querySelector('[data-vibe-arr-max]').value = '';
           } else {
             _arrSelectedIds.delete('all');
             if (_arrSelectedIds.has(id)) _arrSelectedIds.delete(id);
             else _arrSelectedIds.add(id);
             if (_arrSelectedIds.size === 0) _arrSelectedIds.add('all');
-            panel.querySelector('[data-vibe-arr-min]').value = '';
-            panel.querySelector('[data-vibe-arr-max]').value = '';
           }
-          syncArrChipUI(panel);
+          clearAllArrCustomInputs();
+          syncAllArrPanels();
           applyArrSelection(panel);
         }
 
@@ -2888,6 +2966,7 @@
           panel.className = 'region-filter-section glass-card-surface';
           panel.setAttribute('role', 'group');
           panel.setAttribute('aria-label', 'ARR range filter');
+          panel.setAttribute('data-vibe-arr-panel', 'sidebar');
           panel.innerHTML =
             '<button type="button" class="vibe-arr-toggle" data-vibe-arr-toggle>' +
               '<span class="vibe-arr-chevron" aria-hidden="true">▼</span> ARR Range' +
@@ -2913,11 +2992,13 @@
           panel.dataset.vibeArrWired = '1';
 
           const toggle = panel.querySelector('[data-vibe-arr-toggle]');
-          toggle.addEventListener('click', function () {
-            _arrSidebarOpen = !_arrSidebarOpen;
-            panel.classList.toggle('vibe-arr-collapsed', !_arrSidebarOpen);
-          });
-          if (!_arrSidebarOpen) panel.classList.add('vibe-arr-collapsed');
+          if (toggle) {
+            toggle.addEventListener('click', function () {
+              _arrSidebarOpen = !_arrSidebarOpen;
+              panel.classList.toggle('vibe-arr-collapsed', !_arrSidebarOpen);
+            });
+            if (!_arrSidebarOpen) panel.classList.add('vibe-arr-collapsed');
+          }
 
           const chips = panel.querySelector('[data-vibe-arr-chips]');
           ARR_PRESETS.forEach(function (preset) {
@@ -2939,17 +3020,50 @@
             if (min == null && max == null) {
               _arrSelectedIds.clear();
               _arrSelectedIds.add('all');
-              syncArrChipUI(panel);
+              syncAllArrPanels();
               pushArrFilters([]);
               return;
             }
             _arrSelectedIds.clear();
-            syncArrChipUI(panel);
+            syncAllArrPanels();
             pushArrFilters([{ min: min, max: max }]);
             updateArrSummary(panel);
           }
           panel.querySelector('[data-vibe-arr-min]').addEventListener('change', applyCustom);
           panel.querySelector('[data-vibe-arr-max]').addEventListener('change', applyCustom);
+          syncArrChipUI(panel);
+        }
+
+        // ---- ARR Range control inside the top-bar Filters modal ----------
+        // Reuses the shared selection + wiring (wireArrFilterPanel) so it
+        // stays in lock-step with the Region accordion version.
+        function buildArrModalField() {
+          const wrap = document.createElement('label');
+          wrap.id = 'vibe-arr-modal';
+          wrap.className = 'filter-field vibe-arr-modal';
+          wrap.setAttribute('data-vibe-arr-panel', 'modal');
+          wrap.innerHTML =
+            '<span class="filter-label">ARR Range</span>' +
+            '<div class="vibe-arr-modal-chips" data-vibe-arr-chips></div>' +
+            '<div class="vibe-arr-custom">' +
+              '<input class="vibe-money-input" data-vibe-arr-min placeholder="Min $" inputmode="decimal" aria-label="ARR minimum" />' +
+              '<input class="vibe-money-input" data-vibe-arr-max placeholder="Max $" inputmode="decimal" aria-label="ARR maximum" />' +
+            '</div>' +
+            '<div class="vibe-arr-summary" data-vibe-arr-summary></div>';
+          return wrap;
+        }
+
+        function ensureArrFilterInModal() {
+          const sheet = document.querySelector('.filter-sheet');
+          if (!sheet) return;
+          const fields = sheet.querySelector('.filter-sheet-fields');
+          if (!fields) return;
+          let panel = sheet.querySelector('#vibe-arr-modal');
+          if (!panel) {
+            panel = buildArrModalField();
+            fields.appendChild(panel);
+            wireArrFilterPanel(panel);
+          }
           syncArrChipUI(panel);
         }
 
@@ -3669,6 +3783,7 @@
             });
             ensureUserMenu();
             ensureArrFilterSidebar();
+            ensureArrFilterInModal();
             ensurePlanningSync();
             ensureEltFilterSync();
             ensureEditRawGate();
