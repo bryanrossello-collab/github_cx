@@ -527,11 +527,12 @@ function migrateDeletesObject(deletes, notes) {
 function formatCurrencyUSD(v) {
   const n = Number(v) || 0;
   const abs = Math.abs(n);
-  const fmt = (val, suffix) => `$${val.toFixed(1)}${suffix}`;
-  if (abs >= 1e9) return fmt(n / 1e9, "B");
-  if (abs >= 1e6) return fmt(n / 1e6, "M");
-  if (abs >= 1e3) return fmt(n / 1e3, "K");
-  return `$${Math.round(n).toLocaleString()}`;
+  const sign = n < 0 ? "-" : "";
+  const fmt = (val, suffix) => `${sign}$${val.toFixed(1)}${suffix}`;
+  if (abs >= 1e9) return fmt(abs / 1e9, "B");
+  if (abs >= 1e6) return fmt(abs / 1e6, "M");
+  if (abs >= 1e3) return fmt(abs / 1e3, "K");
+  return `${sign}$${Math.round(abs).toLocaleString()}`;
 }
 function formatNoteDate(ts) {
   if (!ts) return "";
@@ -6973,14 +6974,21 @@ function RegionQuarterTable() {
       accts.add(acctId);
       const nk = r.__noteKey;
       const note = nk ? notes[nk] : null;
+      const _ck = typeof RenewalsCallKeys !== "undefined" ? RenewalsCallKeys.buildCallKey(r, hm, settings) : null;
+      const _fc = _ck && fcByAccount ? fcByAccount.get(_ck) : null;
+      const _cs = _fc && _fc.cs_forecast != null ? toNumber(_fc.cs_forecast) : null;
+      const _rn = _fc && _fc.renewals_forecast != null ? toNumber(_fc.renewals_forecast) : null;
       const djRaw = note && !note.archived && note.djForecast != null && isFinite(toNumber(note.djForecast)) ? toNumber(note.djForecast) : null;
-      if (djRaw !== null) {
+      if (_cs !== null || _rn !== null) {
+        djTotal += (_cs || 0) + (_rn || 0);
+        djOverrideCount++;
+      } else if (djRaw !== null) {
         djTotal += djRaw;
         djOverrideCount++;
       } else {
         djTotal += bu;
       }
-      if (note && !note.archived && (safeString(note.note) || djRaw !== null)) reviewedAccts.add(acctId);
+      if (_cs !== null || _rn !== null || note && !note.archived && (safeString(note.note) || djRaw !== null)) reviewedAccts.add(acctId);
       const h = safeString(r[healthKey]).toLowerCase();
       if (h === "red" || h === "churning") atRisk += atr;
     }
@@ -7005,7 +7013,7 @@ function RegionQuarterTable() {
     const gap = target > 0 ? totalAtr - target : null;
     const attain = target > 0 ? totalAtr / target : null;
     return { totalAtr, fullAtr, histAtr, histCount, bookedCC, remainingCC, expectedCC, expectedCcRate, expectedDj, expectedDjRate, acctCount, buTotal, ccRate, djTotal, djOverrideCount, atRisk, target, gap, attain, reviewedCount };
-  }, [focusRows, histRowsFiltered, atrKey, buKey, acctKey, acctIdKey, healthKey, histAtrKey, histCcKey, state.targets, selectedFQ, rowsView, notes]);
+  }, [focusRows, histRowsFiltered, atrKey, buKey, acctKey, acctIdKey, healthKey, histAtrKey, histCcKey, state.targets, selectedFQ, rowsView, notes, fcByAccount, hm, settings]);
   const gapColor = (g) => g >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-red-500 dark:text-red-400";
   const attainColor = (a) => a >= 1 ? "text-emerald-600 dark:text-emerald-400" : a >= 0.9 ? "text-amber-600 dark:text-amber-400" : "text-red-500 dark:text-red-400";
   const _mobileBandLabel = selectedBand && selectedBand !== "all" ? BAND_OPTIONS.find((b) => b.value === selectedBand)?.label || selectedBand : "All accounts";
@@ -7394,6 +7402,27 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
     if (existing && existing.djForecast != null && isFinite(existing.djForecast)) return fmtCurr(existing.djForecast);
     return "";
   });
+  const [csDraft, setCsDraft] = React.useState("");
+  const [rnDraft, setRnDraft] = React.useState("");
+  const _callKey = typeof RenewalsCallKeys !== "undefined" ? RenewalsCallKeys.buildCallKey(row, headerMap, settings) : null;
+  const _callAccountId = safeString(row[acctIdKey]);
+  React.useEffect(() => {
+    if (!_callKey || !_callAccountId) return;
+    let cancelled = false;
+    fetch("/api/renewals/account-forecasts/" + encodeURIComponent(_callAccountId) + "?call_key=" + encodeURIComponent(_callKey), { cache: "no-store" }).then((r) => r.ok ? r.json() : null).then((d) => {
+      if (cancelled || !d) return;
+      if (d.cs_forecast != null && isFinite(toNumber(d.cs_forecast))) setCsDraft(fmtCurr(toNumber(d.cs_forecast)));
+      if (d.renewals_forecast != null && isFinite(toNumber(d.renewals_forecast))) setRnDraft(fmtCurr(toNumber(d.renewals_forecast)));
+    }).catch(() => {
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [_callKey, _callAccountId]);
+  const _csVal = normDj(csDraft) === "" ? null : toNumber(normDj(csDraft));
+  const _rnVal = normDj(rnDraft) === "" ? null : toNumber(normDj(rnDraft));
+  const _hasCall = _csVal != null && isFinite(_csVal) || _rnVal != null && isFinite(_rnVal);
+  const _eltComputed = _hasCall ? (isFinite(_csVal) ? _csVal : 0) + (isFinite(_rnVal) ? _rnVal : 0) : null;
   const [newEntry, setNewEntry] = React.useState("");
   const [showRaw, setShowRaw] = React.useState(false);
   const [showForecast, setShowForecast] = React.useState(false);
@@ -7445,10 +7474,35 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
       fq: safeString(row[qKey]),
       atr,
       note: noteDraft,
-      djForecast: djVal !== null && isFinite(djVal) ? djVal : null,
+      djForecast: _hasCall ? null : djVal !== null && isFinite(djVal) ? djVal : null,
       archived: false,
       updatedAt: Date.now()
     });
+    if (_callKey && _callAccountId && _hasCall) {
+      const yq = typeof RenewalsCallKeys !== "undefined" ? RenewalsCallKeys.yearQuarterFromRow(row, headerMap) : "";
+      const ratr = typeof RenewalsCallKeys !== "undefined" ? RenewalsCallKeys.effectiveAtrFromRow(row, headerMap, settings) : 0;
+      fetch("/api/renewals/account-forecasts/" + encodeURIComponent(_callAccountId), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          call_key: _callKey,
+          account_name: safeString(row[acctKey]),
+          year_quarter: yq,
+          rounded_atr: ratr,
+          cs_forecast: _csVal != null && isFinite(_csVal) ? _csVal : null,
+          renewals_forecast: _rnVal != null && isFinite(_rnVal) ? _rnVal : null,
+          source: "modal_done"
+        })
+      }).then((r) => {
+        if (r.ok) {
+          try {
+            window.dispatchEvent(new CustomEvent("renewals-acctfc-changed"));
+          } catch (_) {
+          }
+        }
+      }).catch(() => {
+      });
+    }
   };
   saveRef.current = handleSave;
   React.useEffect(() => {
@@ -7529,21 +7583,43 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
     isFinite(touchVal) && touchVal > 0 ? ["Days since touch", `${touchVal}d`] : null,
     largest ? ["Largest", `${largest.date || "--"} \xB7 ${fmtCompact(largest.atr || 0)}`] : null,
     safeString(row[headerMap.DICTATED_BY]) ? ["Dictated by", safeString(row[headerMap.DICTATED_BY])] : null
-  ].filter(Boolean).map(([label, val]) => /* @__PURE__ */ React.createElement("div", { key: label, className: "flex justify-between items-baseline" }, /* @__PURE__ */ React.createElement("span", { className: "text-[10px] uppercase tracking-wider font-semibold text-gray-500 dark:text-gray-400" }, label), /* @__PURE__ */ React.createElement("span", { className: "text-xs font-medium text-gray-800 dark:text-gray-100" }, val)))), safeString(row[partnerKey]) && /* @__PURE__ */ React.createElement("div", { className: "space-y-1 pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Partner"), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-700 dark:text-gray-200" }, safeString(row[partnerKey]))), products.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-1 pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Products"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1" }, products.map((p, i) => /* @__PURE__ */ React.createElement("span", { key: `${p}-${i}`, className: "pill-chip pill-chip-muted" }, p)))), summaryText && /* @__PURE__ */ React.createElement("div", { className: "pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "flex items-center gap-1 text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-widest hover:text-gray-700 dark:hover:text-gray-300 transition-colors", onClick: () => setShowForecast(!showForecast) }, /* @__PURE__ */ React.createElement("svg", { className: `w-3 h-3 transition-transform ${showForecast ? "rotate-90" : ""}`, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor" }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M9 5l7 7-7 7" })), "Forecast Summary"), showForecast && /* @__PURE__ */ React.createElement("div", { className: "mt-1.5 text-[11px] text-gray-700 dark:text-gray-200 leading-relaxed" }, summaryText))), /* @__PURE__ */ React.createElement("div", { className: "acct-modal-main" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2.5 mb-4" }, /* @__PURE__ */ React.createElement("span", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400 shrink-0" }, "ELT Forecast"), /* @__PURE__ */ React.createElement(
+  ].filter(Boolean).map(([label, val]) => /* @__PURE__ */ React.createElement("div", { key: label, className: "flex justify-between items-baseline" }, /* @__PURE__ */ React.createElement("span", { className: "text-[10px] uppercase tracking-wider font-semibold text-gray-500 dark:text-gray-400" }, label), /* @__PURE__ */ React.createElement("span", { className: "text-xs font-medium text-gray-800 dark:text-gray-100" }, val)))), safeString(row[partnerKey]) && /* @__PURE__ */ React.createElement("div", { className: "space-y-1 pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Partner"), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-700 dark:text-gray-200" }, safeString(row[partnerKey]))), products.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-1 pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Products"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1" }, products.map((p, i) => /* @__PURE__ */ React.createElement("span", { key: `${p}-${i}`, className: "pill-chip pill-chip-muted" }, p)))), summaryText && /* @__PURE__ */ React.createElement("div", { className: "pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "flex items-center gap-1 text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-widest hover:text-gray-700 dark:hover:text-gray-300 transition-colors", onClick: () => setShowForecast(!showForecast) }, /* @__PURE__ */ React.createElement("svg", { className: `w-3 h-3 transition-transform ${showForecast ? "rotate-90" : ""}`, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor" }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M9 5l7 7-7 7" })), "Forecast Summary"), showForecast && /* @__PURE__ */ React.createElement("div", { className: "mt-1.5 text-[11px] text-gray-700 dark:text-gray-200 leading-relaxed" }, summaryText))), /* @__PURE__ */ React.createElement("div", { className: "acct-modal-main" }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 mb-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400 mb-1" }, "CS Forecast"), /* @__PURE__ */ React.createElement("input", { className: "w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-slate-900 text-xs font-bold px-2.5 py-1.5 tabular-nums", inputMode: "decimal", placeholder: "--", value: csDraft, onChange: (e) => setCsDraft(e.target.value), onFocus: () => setCsDraft(normDj(csDraft)), onBlur: () => {
+    const raw = normDj(csDraft);
+    setCsDraft(raw === "" ? "" : isFinite(toNumber(raw)) ? fmtCurr(toNumber(raw)) : "");
+  }, onKeyDown: (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      saveRef.current?.();
+    }
+  } })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400 mb-1" }, "Renewals Forecast"), /* @__PURE__ */ React.createElement("input", { className: "w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-slate-900 text-xs font-bold px-2.5 py-1.5 tabular-nums", inputMode: "decimal", placeholder: "--", value: rnDraft, onChange: (e) => setRnDraft(e.target.value), onFocus: () => setRnDraft(normDj(rnDraft)), onBlur: () => {
+    const raw = normDj(rnDraft);
+    setRnDraft(raw === "" ? "" : isFinite(toNumber(raw)) ? fmtCurr(toNumber(raw)) : "");
+  }, onKeyDown: (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      saveRef.current?.();
+    }
+  } }))), /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-400 mb-3" }, _hasCall ? "ELT Forecast = CS + Renewals (read-only). Clear both to set ELT manually. Calls save when you click Done." : "Enter CS and/or Renewals to compute ELT, or set ELT manually below."), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2.5 mb-4" }, /* @__PURE__ */ React.createElement("span", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400 shrink-0" }, "ELT Forecast"), /* @__PURE__ */ React.createElement(
     "input",
     {
       className: "w-28 rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-slate-900 text-xs font-bold px-2.5 py-1.5 tabular-nums",
       inputMode: "decimal",
       placeholder: "--",
-      value: djDraft,
-      onChange: (e) => setDjDraft(e.target.value),
+      value: _hasCall ? fmtCurr(_eltComputed) : djDraft,
+      readOnly: _hasCall,
+      title: _hasCall ? "ELT = CS + Renewals (clear both to edit manually)" : "",
+      onChange: (e) => {
+        if (!_hasCall) setDjDraft(e.target.value);
+      },
       onKeyDown: (e) => {
         if (e.key === "Enter") {
           e.preventDefault();
-          const raw = normDj(djDraft);
-          if (raw !== "") {
-            const n = toNumber(raw);
-            setDjDraft(isFinite(n) ? fmtCurr(n) : "");
+          if (!_hasCall) {
+            const raw = normDj(djDraft);
+            if (raw !== "") {
+              const n = toNumber(raw);
+              setDjDraft(isFinite(n) ? fmtCurr(n) : "");
+            }
           }
           saveRef.current?.();
         }
@@ -7559,7 +7635,7 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
       },
       onFocus: () => setDjDraft(normDj(djDraft))
     }
-  ), /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-indigo", onClick: () => setDjDraft(fmtCurr(bu)) }, "= BU FC"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-emerald", onClick: () => setDjDraft("$0") }, "Flat"), djDraft && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-slate", onClick: () => setDjDraft("") }, "Clear")), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement(
+  ), !_hasCall && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-indigo", onClick: () => setDjDraft(fmtCurr(bu)) }, "= BU FC"), !_hasCall && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-emerald", onClick: () => setDjDraft("$0") }, "Flat"), !_hasCall && djDraft && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-slate", onClick: () => setDjDraft("") }, "Clear"), _hasCall && /* @__PURE__ */ React.createElement("span", { className: "text-[10px] text-gray-400" }, "= CS + Renewals")), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement(
     "input",
     {
       ref: inputRef,
@@ -7752,15 +7828,19 @@ function DataTable({ rows }) {
     const id = accountIdFromRow(r, hm);
     return id ? fcByAccount.get(id) : null;
   };
+  const noteDjVal = (r) => {
+    const nk = r.__noteKey;
+    const note = nk ? notes[nk] : null;
+    return note && !note.archived && note.djForecast != null && isFinite(toNumber(note.djForecast)) ? toNumber(note.djForecast) : null;
+  };
   const fcSortVal = (r, key) => {
     const fc = fcForRow(r);
-    if (!fc) return null;
-    if (key === FC_SORT_CS) return fc.cs_forecast != null ? toNumber(fc.cs_forecast) : null;
-    if (key === FC_SORT_RN) return fc.renewals_forecast != null ? toNumber(fc.renewals_forecast) : null;
-    const cs = fc.cs_forecast != null ? toNumber(fc.cs_forecast) : 0;
-    const rn = fc.renewals_forecast != null ? toNumber(fc.renewals_forecast) : 0;
-    if (fc.cs_forecast == null && fc.renewals_forecast == null) return null;
-    return cs + rn;
+    if (key === FC_SORT_CS) return fc && fc.cs_forecast != null ? toNumber(fc.cs_forecast) : null;
+    if (key === FC_SORT_RN) return fc && fc.renewals_forecast != null ? toNumber(fc.renewals_forecast) : null;
+    const cs = fc && fc.cs_forecast != null ? toNumber(fc.cs_forecast) : null;
+    const rn = fc && fc.renewals_forecast != null ? toNumber(fc.renewals_forecast) : null;
+    if (cs != null || rn != null) return (cs || 0) + (rn || 0);
+    return noteDjVal(r);
   };
   const clearAcctFc = async (row, mode, e) => {
     if (e) {
@@ -7900,12 +7980,19 @@ function DataTable({ rows }) {
     } },
     visibleCols.eltCall && { id: "eltCall", label: "ELT Call", key: FC_SORT_ELT, sw: "76px", right: true, render: (_, r) => {
       const fc = fcForRow(r);
-      if (!fc) return null;
-      const cs = fc.cs_forecast != null ? toNumber(fc.cs_forecast) : null;
-      const rn = fc.renewals_forecast != null ? toNumber(fc.renewals_forecast) : null;
-      if (cs == null && rn == null) return null;
-      const sum = (cs || 0) + (rn || 0);
-      return /* @__PURE__ */ React.createElement("span", { className: "inline-flex items-center justify-end gap-0.5 font-semibold" }, fmtK(sum), fcClearBtn(r, "all", "Clear all calls"));
+      const cs = fc && fc.cs_forecast != null ? toNumber(fc.cs_forecast) : null;
+      const rn = fc && fc.renewals_forecast != null ? toNumber(fc.renewals_forecast) : null;
+      if (cs != null || rn != null) {
+        const sum = (cs || 0) + (rn || 0);
+        return /* @__PURE__ */ React.createElement("span", { className: "inline-flex items-center justify-end gap-0.5 font-semibold" }, fmtK(sum), fcClearBtn(r, "all", "Clear all calls"));
+      }
+      // Fall back to the ELT Forecast override stored on the note (set in the
+      // account card), matching how the Region tab surfaces ELT.
+      const nk = r.__noteKey;
+      const note = nk ? notes[nk] : null;
+      const dj = note && !note.archived && note.djForecast != null && isFinite(toNumber(note.djForecast)) ? toNumber(note.djForecast) : null;
+      if (dj == null) return null;
+      return /* @__PURE__ */ React.createElement("span", { className: "inline-flex items-center justify-end gap-0.5 font-semibold", title: "ELT Forecast override (from account card)" }, fmtK(dj));
     } },
     visibleCols.nextRenewal && { id: "renewal", label: "Renewal", key: dateKey, sw: "72px" },
     visibleCols.priorArr && { id: "priorArr", label: "Acct ARR", key: "__PRIOR_ARR__", sw: "68px", right: true, render: (_, r) => {

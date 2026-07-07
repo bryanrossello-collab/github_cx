@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from starlette.requests import ClientDisconnect
 
 from app.auth import require_admin, require_owner, require_signed_in, get_current_user, ResolvedUser
 from app.call_keys import build_call_key, parse_call_key
@@ -978,7 +979,16 @@ async def list_account_forecasts(request: Request) -> dict:
 async def account_forecasts_totals_filtered(request: Request) -> dict:
     """Roll up CS / Renewals / ELT for scoped renewal rows."""
     db = _db(request)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except ClientDisconnect:
+        # Browser aborted the request (common on hard refresh / rapid re-filter)
+        # before the body arrived. The client is gone, so just return zeros
+        # instead of surfacing a stack trace.
+        return {
+            "ok": True, "cs_total": 0, "renewals_total": 0, "elt_total": 0,
+            "variance": 0, "cs_count": 0, "renewals_count": 0, "total_accounts": 0,
+        }
     if not isinstance(body, dict):
         body = {}
     call_keys = body.get("call_keys")
