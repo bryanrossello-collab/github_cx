@@ -191,6 +191,7 @@ const FIELD_KEYS = {
   NEXT_RENEWAL_DATE: ["NEXT_RENEWAL_DATE", "RENEWAL_DATE", "RENEW_DATE"],
   LARGEST_RENEWAL_DATE: ["LARGEST_RENEWAL_DATE", "LARGEST RENEWAL DATE"],
   FORECAST_SUMMARY: ["FORECAST_SUMMARY", "FORECAST", "FC_SUMMARY"],
+  DICTATED_BY: ["DICTATED_BY", "RENEWAL_DICTATED_BY", "DICTATED BY"],
   OWNER: ["CRM_SUCCESS_OWNER_NAME", "SUCCESS_OWNER", "OWNER", "CSM"],
   PARTNER: ["PARTNER"],
   PARTNER_TYPE: ["PARTNER_TYPE_C", "PARTNER_TYPE__C", "PARTNER_TYPE"],
@@ -209,7 +210,6 @@ function normalizeHeader(h) {
   return String(h).trim().replace(/\s+/g, "_").replace(/[^\w_]/g, "").toUpperCase();
 }
 const DROPPED_COLUMNS = /* @__PURE__ */ new Set([
-  "DICTATED_BY",
   "QTD_CC",
   "FC_ONCYCLE",
   "FC_OFFCYCLE",
@@ -359,6 +359,7 @@ function buildHeaderMap(headers) {
   map.LARGEST_RENEWAL_DATE = find(FIELD_KEYS.LARGEST_RENEWAL_DATE);
   map.FORECAST_SUMMARY = find(FIELD_KEYS.FORECAST_SUMMARY);
   map.OWNER = find(FIELD_KEYS.OWNER) || "CRM_SUCCESS_OWNER_NAME";
+  map.DICTATED_BY = find(FIELD_KEYS.DICTATED_BY) || "DICTATED_BY";
   map.PARTNER = find(FIELD_KEYS.PARTNER);
   map.PARTNER_TYPE = find(FIELD_KEYS.PARTNER_TYPE);
   map.PRODUCT_LINES = find(FIELD_KEYS.PRODUCT_LINES) || "PRODUCT_LINES";
@@ -906,6 +907,7 @@ const initialState = {
     bufc: true,
     nextRenewal: true,
     owner: true,
+    dictatedBy: true,
     partner: false,
     partnerType: false,
     summary: false,
@@ -1280,7 +1282,12 @@ function AppProvider({ children }) {
           headers: { "Content-Type": "application/json" },
           body: serialized
         });
-        if (!res.ok) throw new Error("PUT " + res.status);
+        if (!res.ok) {
+          if (res.status === 401 && typeof window !== "undefined" && window.RenewalsSessionLock && typeof window.RenewalsSessionLock.showLock === "function") {
+            window.RenewalsSessionLock.showLock("Your secure sign-in session expired, so your latest note was NOT saved to the server. Refresh the page to sign in again, then re-enter your note.");
+          }
+          throw new Error("PUT " + res.status);
+        }
         _notesLastPut.current = serialized;
         setServerSyncStatus("synced");
       } catch (err) {
@@ -4687,11 +4694,15 @@ function useAccountForecasts() {
       const m = /* @__PURE__ */ new Map();
       (data.items || []).forEach((item) => {
         const ck = safeString(item.call_key);
-        if (ck) m.set(ck, item);
-        const id = safeString(item.account_id);
-        if (id) m.set(id, item);
-        const name = safeString(item.account_name);
-        if (name) m.set(name, item);
+        if (!ck) return;
+        // Calls are keyed strictly by account + quarter + rounded ATR
+        // (the call_key). Indexing by bare account id/name previously let a
+        // call in one quarter bleed onto every other quarter of the account
+        // and made deletes look like no-ops. A fully-cleared call (both
+        // forecasts null) is skipped so it disappears everywhere.
+        const hasValue = item.cs_forecast != null || item.renewals_forecast != null;
+        if (!hasValue) return;
+        m.set(ck, item);
       });
       setByAccount(m);
       try {
@@ -6729,20 +6740,7 @@ function RegionQuarterTable() {
   }, [validRows, qKey, atrKey, buKey]);
   useEffect(() => {
     if (!selectedFQ && rowsView.length) {
-      const now = /* @__PURE__ */ new Date();
-      const month = now.getMonth();
-      const currentQ = month >= 1 && month <= 3 ? 1 : month >= 4 && month <= 6 ? 2 : month >= 7 && month <= 9 ? 3 : 4;
-      const primaryFy = month === 0 ? now.getFullYear() % 100 : (now.getFullYear() + 1) % 100;
-      const exact = rowsView.find((row) => {
-        const p = parseFiscalLabel(row.fq);
-        return p.fy === primaryFy && p.fq === currentQ;
-      });
-      if (exact) setSelectedFQ(exact.fq);
-      else {
-        const sq = rowsView.filter((row) => parseFiscalLabel(row.fq).fq === currentQ);
-        if (sq.length) setSelectedFQ(sq.sort((a, b) => Math.abs(parseFiscalLabel(a.fq).fy - primaryFy) - Math.abs(parseFiscalLabel(b.fq).fy - primaryFy))[0].fq);
-        else setSelectedFQ(rowsView[rowsView.length - 1].fq);
-      }
+      setSelectedFQ("__ALL_FQ__");
     }
     setSelectedAccountRow(null);
   }, [rowsView.length, selectedFQ, selectedSubregions, selectedBand]);
@@ -7229,11 +7227,11 @@ function RegionQuarterTable() {
       alert("No rows to export");
       return;
     }
-    const hdr = ["Account", "Renewal", "ATR", "C/C FC", "ELT Call", "CC%", "Health", "Owner", "Partner"];
+    const hdr = ["Account", "Renewal", "ATR", "C/C FC", "ELT Call", "CC%", "Health", "Owner", "Partner", "Renewal Dictated By"];
     const csvRows = [hdr.join(",")];
     vis.forEach((row) => {
       const esc = escapeCsvField;
-      csvRows.push([esc(row.account), esc(row.date), row.atr, row.bu, row.dj != null ? row.dj : "", isFinite(row.cc) ? (row.cc * 100).toFixed(1) + "%" : "", esc(row.health), esc(row.owner), esc(row.partner)].join(","));
+      csvRows.push([esc(row.account), esc(row.date), row.atr, row.bu, row.dj != null ? row.dj : "", isFinite(row.cc) ? (row.cc * 100).toFixed(1) + "%" : "", esc(row.health), esc(row.owner), esc(row.partner), esc(safeString(row.r && row.r[hm.DICTATED_BY]))].join(","));
     });
     const blob = new Blob(["\uFEFF" + csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
@@ -7244,7 +7242,7 @@ function RegionQuarterTable() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-  } }, /* @__PURE__ */ React.createElement("svg", { className: "w-3.5 h-3.5 text-gray-500 dark:text-gray-400", fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 2 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5m0 0l5-5m-5 5V3" }))))), /* @__PURE__ */ React.createElement("div", { className: "table-container compact-table", style: { maxHeight: "420px" } }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full w-full table-fixed text-[10px]" }, /* @__PURE__ */ React.createElement("thead", { className: "text-[10px] uppercase text-gray-500 dark:text-gray-400" }, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer", onClick: () => toggleSort("account") }, "Account ", sortIcon("account")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer hidden sm:table-cell", style: { width: "72px" }, onClick: () => toggleSort("date") }, "Renewal ", sortIcon("date")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer", style: { width: "68px" }, onClick: () => toggleSort("atr") }, "ATR ", sortIcon("atr")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer hidden sm:table-cell", style: { width: "68px" }, onClick: () => toggleSort("bu") }, "C/C FC ", sortIcon("bu")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer", style: { width: "68px" }, onClick: () => toggleSort("dj") }, "ELT Call ", sortIcon("dj")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer hidden sm:table-cell", style: { width: "42px" }, onClick: () => toggleSort("cc") }, "CC% ", sortIcon("cc")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer", style: { width: "62px" }, onClick: () => toggleSort("health") }, "Health ", sortIcon("health")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer hidden sm:table-cell", style: { width: "90px" }, onClick: () => toggleSort("owner") }, "Owner ", sortIcon("owner")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left hidden sm:table-cell", style: { width: "90px" } }, "Partner"))), /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-gray-100 dark:divide-gray-800" }, detailRowsSorted.length === 0 && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 3, className: "px-1.5 py-2 text-center text-xs text-gray-500 sm:hidden" }, "No accounts for this selection"), /* @__PURE__ */ React.createElement("td", { colSpan: 9, className: "px-1.5 py-2 text-center text-xs text-gray-500 hidden sm:table-cell" }, "No accounts for this selection")), (detailLimit === "all" ? detailRowsSorted : detailRowsSorted.slice(0, Number(detailLimit))).map(({ r, account, owner, partner, partnerType, date, atr, bu, cc, health, dj }, idx) => /* @__PURE__ */ React.createElement(
+  } }, /* @__PURE__ */ React.createElement("svg", { className: "w-3.5 h-3.5 text-gray-500 dark:text-gray-400", fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 2 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5m0 0l5-5m-5 5V3" }))))), /* @__PURE__ */ React.createElement("div", { className: "table-container compact-table", style: { maxHeight: "420px" } }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full w-full table-fixed text-[10px]" }, /* @__PURE__ */ React.createElement("thead", { className: "text-[10px] uppercase text-gray-500 dark:text-gray-400" }, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer", onClick: () => toggleSort("account") }, "Account ", sortIcon("account")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer hidden sm:table-cell", style: { width: "72px" }, onClick: () => toggleSort("date") }, "Renewal ", sortIcon("date")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer", style: { width: "68px" }, onClick: () => toggleSort("atr") }, "ATR ", sortIcon("atr")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer hidden sm:table-cell", style: { width: "68px" }, onClick: () => toggleSort("bu") }, "C/C FC ", sortIcon("bu")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer", style: { width: "68px" }, onClick: () => toggleSort("dj") }, "ELT Call ", sortIcon("dj")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer hidden sm:table-cell", style: { width: "42px" }, onClick: () => toggleSort("cc") }, "CC% ", sortIcon("cc")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer", style: { width: "62px" }, onClick: () => toggleSort("health") }, "Health ", sortIcon("health")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer hidden sm:table-cell", style: { width: "90px" }, onClick: () => toggleSort("owner") }, "Owner ", sortIcon("owner")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left hidden sm:table-cell", style: { width: "90px" } }, "Partner"), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left hidden sm:table-cell", style: { width: "110px" }, title: "Renewal Dictated By" }, "Dictated By"))), /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-gray-100 dark:divide-gray-800" }, detailRowsSorted.length === 0 && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 3, className: "px-1.5 py-2 text-center text-xs text-gray-500 sm:hidden" }, "No accounts for this selection"), /* @__PURE__ */ React.createElement("td", { colSpan: 10, className: "px-1.5 py-2 text-center text-xs text-gray-500 hidden sm:table-cell" }, "No accounts for this selection")), (detailLimit === "all" ? detailRowsSorted : detailRowsSorted.slice(0, Number(detailLimit))).map(({ r, account, owner, partner, partnerType, date, atr, bu, cc, health, dj }, idx) => /* @__PURE__ */ React.createElement(
     "tr",
     {
       key: r.__uid || account + date,
@@ -7259,7 +7257,8 @@ function RegionQuarterTable() {
     /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1 text-right tabular-nums whitespace-nowrap hidden sm:table-cell" }, formatPercent(cc)),
     /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1" }, healthBadge(health)),
     /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1 truncate hidden sm:table-cell", title: owner || "" }, owner || "\u2014"),
-    /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1 truncate hidden sm:table-cell", title: partner || "" }, partner || "\u2014")
+    /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1 truncate hidden sm:table-cell", title: partner || "" }, partner || "\u2014"),
+    /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1 truncate hidden sm:table-cell", title: safeString(r[hm.DICTATED_BY]) || "" }, safeString(r[hm.DICTATED_BY]) || "\u2014")
   ))))))), selectedAccountRow && /* @__PURE__ */ React.createElement(
     AccountNoteModal,
     {
@@ -7528,7 +7527,8 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
     ["Date", safeString(row[dateKey]) || "--"],
     daysToRenew != null ? ["Days to renew", `${daysToRenew}d`] : null,
     isFinite(touchVal) && touchVal > 0 ? ["Days since touch", `${touchVal}d`] : null,
-    largest ? ["Largest", `${largest.date || "--"} \xB7 ${fmtCompact(largest.atr || 0)}`] : null
+    largest ? ["Largest", `${largest.date || "--"} \xB7 ${fmtCompact(largest.atr || 0)}`] : null,
+    safeString(row[headerMap.DICTATED_BY]) ? ["Dictated by", safeString(row[headerMap.DICTATED_BY])] : null
   ].filter(Boolean).map(([label, val]) => /* @__PURE__ */ React.createElement("div", { key: label, className: "flex justify-between items-baseline" }, /* @__PURE__ */ React.createElement("span", { className: "text-[10px] uppercase tracking-wider font-semibold text-gray-500 dark:text-gray-400" }, label), /* @__PURE__ */ React.createElement("span", { className: "text-xs font-medium text-gray-800 dark:text-gray-100" }, val)))), safeString(row[partnerKey]) && /* @__PURE__ */ React.createElement("div", { className: "space-y-1 pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Partner"), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-700 dark:text-gray-200" }, safeString(row[partnerKey]))), products.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-1 pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Products"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1" }, products.map((p, i) => /* @__PURE__ */ React.createElement("span", { key: `${p}-${i}`, className: "pill-chip pill-chip-muted" }, p)))), summaryText && /* @__PURE__ */ React.createElement("div", { className: "pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "flex items-center gap-1 text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-widest hover:text-gray-700 dark:hover:text-gray-300 transition-colors", onClick: () => setShowForecast(!showForecast) }, /* @__PURE__ */ React.createElement("svg", { className: `w-3 h-3 transition-transform ${showForecast ? "rotate-90" : ""}`, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor" }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M9 5l7 7-7 7" })), "Forecast Summary"), showForecast && /* @__PURE__ */ React.createElement("div", { className: "mt-1.5 text-[11px] text-gray-700 dark:text-gray-200 leading-relaxed" }, summaryText))), /* @__PURE__ */ React.createElement("div", { className: "acct-modal-main" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2.5 mb-4" }, /* @__PURE__ */ React.createElement("span", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400 shrink-0" }, "ELT Forecast"), /* @__PURE__ */ React.createElement(
     "input",
     {
@@ -7923,6 +7923,7 @@ function DataTable({ rows }) {
       return v != null ? fmtK(v) : "\u2014";
     } },
     visibleCols.owner && { id: "owner", label: "Owner", key: ownerKey, sw: "90px", trunc: true },
+    visibleCols.dictatedBy && { id: "dictatedBy", label: "Renewal Dictated By", key: hm.DICTATED_BY || "DICTATED_BY", sw: "120px", trunc: true },
     visibleCols.partner && { id: "partner", label: "Partner", key: hm.PARTNER || "PARTNER", sw: "80px", trunc: true },
     visibleCols.partnerType && { id: "partnerType", label: "Type", key: hm.PARTNER_TYPE || "PARTNER_TYPE_C", sw: "60px", trunc: true },
     visibleCols.summary && { id: "summary", label: "Forecast", key: hm.FORECAST_SUMMARY || "FORECAST_SUMMARY", sw: "110px", trunc: true },
@@ -8106,6 +8107,7 @@ function ColumnsDrawer() {
     ["largestAtr", "Lg. Renewal ATR"],
     ["nextRenewal", "Next Renewal"],
     ["owner", "Owner"],
+    ["dictatedBy", "Renewal Dictated By"],
     ["partner", "Partner"],
     ["partnerType", "Partner Type"],
     ["summary", "Forecast Summary"],

@@ -211,12 +211,16 @@
           Every upload becomes a versioned snapshot. The dashboard uses the snapshot
           with the latest <strong>effective date</strong> (parsed from the filename when
           possible). Duplicate account/quarter rows within a snapshot are deduplicated.
+          <br />
+          <strong>Large file?</strong> If a CSV is over ~30&nbsp;MB it may be rejected
+          (413). Zip it first and upload the <code>.zip</code> — the server unzips it
+          automatically.
         </p>
         <form id="upload-form" style="margin-top: 12px;">
           <div class="field-row">
             <div>
-              <label for="upload-file">File</label>
-              <input type="file" id="upload-file" accept=".csv,text/csv,text/plain" required />
+              <label for="upload-file">File (.csv or .zip)</label>
+              <input type="file" id="upload-file" accept=".csv,.zip,text/csv,text/plain,application/zip,application/x-zip-compressed" required />
             </div>
             <div>
               <label for="upload-slot">Slot</label>
@@ -523,7 +527,7 @@
       accounts: 'Accounts',
       notes: 'Notes',
       historical: 'Historical',
-      targets: 'Targets',
+      targets: 'Report',
     };
     let _tabAccessAllTabs = [];
     let _tabAccessMatrix = null;
@@ -1097,6 +1101,22 @@
     }
 
     bootAuth();
+
+    // If this admin page was opened from the dashboard (same session tab),
+    // "Back to dashboard" returns to that still-live tab instead of forcing
+    // a fresh full-page load of the dashboard.
+    (function () {
+      function backToDashboard(e) {
+        if (window.opener && !window.opener.closed) {
+          e.preventDefault();
+          try { window.opener.focus(); } catch (_) {}
+          window.close();
+        }
+      }
+      document.querySelectorAll('a[href="/"]').forEach(function (a) {
+        a.addEventListener('click', backToDashboard);
+      });
+    })();
   </script>
 </body>
 </html>

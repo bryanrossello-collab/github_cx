@@ -31,6 +31,7 @@ import csv
 import hashlib
 import io
 import json
+import zipfile
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -633,6 +634,71 @@ async def legacy_apps_renewals(request: Request, filename: str):
 # Upload — admin SSO only
 # ---------------------------------------------------------------------------
 
+# Upfront cap on a single decompressed CSV pulled out of a zip. Guards
+# against zip-bombs while staying well above any realistic renewals book.
+_MAX_UNZIPPED_CSV_BYTES = 300 * 1024 * 1024  # 300 MB
+
+
+def _looks_like_zip(content: bytes, filename: str, content_type: str) -> bool:
+    if content[:4] == b"PK\x03\x04":
+        return True
+    if filename.lower().endswith(".zip"):
+        return True
+    if "zip" in (content_type or "").lower():
+        return True
+    return False
+
+
+def _extract_csv_from_zip(content: bytes) -> tuple[bytes, str]:
+    """Pull the CSV out of an uploaded zip.
+
+    Returns (csv_bytes, inner_filename). Picks the single .csv entry, or the
+    largest one when several are present (ignoring macOS resource forks and
+    directories). Raises HTTPException(400) with a clear message on failure.
+    """
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid .zip archive.")
+
+    csv_entries = [
+        info
+        for info in zf.infolist()
+        if not info.is_dir()
+        and info.filename.lower().endswith(".csv")
+        and not info.filename.startswith("__MACOSX/")
+        and "/." not in info.filename
+        and not info.filename.startswith(".")
+    ]
+    if not csv_entries:
+        raise HTTPException(
+            status_code=400,
+            detail="No .csv file found inside the .zip archive.",
+        )
+
+    # Largest CSV = the data file when several are bundled.
+    chosen = max(csv_entries, key=lambda i: i.file_size)
+    if chosen.file_size > _MAX_UNZIPPED_CSV_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"CSV inside the zip is too large "
+                f"({chosen.file_size // (1024 * 1024)} MB, limit "
+                f"{_MAX_UNZIPPED_CSV_BYTES // (1024 * 1024)} MB)."
+            ),
+        )
+    try:
+        with zf.open(chosen) as fh:
+            csv_bytes = fh.read()
+    except Exception as exc:  # noqa: BLE001 — surface any decompression error
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read the CSV inside the zip: {type(exc).__name__}",
+        )
+    inner_name = chosen.filename.split("/")[-1]
+    return csv_bytes, inner_name
+
+
 @router.post("/upload-csv")
 async def upload_csv(
     request: Request,
@@ -667,19 +733,35 @@ async def upload_csv(
         explicit_slot = (form.get("slot") or explicit_slot or "").strip().lower()
         if not upload_note:
             upload_note = (form.get("note") or "").strip() or None
-    elif ct.startswith("text/csv") or ct.startswith("text/plain") or ct.startswith("application/octet-stream"):
+    elif (
+        ct.startswith("text/csv")
+        or ct.startswith("text/plain")
+        or ct.startswith("application/octet-stream")
+        or ct.startswith("application/zip")
+        or ct.startswith("application/x-zip-compressed")
+    ):
         content = await request.body()
     else:
         raise HTTPException(
             status_code=415,
             detail=(
-                "Content-Type must be text/csv, application/octet-stream, "
-                "or multipart/form-data"
+                "Content-Type must be text/csv, application/zip, "
+                "application/octet-stream, or multipart/form-data"
             ),
         )
 
     if not content:
         raise HTTPException(status_code=400, detail="empty CSV body")
+
+    # Accept a .zip that houses the CSV — a common workaround for the 32 MB
+    # request-size limit on Cloud Run. Unzip server-side and continue exactly
+    # as if the CSV had been uploaded directly (we store the decompressed
+    # bytes, so serving and ingest are unchanged).
+    if _looks_like_zip(content, filename, ct):
+        content, inner_name = _extract_csv_from_zip(content)
+        if not filename or filename.lower().endswith(".zip"):
+            filename = inner_name
+
     if not filename:
         filename = f"upload-{int(datetime.now(timezone.utc).timestamp())}.csv"
     filename = filename.replace("\\", "_").split("/")[-1].lstrip(".")

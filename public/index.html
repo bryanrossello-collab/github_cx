@@ -2335,7 +2335,7 @@
     <script src="vendor/vibe-session-lock.js"></script>
 
     <!-- App (compiled from app.jsx by ./build.sh) -->
-    <script src="vendor/app.js?v=20260706y"></script>
+    <script src="vendor/app.js?v=20260707f"></script>
 
     <!--
       Container-mode toolbar tweaks. Mounted after the React app so we can
@@ -2834,13 +2834,14 @@
                     '<span class="vibe-user-role guest" data-vibe-dd-role style="margin-top:6px;display:inline-block">Guest</span>' +
                   '</div>' +
                   '<button type="button" class="vibe-user-dd-item" data-vibe-dd-admin style="display:none">Admin panel</button>' +
+                  '<button type="button" class="vibe-user-dd-item" data-vibe-dd-resync>Re-sync my notes</button>' +
                   '<button type="button" class="vibe-user-dd-item" data-vibe-dd-whoami>Session info</button>' +
                 '</div>' +
               '</div>';
             rightBlock.insertBefore(wrap, rightBlock.firstChild);
 
             document.getElementById('vibe-admin-view-btn').addEventListener('click', function () {
-              window.location.href = '/admin';
+              window.open('/admin', 'renewalsAdmin');
             });
             document.getElementById('vibe-user-menu-trigger').addEventListener('click', function (ev) {
               ev.stopPropagation();
@@ -2851,7 +2852,11 @@
             });
             document.querySelector('[data-vibe-dd-admin]').addEventListener('click', function () {
               closeUserMenuDropdown();
-              window.location.href = '/admin';
+              window.open('/admin', 'renewalsAdmin');
+            });
+            document.querySelector('[data-vibe-dd-resync]').addEventListener('click', function () {
+              closeUserMenuDropdown();
+              resyncLocalNotes();
             });
             document.querySelector('[data-vibe-dd-whoami]').addEventListener('click', function () {
               closeUserMenuDropdown();
@@ -2920,6 +2925,78 @@
             'Source: ' + (user.source || id.source || '—'),
           ];
           alert(lines.join('\n'));
+        }
+
+        // Manually push any browser-local notes to the shared server. Useful
+        // after a session expired and background saves were silently rejected.
+        let _resyncInFlight = false;
+        async function resyncLocalNotes() {
+          if (_resyncInFlight) return;
+          _resyncInFlight = true;
+          try {
+            const peek = window.__renewalsPeekState && window.__renewalsPeekState();
+            const notes = (peek && peek.notes) || {};
+            const noteDeletes = (peek && peek.noteDeletes) || {};
+            const noteCount = Object.keys(notes).length;
+            if (!noteCount && !Object.keys(noteDeletes).length) {
+              alert('You have no notes on this device to re-sync.');
+              return;
+            }
+            // Confirm the session is still valid before attempting the write.
+            let signedIn = false;
+            try {
+              const who = await fetch('/api/whoami', { cache: 'no-store' });
+              if (who.ok) {
+                const wd = await who.json();
+                const role = wd && wd.user && wd.user.role;
+                signedIn = role === 'standard' || role === 'admin' || role === 'owner';
+              }
+            } catch (_) {}
+            if (!signedIn) {
+              if (window.RenewalsSessionLock && typeof window.RenewalsSessionLock.showLock === 'function') {
+                window.RenewalsSessionLock.showLock(
+                  'You need to sign in again before your notes can be saved. Refresh the page to sign in, then use "Re-sync my notes" again.'
+                );
+              } else {
+                alert('You appear to be signed out. Please refresh the page to sign in, then try Re-sync again.');
+              }
+              return;
+            }
+            const res = await fetch('/api/renewals/notes', {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ notes: notes, noteDeletes: noteDeletes }),
+            });
+            if (res.status === 401) {
+              if (window.RenewalsSessionLock && typeof window.RenewalsSessionLock.showLock === 'function') {
+                window.RenewalsSessionLock.showLock(
+                  'Your secure session expired. Refresh the page to sign in again, then use "Re-sync my notes".'
+                );
+              } else {
+                alert('Your session expired. Please refresh and sign in, then try Re-sync again.');
+              }
+              return;
+            }
+            if (!res.ok) {
+              alert('Re-sync failed (server said ' + res.status + '). Please try again in a moment.');
+              return;
+            }
+            const data = await res.json().catch(() => ({}));
+            const serverTotal = data && data.noteCount != null ? data.noteCount : null;
+            const denied = data && Array.isArray(data.deniedKeys) ? data.deniedKeys.length : 0;
+            let msg = 'Re-sync complete. Your ' + noteCount + ' note' + (noteCount === 1 ? '' : 's') + ' on this device ' + (noteCount === 1 ? 'was' : 'were') + ' sent to the shared server.';
+            if (serverTotal != null) {
+              msg += '\n\nThe shared server now has ' + serverTotal + ' note' + (serverTotal === 1 ? '' : 's') + ' total.';
+            }
+            if (denied > 0) {
+              msg += '\n\nNote: ' + denied + ' note' + (denied === 1 ? '' : 's') + ' could not be updated because they belong to another user (only an admin can edit those).';
+            }
+            alert(msg);
+          } catch (err) {
+            alert('Re-sync failed: ' + (err && err.message ? err.message : 'unknown error') + '. Please try again.');
+          } finally {
+            _resyncInFlight = false;
+          }
         }
 
         // ---- Planning data → Postgres (targets, rates, budgets, expansion) --

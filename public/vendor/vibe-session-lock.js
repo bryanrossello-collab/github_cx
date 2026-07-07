@@ -78,7 +78,7 @@
   }
 
   function showLock(message) {
-    if (!shouldEnforce() || locked) return;
+    if (locked) return;
     locked = true;
     ensureOverlay();
     document.documentElement.classList.add('vibe-session-locked');
@@ -108,7 +108,7 @@
     if (isAuthedUser(user)) {
       wasAuthed = true;
       if (locked) unlock();
-    } else if (wasAuthed && shouldEnforce()) {
+    } else if (wasAuthed) {
       showLock(
         'Your company sign-in session expired while you were working. ' +
         'Refresh the page to sign in again — unsaved changes on this screen were not written to the server.'
@@ -121,7 +121,7 @@
     return global.fetch('/api/whoami', { cache: 'no-store' })
       .then(function (res) {
         if (res.status === 401) {
-          if (wasAuthed && shouldEnforce()) {
+          if (wasAuthed) {
             showLock(
               'Authentication is required. Refresh the page to sign in through your company SSO.'
             );
@@ -145,7 +145,7 @@
     var orig = global.fetch.bind(global);
     global.fetch = function () {
       return orig.apply(global, arguments).then(function (res) {
-        if (res.status === 401 && wasAuthed && shouldEnforce()) {
+        if (res.status === 401 && wasAuthed) {
           res.clone().json().then(function (body) {
             if (isAuth401(body)) {
               showLock(
