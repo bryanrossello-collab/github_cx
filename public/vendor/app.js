@@ -8060,8 +8060,9 @@ function TrendingTab() {
 }
 function Accounts() {
   const { state } = useApp();
-  const rows = useFilteredRows();
   const { headerMap: hm, settings, notes } = state;
+  const _allRows = useFilteredRows();
+  const rows = React.useMemo(() => _allRows.filter((r) => isValidRenewal(r, hm, settings)), [_allRows, hm, settings]);
   const { byAccount: fcByAccount } = useAccountForecasts();
   useScopedCallKeys(rows, hm, settings);
   useScopedCallRollup(rows, hm, settings, notes, fcByAccount);
