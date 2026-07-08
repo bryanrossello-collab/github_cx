@@ -177,7 +177,7 @@ async def put_notes(
                 if not isinstance(payload, dict):
                     continue
                 existing = await conn.fetchrow(
-                    "SELECT owner_email, note_text, dj_forecast, history "
+                    "SELECT owner_email, note_text, dj_forecast, history, updated_at "
                     "FROM notes WHERE note_key = $1",
                     key,
                 )
@@ -463,6 +463,12 @@ def _dedupe_raw_rows(rows: list[dict]) -> list[dict]:
     return [seen[k] for k in order]
 
 
+# Above this row count, /parsed-data returns no rows and the client parses the
+# raw CSV instead — the JSONB round-trip for very large uploads is slow enough
+# to exhaust the DB command timeout and starve the connection pool.
+MAX_PARSED_DATA_ROWS = 40000
+
+
 @router.get("/parsed-data")
 async def parsed_data(request: Request, slot: str = Query(default="active")) -> dict:
     """Return pre-parsed dashboard rows from Postgres (``account_snapshots``).
@@ -515,6 +521,28 @@ async def parsed_data(request: Request, slot: str = Query(default="active")) -> 
                     status_code=503,
                     detail=f"snapshot ingest failed: {type(exc).__name__}: {exc}",
                 ) from exc
+            snap_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM account_snapshots WHERE csv_upload_id = $1",
+                upload_id,
+            )
+
+        # Very large uploads make the JSONB round-trip (fetch + serialize tens
+        # of thousands of rows) slow enough to hit the DB command timeout and
+        # starve the pool. Above this threshold we return no rows so the client
+        # falls back to fetching + parsing the raw CSV directly (fast, and it
+        # never ties up a DB connection).
+        if (snap_count or 0) > MAX_PARSED_DATA_ROWS:
+            return {
+                "ok": True,
+                "rows": [],
+                "headers": headers,
+                "source": "postgres:account_snapshots:too-large",
+                "count": int(snap_count or 0),
+                "note": (
+                    "Row count exceeds the server-parse threshold; the client "
+                    "will download and parse the raw CSV instead."
+                ),
+            }
 
         snap_rows = await conn.fetch(
             "SELECT raw_row FROM account_snapshots "
