@@ -1305,7 +1305,14 @@ function AppProvider({ children }) {
     let cancelled = false;
     setCsvAutoLoadStatus("pending");
     const processSlot = (config) => new Promise((resolve) => {
-      const { slot, label, matchSubstring, fallbackToCsvList, getCachedMs, hasData, importFnName } = config;
+      const { slot, label, matchSubstring, fallbackToCsvList, getCachedMs, hasData, importFnName, suppressActiveError } = config;
+      // Only flips the visible status (and thus the splash) to "error" when we
+      // are NOT going to retry. During retry attempts suppressActiveError is
+      // true, so the status stays "pending" and the gate keeps showing the
+      // loading spinner rather than the load-CSV splash.
+      const failActiveStatus = () => {
+        if (slot === "active" && !suppressActiveError) setCsvAutoLoadStatus("error");
+      };
       (async () => {
         let info = null;
         try {
@@ -1372,7 +1379,7 @@ function AppProvider({ children }) {
           const csvRes = await fetch(info.fetchUrl, { cache: "no-store" });
           if (!csvRes.ok) {
             if (!cancelled) {
-              if (slot === "active") setCsvAutoLoadStatus("error");
+              failActiveStatus();
               if (isRefresh) setRefreshState({ phase: "error", slot, label, filename: info.filename, error: "HTTP " + csvRes.status, startedAt });
             }
             return resolve(false);
@@ -1382,6 +1389,7 @@ function AppProvider({ children }) {
           if (isRefresh) {
             setRefreshState((prev) => prev ? { ...prev, phase: "parsing" } : prev);
           }
+          let importFailed = false;
           await new Promise((finishParse) => {
             streamParseCSV(text, {
               onProgress: (count) => {
@@ -1406,11 +1414,13 @@ function AppProvider({ children }) {
                         }, 2500);
                       }
                     } else {
-                      if (slot === "active") setCsvAutoLoadStatus("error");
+                      importFailed = true;
+                      failActiveStatus();
                       if (isRefresh) setRefreshState((prev) => prev ? { ...prev, phase: "error", error: "import handle missing" } : prev);
                     }
                   } catch (err) {
-                    if (slot === "active") setCsvAutoLoadStatus("error");
+                    importFailed = true;
+                    failActiveStatus();
                     if (isRefresh) setRefreshState((prev) => prev ? { ...prev, phase: "error", error: err?.message || "import failed" } : prev);
                   } finally {
                     finishParse();
@@ -1420,18 +1430,19 @@ function AppProvider({ children }) {
               onError: (err) => {
                 console.warn(`auto-load CSV (${slot}) parse error:`, err?.message || err);
                 if (!cancelled) {
-                  if (slot === "active") setCsvAutoLoadStatus("error");
+                  importFailed = true;
+                  failActiveStatus();
                   if (isRefresh) setRefreshState((prev) => prev ? { ...prev, phase: "error", error: err?.message || "parse failed" } : prev);
                 }
                 finishParse();
               }
             });
           });
-          resolve(true);
+          resolve(!importFailed);
         } catch (err) {
           console.warn(`auto-load CSV (${slot}) failed:`, err?.message || err);
           if (!cancelled) {
-            if (slot === "active") setCsvAutoLoadStatus("error");
+            failActiveStatus();
             if (isRefresh) setRefreshState((prev) => prev ? { ...prev, phase: "error", error: err?.message || "fetch failed" } : prev);
           }
           resolve(false);
@@ -1439,7 +1450,7 @@ function AppProvider({ children }) {
       })();
     });
     (async () => {
-      await processSlot({
+      const activeConfig = {
         slot: "active",
         label: "Active",
         matchSubstring: "2026 data",
@@ -1447,7 +1458,24 @@ function AppProvider({ children }) {
         getCachedMs: (cur) => Number(cur.meta?.uploadedAt) || 0,
         hasData: (cur) => Array.isArray(cur.data) && cur.data.length > 0,
         importFnName: "importCSV"
-      });
+      };
+      // Retry the active-slot auto-load on transient fetch/parse/import
+      // failures so a cache-less first-time user isn't stranded on the
+      // load-CSV splash after a single hiccup (e.g. a slow DB round-trip on a
+      // cold container). processSlot resolves false ONLY on a genuine error;
+      // the "empty"/no-source-configured case resolves true and is never
+      // retried. suppressActiveError keeps the status at "pending" (loading
+      // spinner) until the final attempt, so the splash appears at most once,
+      // only after retries are exhausted. This loop runs sequentially inside
+      // the single _autoLoadClaimed effect run, so it never stacks concurrent
+      // loads and never re-triggers reload storms.
+      const activeRetryBackoffsMs = [400, 800];
+      for (let attempt = 0; !cancelled; attempt++) {
+        const lastAttempt = attempt >= activeRetryBackoffsMs.length;
+        const ok = await processSlot({ ...activeConfig, suppressActiveError: !lastAttempt });
+        if (cancelled || ok || lastAttempt) break;
+        await new Promise((r) => setTimeout(r, activeRetryBackoffsMs[attempt]));
+      }
       if (cancelled) return;
       await processSlot({
         slot: "historical",
@@ -7304,11 +7332,11 @@ function RegionQuarterTable() {
   )))))), /* @__PURE__ */ React.createElement("div", { className: "region-main-panel" }, /* @__PURE__ */ React.createElement("div", { id: "region-top-stack", className: "region-top-stack" }, /* @__PURE__ */ React.createElement("div", { id: "region-kpi-grid", className: "region-kpi-strip" }, [
     { label: "Total ATR", info: "Sum of ATR (Annual Target Revenue) across renewals in the current view \u2014 pending plus already-closed. Respects all active filters.", value: formatCurrencyUSD(kpis.fullAtr), sub: kpis.histCount > 0 ? `${kpis.acctCount.toLocaleString()} pending \xB7 ${kpis.histCount.toLocaleString()} closed` : `${kpis.acctCount.toLocaleString()} accounts` },
     { label: "Churn Health ATR", info: "Total ATR of accounts with a Churning health status, within the current filters.", value: formatCurrencyUSD(kpis.churnAtr), sub: `Churning health \xB7 ${formatPercent(kpis.totalAtr > 0 ? kpis.churnAtr / kpis.totalAtr : 0)} of pending` },
+    { label: "Reviewed", info: "Share of pending accounts that have a note or an ELT Forecast override \u2014 i.e. an account has been actively reviewed.", value: kpis.acctCount > 0 ? `${Math.round(kpis.reviewedCount / kpis.acctCount * 100)}%` : "\u2014", sub: `${kpis.reviewedCount} of ${kpis.acctCount} accounts` },
     { label: "Booked C/C", info: "Churn & Contraction (C/C) already booked on renewals that have closed in the historical data for the current view.", value: kpis.bookedCC > 0 ? formatCurrencyUSD(kpis.bookedCC) : "\u2014", sub: kpis.histCount > 0 ? `${kpis.histCount.toLocaleString()} closed` : "No closed renewals" },
     { label: "Remaining C/C", info: "Bottoms-Up (BU) forecast of Churn & Contraction across pending renewals in view. The sub-line shows it as a % of pending ATR.", value: formatCurrencyUSD(kpis.remainingCC), sub: kpis.totalAtr > 0 ? `${formatPercent(kpis.ccRate)} of pending` : `${kpis.acctCount.toLocaleString()} pending` },
     { label: "Expected C/C", info: "Booked C/C + Remaining C/C \u2014 total expected Churn & Contraction (already-closed plus the Bottoms-Up forecast for pending renewals).", value: formatCurrencyUSD(kpis.expectedCC), sub: kpis.fullAtr > 0 ? `Booked + BU FC \xB7 ${formatPercent(kpis.expectedCcRate)}` : "Booked + BU FC" },
-    { label: "ELT FC", info: "Booked C/C + ELT Forecast. Uses the per-renewal ELT Call override where one is set, otherwise falls back to the Bottoms-Up (BU) forecast.", value: formatCurrencyUSD(kpis.expectedDj), sub: kpis.djOverrideCount > 0 ? `Booked + ELT \xB7 ${kpis.djOverrideCount} override${kpis.djOverrideCount !== 1 ? "s" : ""}` : "Booked + ELT \xB7 no overrides" },
-    { label: "Reviewed", info: "Share of pending accounts that have a note or an ELT Forecast override \u2014 i.e. an account has been actively reviewed.", value: kpis.acctCount > 0 ? `${Math.round(kpis.reviewedCount / kpis.acctCount * 100)}%` : "\u2014", sub: `${kpis.reviewedCount} of ${kpis.acctCount} accounts` }
+    { label: "ELT FC", info: "Booked C/C + ELT Forecast. Uses the per-renewal ELT Call override where one is set, otherwise falls back to the Bottoms-Up (BU) forecast.", value: formatCurrencyUSD(kpis.expectedDj), sub: kpis.djOverrideCount > 0 ? `Booked + ELT \xB7 ${kpis.djOverrideCount} override${kpis.djOverrideCount !== 1 ? "s" : ""}` : "Booked + ELT \xB7 no overrides" }
   ].map((c, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: "glass-kpi" }, /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-labelrow" }, /* @__PURE__ */ React.createElement("span", { className: "glass-kpi-label" }, c.label), c.info && /* @__PURE__ */ React.createElement("span", { className: "kpi-info", tabIndex: 0, role: "note", "aria-label": c.label + ": " + c.info, "data-tip": c.info }, "\u24D8")), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-value" }, c.value), c.sub && /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub" }, c.sub)))), selectedFQ && /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold mb-2" }, "ATR Distribution"), /* @__PURE__ */ React.createElement("div", { className: "space-y-1" }, (() => {
     const bands = [
       { label: "$0 to <$12K", test: (r) => toNumber(r[atrKey]) > 0 && toNumber(r[atrKey]) <= 12e3 },

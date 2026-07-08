@@ -2304,15 +2304,21 @@
       }
       .region-kpi-strip {
         display: grid;
-        grid-template-columns: repeat(6, minmax(0, 1fr));
+        grid-template-columns: repeat(12, minmax(0, 1fr));
         gap: 12px;
         width: 100%;
       }
+      /* Even two-row layout: 3 tiles on top (span 4 each = 12),
+         4 tiles on the bottom (span 3 each = 12). */
+      .region-kpi-strip > .glass-kpi:nth-child(-n + 3) { grid-column: span 4; }
+      .region-kpi-strip > .glass-kpi:nth-child(n + 4) { grid-column: span 3; }
       @media (max-width: 1280px) {
         .region-kpi-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .region-kpi-strip > .glass-kpi { grid-column: auto; }
       }
       @media (max-width: 768px) {
         .region-kpi-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .region-kpi-strip > .glass-kpi { grid-column: auto; }
       }
       .region-viz-grid {
         display: grid;
@@ -2411,7 +2417,7 @@
     <script src="vendor/vibe-session-lock.js"></script>
 
     <!-- App (compiled from app.jsx by ./build.sh) -->
-    <script src="vendor/app.js?v=20260708g"></script>
+    <script src="vendor/app.js?v=20260708i"></script>
 
     <!--
       Container-mode toolbar tweaks. Mounted after the React app so we can
