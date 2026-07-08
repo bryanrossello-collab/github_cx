@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import secrets
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
@@ -27,6 +28,21 @@ from app.config import Settings, get_settings
 from app.users import UserRecord, provision_from_identity
 
 logger = logging.getLogger("renewals_studio.auth")
+
+# Short-lived cache of DB-provisioned users keyed by identity email. The auth
+# middleware runs on every request; without this we'd hit Postgres (pool
+# acquire + users SELECT) for each one, which under load times out and shows
+# up as sporadic "guest" / "could not reach server" and admin lag.
+_USER_CACHE_TTL_S = 45.0
+_user_cache: dict[str, tuple[float, "ResolvedUser"]] = {}
+
+
+def invalidate_user_cache(email: str | None = None) -> None:
+    """Drop cached provisioning (e.g. after an admin changes a role)."""
+    if email is None:
+        _user_cache.clear()
+    else:
+        _user_cache.pop(email.lower(), None)
 
 # Header fallback chain — first non-empty wins.
 EMAIL_HEADERS = (
@@ -167,6 +183,11 @@ def _guest() -> ResolvedUser:
     )
 
 
+def guest_user() -> ResolvedUser:
+    """Public cheap guest (no DB) — used for static assets that skip auth."""
+    return _guest()
+
+
 def _dev_user(settings: Settings) -> ResolvedUser:
     email = settings.effective_dev_user_email()
     owners = set(settings.bootstrap_owner_emails())
@@ -199,6 +220,11 @@ async def resolve_user(request: Request) -> ResolvedUser:
         if settings.effective_strict_auth:
             return _guest()
         return _dev_user(settings)
+
+    cache_key = identity.email
+    cached = _user_cache.get(cache_key)
+    if cached is not None and (time.monotonic() - cached[0]) < _USER_CACHE_TTL_S:
+        return cached[1]
 
     bootstrap = set(settings.bootstrap_admin_emails())
     owners = set(settings.bootstrap_owner_emails())
@@ -246,13 +272,15 @@ async def resolve_user(request: Request) -> ResolvedUser:
             f"{identity.source}:not-provisioned",
         )
 
-    return ResolvedUser(
+    resolved = ResolvedUser(
         email=record.email,
         display_name=record.display_name or identity.display_name,
         role=record.role,
         source=identity.source,
         ephemeral=record.ephemeral,
     )
+    _user_cache[cache_key] = (time.monotonic(), resolved)
+    return resolved
 
 
 def redact_jwt(value: str) -> str:

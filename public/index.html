@@ -2335,7 +2335,7 @@
     <script src="vendor/vibe-session-lock.js"></script>
 
     <!-- App (compiled from app.jsx by ./build.sh) -->
-    <script src="vendor/app.js?v=20260707j"></script>
+    <script src="vendor/app.js?v=20260708a"></script>
 
     <!--
       Container-mode toolbar tweaks. Mounted after the React app so we can
@@ -3622,25 +3622,38 @@
           const variance = cs - rn;
           const filtered = isDashboardFiltered();
 
-          row.querySelector('[data-vibe-val="cs"]').textContent  = fmtCurrency(cs);
-          row.querySelector('[data-vibe-val="rn"]').textContent  = fmtCurrency(rn);
-          row.querySelector('[data-vibe-val="elt"]').textContent = fmtCurrency(elt);
-          row.querySelector('[data-vibe-sub="cs"]').textContent =
+          // Only touch the DOM when a value actually changes. Writing
+          // identical textContent still registers a mutation, which the
+          // MutationObserver would see and re-schedule applyAll — an idle
+          // self-trigger loop. Guarding stops that.
+          const setText = function (sel, val) {
+            const el = row.querySelector(sel);
+            if (el && el.textContent !== val) el.textContent = val;
+          };
+          setText('[data-vibe-val="cs"]', fmtCurrency(cs));
+          setText('[data-vibe-val="rn"]', fmtCurrency(rn));
+          setText('[data-vibe-val="elt"]', fmtCurrency(elt));
+          setText('[data-vibe-sub="cs"]',
             csCount === 0 ? 'No CS Forecasts in current view'
-                          : 'CS rollup · ' + csCount + ' account(s)' + (filtered ? ' · filtered view' : '');
-          row.querySelector('[data-vibe-sub="rn"]').textContent =
+                          : 'CS rollup · ' + csCount + ' account(s)' + (filtered ? ' · filtered view' : ''));
+          setText('[data-vibe-sub="rn"]',
             rnCount === 0 ? 'No Renewals Forecasts in current view'
-                          : 'Renewals rollup · ' + rnCount + ' account(s)' + (filtered ? ' · filtered view' : '');
+                          : 'Renewals rollup · ' + rnCount + ' account(s)' + (filtered ? ' · filtered view' : ''));
           const varianceEl = row.querySelector('[data-vibe-sub="variance"]');
-          if (cs === 0 && rn === 0 && elt === 0) {
-            varianceEl.textContent = 'CS vs Renewals — enter values in any account modal';
-            varianceEl.style.color = '#6b7280';
-          } else if (cs === 0 && rn === 0 && djCount > 0) {
-            varianceEl.textContent = 'ELT overrides · ' + djCount + ' account(s) · no CS/RN split yet';
-            varianceEl.style.color = '#6b7280';
-          } else {
-            varianceEl.textContent = 'CS vs Renewals: ' + fmtVarianceText(variance);
-            varianceEl.style.color = varianceColor(variance);
+          if (varianceEl) {
+            let vText, vColor;
+            if (cs === 0 && rn === 0 && elt === 0) {
+              vText = 'CS vs Renewals — enter values in any account modal';
+              vColor = '#6b7280';
+            } else if (cs === 0 && rn === 0 && djCount > 0) {
+              vText = 'ELT overrides · ' + djCount + ' account(s) · no CS/RN split yet';
+              vColor = '#6b7280';
+            } else {
+              vText = 'CS vs Renewals: ' + fmtVarianceText(variance);
+              vColor = varianceColor(variance);
+            }
+            if (varianceEl.textContent !== vText) varianceEl.textContent = vText;
+            if (varianceEl.style.color !== vColor) varianceEl.style.color = vColor;
           }
         }
 
@@ -4002,7 +4015,11 @@
             ensureDataAsOfBadge();
             sanitiseBlocklisted();
             rewireSplashCTA();
-            refreshEltTiles(true);
+            // Re-apply ELT tile values after React re-renders the KPI grid.
+            // NOT forced: this reuses the cached totals (and only refetches
+            // when the filter scope actually changed). Forcing here made the
+            // app POST /account-forecasts/totals on every DOM mutation.
+            refreshEltTiles(false);
             ensureAcctModalInjection();
           } catch (e) {
             try { console.warn('[vibe injection] applyAll error', e); } catch (_) {}

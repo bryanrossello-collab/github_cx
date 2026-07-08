@@ -7,7 +7,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-from app.auth import build_whoami, get_current_user, require_admin, require_signed_in
+from app.auth import build_whoami, get_current_user, invalidate_user_cache, require_admin, require_signed_in
 from app.database import DatabaseUnavailable
 from app.users import delete_user, list_directory, list_users, update_user_role, upsert_user
 
@@ -87,6 +87,7 @@ async def users_create(
             display_name=body.display_name.strip(),
             role=body.role,
         )
+    invalidate_user_cache(email)
     return {
         "ok": True,
         "user": {
@@ -138,6 +139,7 @@ async def users_update_role(
                     },
                 )
         updated = await update_user_role(conn, target, body.role)
+    invalidate_user_cache(target)
     if updated is None:
         raise HTTPException(status_code=404, detail={"error": "not_found"})
     return {
@@ -181,6 +183,7 @@ async def users_delete(
                 },
             )
         deleted = await delete_user(conn, target)
+    invalidate_user_cache(target)
     if not deleted:
         raise HTTPException(status_code=404, detail={"error": "not_found"})
     return {"ok": True}

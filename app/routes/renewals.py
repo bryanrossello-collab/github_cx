@@ -1711,19 +1711,26 @@ async def list_snapshots(request: Request, limit: int = 50) -> dict:
     async with db.acquire() as conn:
         rows = await conn.fetch(
             """
+            WITH recent AS (
+                SELECT id, slot, filename, size_bytes, uploaded_at,
+                       uploaded_by, note
+                FROM csv_uploads
+                ORDER BY uploaded_at DESC
+                LIMIT $1
+            )
             SELECT
-                u.id,
-                u.slot,
-                u.filename,
-                u.size_bytes,
-                u.uploaded_at,
-                u.uploaded_by,
-                u.note,
+                r.id,
+                r.slot,
+                r.filename,
+                r.size_bytes,
+                r.uploaded_at,
+                r.uploaded_by,
+                r.note,
                 COALESCE(s.row_count, 0) AS row_count,
                 s.distinct_accounts,
                 s.atr_total,
                 s.effective_date
-            FROM csv_uploads u
+            FROM recent r
             LEFT JOIN (
                 SELECT
                     csv_upload_id,
@@ -1732,10 +1739,10 @@ async def list_snapshots(request: Request, limit: int = 50) -> dict:
                     SUM(atr) AS atr_total,
                     MAX(effective_date) AS effective_date
                 FROM account_snapshots
+                WHERE csv_upload_id IN (SELECT id FROM recent)
                 GROUP BY csv_upload_id
-            ) s ON s.csv_upload_id = u.id
-            ORDER BY COALESCE(s.effective_date, u.uploaded_at) DESC
-            LIMIT $1
+            ) s ON s.csv_upload_id = r.id
+            ORDER BY COALESCE(s.effective_date, r.uploaded_at) DESC
             """,
             limit,
         )

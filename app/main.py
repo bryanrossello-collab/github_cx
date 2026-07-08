@@ -31,7 +31,15 @@ from app.config import get_settings
 from app.database import Database, DatabaseUnavailable
 from app.logging_setup import configure_logging
 from app.routes import admin, auth_api, health, renewals
-from app.auth import resolve_user
+from app.auth import guest_user, resolve_user
+
+# Paths that never need a DB-provisioned identity. Skipping auth here avoids a
+# Postgres round-trip on every static asset / health probe (the middleware runs
+# on every request), which otherwise piles onto the connection pool.
+_AUTH_SKIP_PREFIXES = ("/vendor/",)
+_AUTH_SKIP_EXACT = frozenset(
+    {"/favicon.ico", "/manifest.json", "/icon.svg", "/healthz", "/readyz", "/api/health"}
+)
 
 logger = logging.getLogger("renewals_studio")
 
@@ -53,7 +61,11 @@ class AttachUserMiddleware(BaseHTTPMiddleware):
     """Resolve proxy identity on every request → request.state.user."""
 
     async def dispatch(self, request: Request, call_next):
-        request.state.user = await resolve_user(request)
+        path = request.url.path
+        if path in _AUTH_SKIP_EXACT or path.startswith(_AUTH_SKIP_PREFIXES):
+            request.state.user = guest_user()
+        else:
+            request.state.user = await resolve_user(request)
         return await call_next(request)
 
 
