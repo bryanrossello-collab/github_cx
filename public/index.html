@@ -355,6 +355,28 @@
       .compact-table table { font-size: 10px; line-height: 1.25; }
       .compact-table th, .compact-table td { padding: 3px 6px !important; }
       .compact-table thead th { font-size: 9px; }
+      .fc-inline-wrap { display: inline-flex; align-items: center; justify-content: flex-end; gap: 2px; width: 100%; }
+      .fc-inline-input {
+        width: 100%;
+        min-width: 0;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+        font-size: 10px;
+        line-height: 1.2;
+        padding: 1px 3px;
+        border: 1px solid transparent;
+        border-radius: 4px;
+        background: transparent;
+        color: inherit;
+        outline: none;
+      }
+      .fc-inline-input::placeholder { color: rgba(148, 163, 184, 0.55); }
+      .fc-inline-input:hover { border-color: var(--border); background: rgba(99, 102, 241, 0.05); }
+      .fc-inline-input:focus { border-color: #6366f1; background: rgba(99, 102, 241, 0.09); box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.35); }
+      .fc-inline-cs { color: #0284c7; }
+      .fc-inline-rn { color: #7c3aed; }
+      .dark .fc-inline-cs { color: #38bdf8; }
+      .dark .fc-inline-rn { color: #a78bfa; }
       .region-font {
         font-size: 10px;
         line-height: 1.25;
@@ -2389,7 +2411,7 @@
     <script src="vendor/vibe-session-lock.js"></script>
 
     <!-- App (compiled from app.jsx by ./build.sh) -->
-    <script src="vendor/app.js?v=20260708f"></script>
+    <script src="vendor/app.js?v=20260708g"></script>
 
     <!--
       Container-mode toolbar tweaks. Mounted after the React app so we can

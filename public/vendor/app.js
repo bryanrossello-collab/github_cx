@@ -2453,21 +2453,42 @@ ${sourceText}`;
   const restoreCallsFromImport = (notesObj) => {
     const entries = Object.entries(notesObj || {}).filter(([, v]) => v && (v.csCall != null || v.renewalsCall != null));
     if (!entries.length) return;
+    const importSettings = state.settings || {};
     Promise.all(entries.map(([k, v]) => {
-      const parts = String(k).split("::");
-      const accountId = safeString(v.accountId) || parts[0] || "";
-      const yq = parts[1] || safeString(v.fq) || "";
-      const atr = Number(parts[2]);
-      const roundedAtr = isFinite(atr) ? atr : Math.round(toNumber(v.atr)) || 0;
       const cs = v.csCall != null && isFinite(toNumber(v.csCall)) ? toNumber(v.csCall) : null;
       const rn = v.renewalsCall != null && isFinite(toNumber(v.renewalsCall)) ? toNumber(v.renewalsCall) : null;
-      if (!accountId || cs == null && rn == null) return Promise.resolve();
-      return fetch("/api/renewals/account-forecasts/" + encodeURIComponent(accountId), {
+      if (cs == null && rn == null) return Promise.resolve();
+      // Note keys are 2-part (accountBase::period); call_keys are 3-part
+      // (accountBase::period::roundedATR). Rebuild the call_key from the
+      // matched row using the SAME helpers the inline editor and account card
+      // use, so an imported call lands on the record the row resolves to
+      // (otherwise it is stored under an orphan key and cannot be edited).
+      const row = rowsByNoteKey.get(k);
+      let callKey = null, yq = "", roundedAtr = 0, accountName = safeString(v.accountName), acctBase = "";
+      if (row && typeof RenewalsCallKeys !== "undefined") {
+        callKey = RenewalsCallKeys.buildCallKey(row, hm, importSettings);
+        yq = RenewalsCallKeys.yearQuarterFromRow(row, hm);
+        roundedAtr = RenewalsCallKeys.effectiveAtrFromRow(row, hm, importSettings);
+        accountName = safeString(row[accountKey]) || accountName;
+      }
+      if (callKey) {
+        acctBase = String(callKey).split("::")[0];
+      } else {
+        // Unmatched note: fall back to the exported metadata.
+        const parts = String(k).split("::");
+        acctBase = safeString(v.accountId) || parts[0] || "";
+        yq = parts[1] || safeString(v.fq) || "";
+        const atrNum = Math.round(toNumber(v.atr));
+        roundedAtr = isFinite(atrNum) ? atrNum : 0;
+        callKey = typeof RenewalsCallKeys !== "undefined" ? RenewalsCallKeys.buildCallKeyFromParts(acctBase, accountName, yq, roundedAtr) : null;
+      }
+      if (!acctBase || !callKey) return Promise.resolve();
+      return fetch("/api/renewals/account-forecasts/" + encodeURIComponent(acctBase), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          call_key: k,
-          account_name: safeString(v.accountName),
+          call_key: callKey,
+          account_name: accountName,
           year_quarter: yq,
           rounded_atr: roundedAtr,
           cs_forecast: cs,
@@ -7051,7 +7072,7 @@ function RegionQuarterTable() {
     return /* @__PURE__ */ React.createElement("span", { className: `px-2 py-0.5 rounded-full text-[10px] font-medium ${cls}` }, h || "\u2014");
   };
   const kpis = useMemo(() => {
-    let totalAtr = 0, buTotal = 0, djTotal = 0, djOverrideCount = 0, atRisk = 0;
+    let totalAtr = 0, buTotal = 0, djTotal = 0, djOverrideCount = 0, atRisk = 0, churnAtr = 0;
     const accts = /* @__PURE__ */ new Set();
     const reviewedAccts = /* @__PURE__ */ new Set();
     for (let i = 0, len = focusRows.length; i < len; i++) {
@@ -7081,6 +7102,7 @@ function RegionQuarterTable() {
       if (_cs !== null || _rn !== null || note && !note.archived && (safeString(note.note) || djRaw !== null)) reviewedAccts.add(acctId);
       const h = safeString(r[healthKey]).toLowerCase();
       if (h === "red" || h === "churning") atRisk += atr;
+      if (h === "churning") churnAtr += atr;
     }
     let bookedCC = 0, histAtr = 0, histCount = 0;
     for (let i = 0, len = histRowsFiltered.length; i < len; i++) {
@@ -7102,7 +7124,7 @@ function RegionQuarterTable() {
     const target = selectedFQ && selectedFQ !== "__ALL_FQ__" ? targets[selectedFQ] || 0 : rowsView.reduce((s, r) => s + (targets[r.fq] || 0), 0);
     const gap = target > 0 ? totalAtr - target : null;
     const attain = target > 0 ? totalAtr / target : null;
-    return { totalAtr, fullAtr, histAtr, histCount, bookedCC, remainingCC, expectedCC, expectedCcRate, expectedDj, expectedDjRate, acctCount, buTotal, ccRate, djTotal, djOverrideCount, atRisk, target, gap, attain, reviewedCount };
+    return { totalAtr, fullAtr, histAtr, histCount, bookedCC, remainingCC, expectedCC, expectedCcRate, expectedDj, expectedDjRate, acctCount, buTotal, ccRate, djTotal, djOverrideCount, atRisk, churnAtr, target, gap, attain, reviewedCount };
   }, [focusRows, histRowsFiltered, atrKey, buKey, acctKey, acctIdKey, healthKey, histAtrKey, histCcKey, state.targets, selectedFQ, rowsView, notes, fcByAccount, hm, settings]);
   const gapColor = (g) => g >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-red-500 dark:text-red-400";
   const attainColor = (a) => a >= 1 ? "text-emerald-600 dark:text-emerald-400" : a >= 0.9 ? "text-amber-600 dark:text-amber-400" : "text-red-500 dark:text-red-400";
@@ -7281,6 +7303,7 @@ function RegionQuarterTable() {
     /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500 dark:text-gray-400 mt-px tabular-nums" }, formatCurrencyUSD(cm.atr))
   )))))), /* @__PURE__ */ React.createElement("div", { className: "region-main-panel" }, /* @__PURE__ */ React.createElement("div", { id: "region-top-stack", className: "region-top-stack" }, /* @__PURE__ */ React.createElement("div", { id: "region-kpi-grid", className: "region-kpi-strip" }, [
     { label: "Total ATR", info: "Sum of ATR (Annual Target Revenue) across renewals in the current view \u2014 pending plus already-closed. Respects all active filters.", value: formatCurrencyUSD(kpis.fullAtr), sub: kpis.histCount > 0 ? `${kpis.acctCount.toLocaleString()} pending \xB7 ${kpis.histCount.toLocaleString()} closed` : `${kpis.acctCount.toLocaleString()} accounts` },
+    { label: "Churn Health ATR", info: "Total ATR of accounts with a Churning health status, within the current filters.", value: formatCurrencyUSD(kpis.churnAtr), sub: `Churning health \xB7 ${formatPercent(kpis.totalAtr > 0 ? kpis.churnAtr / kpis.totalAtr : 0)} of pending` },
     { label: "Booked C/C", info: "Churn & Contraction (C/C) already booked on renewals that have closed in the historical data for the current view.", value: kpis.bookedCC > 0 ? formatCurrencyUSD(kpis.bookedCC) : "\u2014", sub: kpis.histCount > 0 ? `${kpis.histCount.toLocaleString()} closed` : "No closed renewals" },
     { label: "Remaining C/C", info: "Bottoms-Up (BU) forecast of Churn & Contraction across pending renewals in view. The sub-line shows it as a % of pending ATR.", value: formatCurrencyUSD(kpis.remainingCC), sub: kpis.totalAtr > 0 ? `${formatPercent(kpis.ccRate)} of pending` : `${kpis.acctCount.toLocaleString()} pending` },
     { label: "Expected C/C", info: "Booked C/C + Remaining C/C \u2014 total expected Churn & Contraction (already-closed plus the Bottoms-Up forecast for pending renewals).", value: formatCurrencyUSD(kpis.expectedCC), sub: kpis.fullAtr > 0 ? `Booked + BU FC \xB7 ${formatPercent(kpis.expectedCcRate)}` : "Booked + BU FC" },
@@ -7914,11 +7937,66 @@ function AccountsToolbar({ rowsCount }) {
     setSortOpen(false);
   } }, "\u2193 Descending")), sortOpen && /* @__PURE__ */ React.createElement("div", { style: { position: "fixed", inset: 0, zIndex: 49 }, onClick: () => setSortOpen(false) })), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-slate", onClick: () => actions.toggleColumns() }, "Columns"), /* @__PURE__ */ React.createElement(ExportButton, null)));
 }
+function InlineFcCell({ value, onCommit, colorClass, title, placeholder }) {
+  const fmt = (v) => v == null || !isFinite(toNumber(v)) ? "" : `$${Math.round(toNumber(v)).toLocaleString()}`;
+  const [draft, setDraft] = React.useState(() => fmt(value));
+  const [focused, setFocused] = React.useState(false);
+  React.useEffect(() => {
+    if (!focused) setDraft(fmt(value));
+  }, [value, focused]);
+  const commit = () => {
+    const raw = String(draft).replace(/[^\d.\-]/g, "");
+    const next = raw === "" ? null : toNumber(raw);
+    const nextNorm = next == null || !isFinite(next) ? null : Math.round(next);
+    const curNorm = value == null || !isFinite(toNumber(value)) ? null : Math.round(toNumber(value));
+    if (nextNorm !== curNorm) onCommit(nextNorm);
+  };
+  return /* @__PURE__ */ React.createElement("input", {
+    type: "text",
+    inputMode: "numeric",
+    value: draft,
+    title,
+    placeholder: placeholder || "\u2014",
+    className: "fc-inline-input " + (colorClass || ""),
+    onFocus: (e) => {
+      setFocused(true);
+      setDraft(value == null || !isFinite(toNumber(value)) ? "" : String(Math.round(toNumber(value))));
+      e.target.select();
+    },
+    onChange: (e) => setDraft(e.target.value),
+    onBlur: () => {
+      setFocused(false);
+      commit();
+    },
+    onKeyDown: (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        e.target.blur();
+      } else if (e.key === "Escape") {
+        setDraft(fmt(value));
+        e.target.blur();
+      }
+    },
+    onClick: (e) => e.stopPropagation()
+  });
+}
 function DataTable({ rows }) {
   const { state, actions } = useApp();
   const { headerMap: hm, settings, visibleCols } = state;
   const notes = state.notes || {};
   const { byAccount: fcByAccount, reload: reloadFc } = useAccountForecasts();
+  const [localFc, setLocalFc] = React.useState({});
+  const reloadTimer = React.useRef(null);
+  const scheduleReload = React.useCallback(() => {
+    if (reloadTimer.current) clearTimeout(reloadTimer.current);
+    reloadTimer.current = setTimeout(() => {
+      reloadTimer.current = null;
+      Promise.resolve(reloadFc()).then(() => setLocalFc({}));
+    }, 400);
+  }, [reloadFc]);
+  React.useEffect(() => () => {
+    if (reloadTimer.current) clearTimeout(reloadTimer.current);
+  }, []);
   const atrKey = getAtrKey(hm, settings);
   const buKey = getBuKey(hm, settings);
   const dateKey = hm.NEXT_RENEWAL_DATE || "NEXT_RENEWAL_DATE";
@@ -7974,10 +8052,42 @@ function DataTable({ rows }) {
   const fcForRow = (r) => {
     if (typeof RenewalsCallKeys !== "undefined") {
       const ck = RenewalsCallKeys.buildCallKey(r, hm, settings);
+      if (ck && localFc[ck]) return localFc[ck];
       if (ck && fcByAccount.has(ck)) return fcByAccount.get(ck);
     }
     const id = accountIdFromRow(r, hm);
     return id ? fcByAccount.get(id) : null;
+  };
+  const saveAcctFcInline = (row, field, newVal) => {
+    const accountId = accountIdFromRow(row, hm);
+    if (!accountId) return;
+    const accountName = safeString(row[acctKey]) || "";
+    const ck = typeof RenewalsCallKeys !== "undefined" ? RenewalsCallKeys.buildCallKey(row, hm, settings) : null;
+    const yq = typeof RenewalsCallKeys !== "undefined" ? RenewalsCallKeys.yearQuarterFromRow(row, hm) : "";
+    const atr = typeof RenewalsCallKeys !== "undefined" ? RenewalsCallKeys.effectiveAtrFromRow(row, hm, settings) : 0;
+    const cur = fcForRow(row) || {};
+    const curCs = cur.cs_forecast != null && isFinite(toNumber(cur.cs_forecast)) ? toNumber(cur.cs_forecast) : null;
+    const curRn = cur.renewals_forecast != null && isFinite(toNumber(cur.renewals_forecast)) ? toNumber(cur.renewals_forecast) : null;
+    const nextCs = field === "cs" ? newVal : curCs;
+    const nextRn = field === "rn" ? newVal : curRn;
+    if (ck) setLocalFc((prev) => ({ ...prev, [ck]: { call_key: ck, cs_forecast: nextCs, renewals_forecast: nextRn } }));
+    const body = {
+      call_key: ck,
+      account_name: accountName,
+      year_quarter: yq,
+      rounded_atr: atr,
+      source: "accounts_inline"
+    };
+    if (field === "cs") body.cs_forecast = newVal;
+    else body.renewals_forecast = newVal;
+    fetch("/api/renewals/account-forecasts/" + encodeURIComponent(accountId), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then((r) => {
+      if (r.ok) scheduleReload();
+    }).catch(() => {
+    });
   };
   const noteDjVal = (r) => {
     const nk = r.__noteKey;
@@ -8036,7 +8146,7 @@ function DataTable({ rows }) {
           })
         }
       );
-      if (res.ok) reloadFc();
+      if (res.ok) Promise.resolve(reloadFc()).then(() => setLocalFc({}));
     } catch (_) {
     }
   };
@@ -8117,17 +8227,15 @@ function DataTable({ rows }) {
       const a = toNumber(r[atrKey]), b = toNumber(r[buKey]);
       return a > 0 ? fmtPct(b / a) : "\u2014";
     } },
-    visibleCols.csCall && { id: "csCall", label: "CS Call", key: FC_SORT_CS, sw: "76px", right: true, render: (_, r) => {
+    visibleCols.csCall && { id: "csCall", label: "CS Call", key: FC_SORT_CS, sw: "92px", right: true, render: (_, r) => {
       const fc = fcForRow(r);
-      const val = fc?.cs_forecast;
-      if (val == null || !isFinite(toNumber(val))) return null;
-      return /* @__PURE__ */ React.createElement("span", { className: "inline-flex items-center justify-end gap-0.5 text-sky-600 dark:text-sky-400" }, fmtK(val), fcClearBtn(r, "cs", "Clear CS call"));
+      const val = fc && fc.cs_forecast != null && isFinite(toNumber(fc.cs_forecast)) ? toNumber(fc.cs_forecast) : null;
+      return /* @__PURE__ */ React.createElement("span", { className: "fc-inline-wrap" }, /* @__PURE__ */ React.createElement(InlineFcCell, { value: val, colorClass: "fc-inline-cs", title: "CS Forecast \u2014 click to edit, Enter to save", onCommit: (nv) => saveAcctFcInline(r, "cs", nv) }), val != null && fcClearBtn(r, "cs", "Clear CS call"));
     } },
-    visibleCols.renewalsCall && { id: "renewalsCall", label: "Renewals Call", key: FC_SORT_RN, sw: "88px", right: true, render: (_, r) => {
+    visibleCols.renewalsCall && { id: "renewalsCall", label: "Renewals Call", key: FC_SORT_RN, sw: "104px", right: true, render: (_, r) => {
       const fc = fcForRow(r);
-      const val = fc?.renewals_forecast;
-      if (val == null || !isFinite(toNumber(val))) return null;
-      return /* @__PURE__ */ React.createElement("span", { className: "inline-flex items-center justify-end gap-0.5 text-violet-600 dark:text-violet-400" }, fmtK(val), fcClearBtn(r, "rn", "Clear Renewals call"));
+      const val = fc && fc.renewals_forecast != null && isFinite(toNumber(fc.renewals_forecast)) ? toNumber(fc.renewals_forecast) : null;
+      return /* @__PURE__ */ React.createElement("span", { className: "fc-inline-wrap" }, /* @__PURE__ */ React.createElement(InlineFcCell, { value: val, colorClass: "fc-inline-rn", title: "Renewals Forecast \u2014 click to edit, Enter to save", onCommit: (nv) => saveAcctFcInline(r, "rn", nv) }), val != null && fcClearBtn(r, "rn", "Clear Renewals call"));
     } },
     visibleCols.eltCall && { id: "eltCall", label: "ELT Call", key: FC_SORT_ELT, sw: "76px", right: true, render: (_, r) => {
       const fc = fcForRow(r);
