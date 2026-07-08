@@ -2062,6 +2062,7 @@ function CSVImporter() {
 }
 function NotesIO({ headless = false }) {
   const { state, actions } = useApp();
+  const { byAccount: fcByAccount } = useAccountForecasts();
   const inputRef = useRef(null);
   const notes = state.notes || {};
   const totalNotes = Object.keys(notes).length;
@@ -2448,6 +2449,39 @@ ${sourceText}`;
     unmatchedAll.forEach((entry) => actions.setNote(entry.key, null));
   };
   const onImportClick = () => inputRef.current?.click();
+  const restoreCallsFromImport = (notesObj) => {
+    const entries = Object.entries(notesObj || {}).filter(([, v]) => v && (v.csCall != null || v.renewalsCall != null));
+    if (!entries.length) return;
+    Promise.all(entries.map(([k, v]) => {
+      const parts = String(k).split("::");
+      const accountId = safeString(v.accountId) || parts[0] || "";
+      const yq = parts[1] || safeString(v.fq) || "";
+      const atr = Number(parts[2]);
+      const roundedAtr = isFinite(atr) ? atr : Math.round(toNumber(v.atr)) || 0;
+      const cs = v.csCall != null && isFinite(toNumber(v.csCall)) ? toNumber(v.csCall) : null;
+      const rn = v.renewalsCall != null && isFinite(toNumber(v.renewalsCall)) ? toNumber(v.renewalsCall) : null;
+      if (!accountId || cs == null && rn == null) return Promise.resolve();
+      return fetch("/api/renewals/account-forecasts/" + encodeURIComponent(accountId), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          call_key: k,
+          account_name: safeString(v.accountName),
+          year_quarter: yq,
+          rounded_atr: roundedAtr,
+          cs_forecast: cs,
+          renewals_forecast: rn,
+          source: "import"
+        })
+      }).catch(() => {
+      });
+    })).then(() => {
+      try {
+        window.dispatchEvent(new CustomEvent("renewals-acctfc-changed"));
+      } catch (_) {
+      }
+    });
+  };
   const onImportFile = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -2455,10 +2489,11 @@ ${sourceText}`;
     reader.onload = () => {
       try {
         const parsed = JSON.parse(reader.result || "{}");
-        if (parsed.version !== 1) throw new Error("Unsupported version (expected 1)");
+        if (parsed.version !== 1 && parsed.version !== 2) throw new Error("Unsupported version (expected 1 or 2)");
         if (!parsed.notes || typeof parsed.notes !== "object") throw new Error("Missing notes object");
         actions.importNotes(parsed.notes);
         setNoteReportState({ type: "import", notesSource: parsed.notes });
+        restoreCallsFromImport(parsed.notes);
       } catch (err) {
         alert("Failed to import notes JSON: " + (err?.message || err));
       }
@@ -2515,12 +2550,24 @@ ${sourceText}`;
       alert("No notes to export");
       return;
     }
+    const notesWithCalls = {};
+    Object.entries(exportNotes).forEach(([k, v]) => {
+      const fc = fcByAccount && fcByAccount.get ? fcByAccount.get(k) : null;
+      const cs = fc && fc.cs_forecast != null && isFinite(toNumber(fc.cs_forecast)) ? toNumber(fc.cs_forecast) : null;
+      const rn = fc && fc.renewals_forecast != null && isFinite(toNumber(fc.renewals_forecast)) ? toNumber(fc.renewals_forecast) : null;
+      const out = { ...v };
+      out.csCall = cs;
+      out.renewalsCall = rn;
+      out.eltCall = cs != null || rn != null ? (cs || 0) + (rn || 0) : null;
+      notesWithCalls[k] = out;
+    });
     const payload = {
-      version: 1,
+      version: 2,
       exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
       totalNotes: exportedTotal,
       exportMode,
-      notes: exportNotes
+      eltCallNote: "eltCall is derived (csCall + renewalsCall) and recomputed by the app on import; it is included for reference only.",
+      notes: notesWithCalls
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
