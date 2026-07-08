@@ -2103,6 +2103,60 @@
       html.dark .region-filter-chip-muted {
         color: rgb(203 213 225);
       }
+      .region-filter-chip-removable {
+        gap: 4px;
+        padding-right: 3px;
+      }
+      .region-filter-chip-x {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 14px;
+        height: 14px;
+        border: none;
+        border-radius: 9999px;
+        background: transparent;
+        color: inherit;
+        font-size: 12px;
+        line-height: 1;
+        cursor: pointer;
+        opacity: 0.65;
+        transition: opacity 0.12s ease, background 0.12s ease;
+      }
+      .region-filter-chip-x:hover {
+        opacity: 1;
+        background: rgba(99, 102, 241, 0.22);
+      }
+      .region-filter-chip-emerald .region-filter-chip-x:hover {
+        background: rgba(16, 185, 129, 0.24);
+      }
+      .region-filter-reset {
+        display: inline-flex;
+        align-items: center;
+        margin-left: auto;
+        padding: 2px 8px;
+        border: none;
+        background: transparent;
+        color: rgb(107 114 128);
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        cursor: pointer;
+        border-radius: 6px;
+        transition: color 0.12s ease, background 0.12s ease;
+      }
+      .region-filter-reset:hover {
+        color: rgb(79 70 229);
+        background: rgba(99, 102, 241, 0.12);
+      }
+      html.dark .region-filter-reset {
+        color: rgb(156 163 175);
+      }
+      html.dark .region-filter-reset:hover {
+        color: rgb(165 180 252);
+        background: rgba(99, 102, 241, 0.2);
+      }
       .region-filter-sections {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2335,7 +2389,7 @@
     <script src="vendor/vibe-session-lock.js"></script>
 
     <!-- App (compiled from app.jsx by ./build.sh) -->
-    <script src="vendor/app.js?v=20260708a"></script>
+    <script src="vendor/app.js?v=20260708f"></script>
 
     <!--
       Container-mode toolbar tweaks. Mounted after the React app so we can
@@ -2722,6 +2776,17 @@
           applyArrSelection(panel);
         }
 
+        // Bridge for the React Region "Quick Filters" chips/reset: lets the
+        // dashboard clear the ARR selection (a DOM-injected filter with its
+        // own selection store) so both systems stay in lock-step.
+        window.__renewalsResetArrFilter = function () {
+          _arrSelectedIds.clear();
+          _arrSelectedIds.add('all');
+          clearAllArrCustomInputs();
+          syncAllArrPanels();
+          pushArrFilters([]);
+        };
+
         async function loadCurrentUser() {
           if (window.RenewalsSessionLock && typeof RenewalsSessionLock.checkWhoami === 'function') {
             return RenewalsSessionLock.checkWhoami();
@@ -2841,7 +2906,7 @@
             rightBlock.insertBefore(wrap, rightBlock.firstChild);
 
             document.getElementById('vibe-admin-view-btn').addEventListener('click', function () {
-              window.open('/admin', 'renewalsAdmin');
+              window.location.href = '/admin';
             });
             document.getElementById('vibe-user-menu-trigger').addEventListener('click', function (ev) {
               ev.stopPropagation();
@@ -2852,7 +2917,7 @@
             });
             document.querySelector('[data-vibe-dd-admin]').addEventListener('click', function () {
               closeUserMenuDropdown();
-              window.open('/admin', 'renewalsAdmin');
+              window.location.href = '/admin';
             });
             document.querySelector('[data-vibe-dd-resync]').addEventListener('click', function () {
               closeUserMenuDropdown();
@@ -4020,7 +4085,10 @@
             // when the filter scope actually changed). Forcing here made the
             // app POST /account-forecasts/totals on every DOM mutation.
             refreshEltTiles(false);
-            ensureAcctModalInjection();
+            // NOTE: account-card CS/Renewals inputs are now rendered natively
+            // by the React modal (app.js). The old DOM injection here produced
+            // a duplicate set of fields, so it is intentionally disabled.
+            // ensureAcctModalInjection();
           } catch (e) {
             try { console.warn('[vibe injection] applyAll error', e); } catch (_) {}
           } finally {

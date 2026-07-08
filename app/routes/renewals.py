@@ -501,14 +501,26 @@ async def parsed_data(request: Request, slot: str = Query(default="active")) -> 
             upload_id,
         )
 
-        content_row = await conn.fetchrow(
-            "SELECT content FROM csv_uploads WHERE id = $1", upload_id,
+        # Only pull a bounded prefix to parse the header row. Fetching the
+        # whole multi-MB BYTEA here (even when we short-circuit large uploads
+        # below, or when snapshots already exist) was hitting the DB command
+        # timeout and starving the pool. The full content is fetched lazily
+        # only in the first-time ingest branch that actually needs it.
+        head_row = await conn.fetchrow(
+            "SELECT substring(content from 1 for 65536) AS head "
+            "FROM csv_uploads WHERE id = $1",
+            upload_id,
         )
-        raw_bytes = bytes(content_row["content"]) if content_row else b""
-        headers = _parse_csv_header_row(raw_bytes)
+        headers = _parse_csv_header_row(
+            bytes(head_row["head"]) if head_row and head_row["head"] else b""
+        )
 
         eff = latest.get("effective_date") or latest["uploaded_at"]
         if not snap_count:
+            content_row = await conn.fetchrow(
+                "SELECT content FROM csv_uploads WHERE id = $1", upload_id,
+            )
+            raw_bytes = bytes(content_row["content"]) if content_row else b""
             try:
                 await db.ingest_snapshot(
                     csv_upload_id=upload_id,

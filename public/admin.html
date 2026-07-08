@@ -1101,22 +1101,9 @@
     }
 
     bootAuth();
-
-    // If this admin page was opened from the dashboard (same session tab),
-    // "Back to dashboard" returns to that still-live tab instead of forcing
-    // a fresh full-page load of the dashboard.
-    (function () {
-      function backToDashboard(e) {
-        if (window.opener && !window.opener.closed) {
-          e.preventDefault();
-          try { window.opener.focus(); } catch (_) {}
-          window.close();
-        }
-      }
-      document.querySelectorAll('a[href="/"]').forEach(function (a) {
-        a.addEventListener('click', backToDashboard);
-      });
-    })();
+    // Admin now opens in the same tab; "Back to dashboard" (the a[href="/"]
+    // links) simply navigates in place. The dashboard reloads its data on
+    // return, which is the accepted trade-off for single-tab navigation.
   </script>
 </body>
 </html>

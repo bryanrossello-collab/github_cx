@@ -865,6 +865,7 @@ const BAND_OPTIONS = [
   { value: "digital", label: "Digital accounts only" }
 ];
 const VALID_TABS = ["region", "trending", "partner", "accounts", "notes", "historical", "targets"];
+const DEFAULT_QUARTERS = ["FY25Q4", "FY26Q1", "FY27Q1", "FY27Q2", "FY27Q3", "FY27Q4"];
 const initialState = {
   data: [],
   headers: [],
@@ -875,7 +876,7 @@ const initialState = {
     segments: [],
     industries: [],
     healths: [],
-    quarters: ["FY25Q4", "FY26Q1", "FY27Q1", "FY27Q2", "FY27Q3", "FY27Q4"],
+    quarters: [...DEFAULT_QUARTERS],
     owners: [],
     partners: [],
     partnerTypes: [],
@@ -4609,7 +4610,9 @@ function useScopedCallRollup(rows, hm, settings, notes, fcByAccount) {
     };
   }, [rows, hm, settings, notes, fcByAccount]);
 }
-function useFilteredRows() {
+function useFilteredRows(opts) {
+  const ignoreQuarters = !!(opts && opts.ignoreQuarters);
+  const ignoreBand = !!(opts && opts.ignoreBand);
   const { state } = useApp();
   const { data, headerMap, filters, notes, settings } = state;
   const get = (k) => headerMap[k] || "";
@@ -4648,14 +4651,14 @@ function useFilteredRows() {
       if (filters.segments.length && !filters.segments.includes(segment)) return false;
       if (filters.industries && filters.industries.length && !filters.industries.includes(industry)) return false;
       if (filters.healths.length && !filters.healths.includes(health)) return false;
-      if (filters.quarters.length && !filters.quarters.includes(quarter)) return false;
+      if (!ignoreQuarters && filters.quarters.length && !filters.quarters.includes(quarter)) return false;
       if (filters.owners.length && !filters.owners.includes(owner)) return false;
       if (filters.partners.length && !filters.partners.includes(partner)) return false;
       if (filters.partnerTypes.length && !filters.partnerTypes.includes(partnerType)) return false;
       if (from && (!dt || dt < from)) return false;
       if (to && (!dt || dt > to)) return false;
       const atrVal = getAtrValue(r, headerMap, settings);
-      const band = filters.band || "all";
+      const band = ignoreBand ? "all" : filters.band || "all";
       if (band === "100k_official") {
         const bandCol = safeString(r[headerMap.BAND || "BAND"]).toUpperCase().replace(/[\s$,]/g, "");
         if (!(bandCol.includes("100K+") || bandCol.includes(">100K") || bandCol.includes("100KANDABOVE") || bandCol === "100K+")) return false;
@@ -4704,7 +4707,7 @@ function useFilteredRows() {
       }
       return true;
     });
-  }, [data, headerMap, filters, notes, settings?.useRemainingArr]);
+  }, [data, headerMap, filters, notes, settings?.useRemainingArr, ignoreQuarters, ignoreBand]);
   useEffect(() => {
     if (typeof window === "undefined") return;
     const acctKey = headerMap.ACCOUNT_NAME || "CRM_ACCOUNT_NAME";
@@ -4732,6 +4735,7 @@ function accountIdFromRow(row, hm) {
   if (id) return id;
   return accountKeyFromRow(row, hm);
 }
+let _acctFcLastSignature = null;
 function useAccountForecasts() {
   const [byAccount, setByAccount] = useState(() => /* @__PURE__ */ new Map());
   const reload = useCallback(async () => {
@@ -4753,9 +4757,21 @@ function useAccountForecasts() {
         m.set(ck, item);
       });
       setByAccount(m);
-      try {
-        window.dispatchEvent(new CustomEvent("renewals-acctfc-changed"));
-      } catch (_) {
+      // Only broadcast when the data actually changed. reload() runs in
+      // response to renewals-acctfc-changed, so an unconditional dispatch here
+      // re-triggered every listener's reload() forever — an unbounded fetch
+      // storm that saturated the DB pool and made unrelated requests (like the
+      // account card's single-call lookup) fail ~99% of the time. The shared
+      // signature lets a real change notify once, then settles.
+      const sig = JSON.stringify(
+        Array.from(m.entries()).map(([k, v]) => [k, v.cs_forecast, v.renewals_forecast]).sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)
+      );
+      if (sig !== _acctFcLastSignature) {
+        _acctFcLastSignature = sig;
+        try {
+          window.dispatchEvent(new CustomEvent("renewals-acctfc-changed"));
+        } catch (_) {
+        }
       }
     } catch (_) {
     }
@@ -6694,7 +6710,7 @@ ${detailRowsSorted.map((d) => {
   }
 }
 function RegionQuarterTable() {
-  const rows = useFilteredRows();
+  const rows = useFilteredRows({ ignoreQuarters: true, ignoreBand: true });
   const { state, actions } = useApp();
   const hm = state.headerMap;
   const notes = state.notes || {};
@@ -6730,9 +6746,32 @@ function RegionQuarterTable() {
   const [selectedBand, _setSelectedBand] = useState(_regionTabCache.selectedBand);
   const [selectedCsManager, _setSelectedCsManager] = useState(_regionTabCache.selectedCsManager);
   const [detailSort, _setDetailSort] = useState(_regionTabCache.detailSort);
-  const setSelectedFQ = (v) => {
+  const _setSelectedFQRaw = (v) => {
     _setSelectedFQ(v);
     _regionTabCache.selectedFQ = v;
+  };
+  const _setSelectedBandRaw = (v) => {
+    _setSelectedBand(v);
+    _regionTabCache.selectedBand = v;
+  };
+  const _syncFQToGlobal = (v) => {
+    const desired = !v || v === "__ALL_FQ__" ? [...DEFAULT_QUARTERS] : [v];
+    actions.setFilters((prev) => {
+      const cur = Array.isArray(prev.quarters) ? prev.quarters : [];
+      if (cur.length === desired.length && cur.every((q, i) => q === desired[i])) return prev;
+      return { ...prev, quarters: desired };
+    });
+  };
+  const _syncBandToGlobal = (v) => {
+    const desired = v || "all";
+    actions.setFilters((prev) => {
+      if ((prev.band || "all") === desired) return prev;
+      return { ...prev, band: desired };
+    });
+  };
+  const setSelectedFQ = (v) => {
+    _setSelectedFQRaw(v);
+    _syncFQToGlobal(v);
   };
   const setSelectedSubregions = (v) => {
     const val = typeof v === "function" ? v(_regionTabCache.selectedSubregions) : v;
@@ -6740,8 +6779,8 @@ function RegionQuarterTable() {
     _regionTabCache.selectedSubregions = val;
   };
   const setSelectedBand = (v) => {
-    _setSelectedBand(v);
-    _regionTabCache.selectedBand = v;
+    _setSelectedBandRaw(v);
+    _syncBandToGlobal(v);
   };
   const setSelectedCsManager = (v) => {
     _setSelectedCsManager(v);
@@ -6787,9 +6826,13 @@ function RegionQuarterTable() {
     });
   }, [validRows, qKey, atrKey, buKey]);
   useEffect(() => {
-    if (!selectedFQ && rowsView.length) {
-      setSelectedFQ("__ALL_FQ__");
-    }
+    const gq = Array.isArray(state.filters?.quarters) ? state.filters.quarters : [];
+    const desiredFQ = gq.length === 0 ? "__ALL_FQ__" : gq.length === 1 ? gq[0] : "__ALL_FQ__";
+    if (desiredFQ !== selectedFQ) _setSelectedFQRaw(desiredFQ);
+    const gb = state.filters?.band || "all";
+    if (gb !== selectedBand) _setSelectedBandRaw(gb);
+  }, [state.filters?.quarters, state.filters?.band, selectedFQ, selectedBand]);
+  useEffect(() => {
     setSelectedAccountRow(null);
   }, [rowsView.length, selectedFQ, selectedSubregions, selectedBand]);
   const _bandKey = hm.BAND || "BAND";
@@ -7065,7 +7108,55 @@ function RegionQuarterTable() {
   const attainColor = (a) => a >= 1 ? "text-emerald-600 dark:text-emerald-400" : a >= 0.9 ? "text-amber-600 dark:text-amber-400" : "text-red-500 dark:text-red-400";
   const _mobileBandLabel = selectedBand && selectedBand !== "all" ? BAND_OPTIONS.find((b) => b.value === selectedBand)?.label || selectedBand : "All accounts";
   const _mobileFqLabel = !selectedFQ ? "Pick a quarter" : selectedFQ === "__ALL_FQ__" ? "All quarters" : selectedFQ;
-  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-bar" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-bar-head glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "region-filter-bar-toggle", onClick: () => setFiltersCollapsed((p) => !p), "aria-expanded": !filtersCollapsed }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${filtersCollapsed ? "" : "is-open"}` }, "\u25BC"), /* @__PURE__ */ React.createElement("svg", { className: "region-filter-bar-icon", width: "13", height: "13", viewBox: "0 0 24 24", "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("path", { fill: "currentColor", d: "M3 5h18l-7 8v5l-4 2v-7z" })), /* @__PURE__ */ React.createElement("span", { className: "region-filter-bar-title" }, "Quick Filters")), /* @__PURE__ */ React.createElement("div", { className: "region-filter-summary" }, /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip" }, _mobileFqLabel), selectedBand !== "all" && /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip region-filter-chip-emerald" }, BAND_OPTIONS.find((b) => b.value === selectedBand)?.label || selectedBand), selectedSubregions.size > 0 && /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip" }, selectedSubregions.size === 1 ? Array.from(selectedSubregions)[0] : selectedSubregions.size + " sub-regions"), selectedCsManager !== "__ALL_CSM__" && /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip" }, selectedCsManager), focusRows.length > 0 && /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip region-filter-chip-muted" }, focusRows.length.toLocaleString(), " accounts"))), !filtersCollapsed && /* @__PURE__ */ React.createElement("div", { className: "region-filter-sections" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-section region-filter-section-primary glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setFqOpen((p) => !p), className: "region-filter-section-head" }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${fqOpen ? "is-open" : ""}` }, "\u25BC"), /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-title" }, "Fiscal Quarters"), selectedFQ && /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-badge" }, selectedFQ === "__ALL_FQ__" ? "All quarters" : selectedFQ)), fqOpen && /* @__PURE__ */ React.createElement("div", { className: "region-filter-section-body" }, /* @__PURE__ */ React.createElement("div", { className: "region-fq-scroll" }, (() => {
+  const _filters = state.filters || {};
+  const _arrRanges = Array.isArray(_filters.arrRanges) ? _filters.arrRanges : [];
+  const _arrMinActive = _filters.arrMin != null && _filters.arrMin !== "";
+  const _arrMaxActive = _filters.arrMax != null && _filters.arrMax !== "";
+  const _arrActive = _arrRanges.length > 0 || _arrMinActive || _arrMaxActive;
+  const _arrLabel = (() => {
+    const money = (v) => v != null && v !== "" ? formatCurrencyUSD(Number(v)) : "Any";
+    if (_arrRanges.length === 1) return money(_arrRanges[0].min) + " \u2013 " + money(_arrRanges[0].max);
+    if (_arrRanges.length > 1) return _arrRanges.length + " ARR ranges";
+    if (_arrMinActive || _arrMaxActive) return money(_filters.arrMin) + " \u2013 " + money(_filters.arrMax);
+    return "";
+  })();
+  const clearArrFilter = () => {
+    if (typeof window !== "undefined" && typeof window.__renewalsResetArrFilter === "function") {
+      window.__renewalsResetArrFilter();
+    } else {
+      actions.setFilters((p) => ({ ...p, arrRanges: [], arrMin: null, arrMax: null }));
+    }
+  };
+  const _fqActive = selectedFQ && selectedFQ !== "__ALL_FQ__";
+  const _bandActive = selectedBand && selectedBand !== "all";
+  const _subActive = selectedSubregions.size > 0;
+  const _csmActive = selectedCsManager && selectedCsManager !== "__ALL_CSM__";
+  const _anyFilterActive = _fqActive || _bandActive || _subActive || _csmActive || _arrActive;
+  const resetAllRegionFilters = () => {
+    React.startTransition(() => {
+      setSelectedFQ("__ALL_FQ__");
+      setSelectedBand("all");
+      setSelectedSubregions(/* @__PURE__ */ new Set());
+      setSelectedCsManager("__ALL_CSM__");
+    });
+    clearArrFilter();
+  };
+  const _mkChip = (key, label, onRemove, extraClass) => /* @__PURE__ */ React.createElement(
+    "span",
+    { key, className: "region-filter-chip region-filter-chip-removable" + (extraClass ? " " + extraClass : "") },
+    /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip-label" }, label),
+    /* @__PURE__ */ React.createElement("button", { type: "button", className: "region-filter-chip-x", "aria-label": "Clear " + label, onClick: (e) => {
+      e.stopPropagation();
+      onRemove();
+    } }, "\u00D7")
+  );
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-bar" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-bar-head glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "region-filter-bar-toggle", onClick: () => setFiltersCollapsed((p) => !p), "aria-expanded": !filtersCollapsed }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${filtersCollapsed ? "" : "is-open"}` }, "\u25BC"), /* @__PURE__ */ React.createElement("svg", { className: "region-filter-bar-icon", width: "13", height: "13", viewBox: "0 0 24 24", "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("path", { fill: "currentColor", d: "M3 5h18l-7 8v5l-4 2v-7z" })), /* @__PURE__ */ React.createElement("span", { className: "region-filter-bar-title" }, "Quick Filters")), /* @__PURE__ */ React.createElement("div", { className: "region-filter-summary" }, _fqActive ? _mkChip("fq", selectedFQ, () => React.startTransition(() => setSelectedFQ("__ALL_FQ__"))) : /* @__PURE__ */ React.createElement("span", { key: "fq", className: "region-filter-chip region-filter-chip-muted" }, _mobileFqLabel), _bandActive && _mkChip("band", BAND_OPTIONS.find((b) => b.value === selectedBand)?.label || selectedBand, () => React.startTransition(() => {
+    setSelectedBand("all");
+    setSelectedSubregions(/* @__PURE__ */ new Set());
+  }), "region-filter-chip-emerald"), _subActive && _mkChip("sub", selectedSubregions.size === 1 ? Array.from(selectedSubregions)[0] : selectedSubregions.size + " sub-regions", () => React.startTransition(() => setSelectedSubregions(/* @__PURE__ */ new Set()))), _csmActive && _mkChip("csm", selectedCsManager, () => React.startTransition(() => setSelectedCsManager("__ALL_CSM__"))), _arrActive && _mkChip("arr", _arrLabel, clearArrFilter), focusRows.length > 0 && /* @__PURE__ */ React.createElement("span", { key: "cnt", className: "region-filter-chip region-filter-chip-muted" }, focusRows.length.toLocaleString(), " accounts"), _anyFilterActive && /* @__PURE__ */ React.createElement("button", { key: "reset", type: "button", className: "region-filter-reset", onClick: (e) => {
+    e.stopPropagation();
+    resetAllRegionFilters();
+  } }, "Reset filters"))), !filtersCollapsed && /* @__PURE__ */ React.createElement("div", { className: "region-filter-sections" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-section region-filter-section-primary glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setFqOpen((p) => !p), className: "region-filter-section-head" }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${fqOpen ? "is-open" : ""}` }, "\u25BC"), /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-title" }, "Fiscal Quarters"), selectedFQ && /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-badge" }, selectedFQ === "__ALL_FQ__" ? "All quarters" : selectedFQ)), fqOpen && /* @__PURE__ */ React.createElement("div", { className: "region-filter-section-body" }, /* @__PURE__ */ React.createElement("div", { className: "region-fq-scroll" }, (() => {
     const COLOR_BOOKED = "#6366f1";
     const COLOR_BU = "#d97706";
     const COLOR_DJ = "#8b5cf6";
@@ -7456,12 +7547,25 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
   React.useEffect(() => {
     if (!_callKey || !_callAccountId) return;
     let cancelled = false;
-    fetch("/api/renewals/account-forecasts/" + encodeURIComponent(_callAccountId) + "?call_key=" + encodeURIComponent(_callKey), { cache: "no-store" }).then((r) => r.ok ? r.json() : null).then((d) => {
-      if (cancelled || !d) return;
-      if (d.cs_forecast != null && isFinite(toNumber(d.cs_forecast))) setCsDraft(fmtCurr(toNumber(d.cs_forecast)));
-      if (d.renewals_forecast != null && isFinite(toNumber(d.renewals_forecast))) setRnDraft(fmtCurr(toNumber(d.renewals_forecast)));
-    }).catch(() => {
-    });
+    const url = "/api/renewals/account-forecasts/" + encodeURIComponent(_callAccountId) + "?call_key=" + encodeURIComponent(_callKey);
+    const load = (attempt) => {
+      fetch(url, { cache: "no-store" }).then((r) => {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      }).then((d) => {
+        if (cancelled || !d) return;
+        if (d.cs_forecast != null && isFinite(toNumber(d.cs_forecast))) setCsDraft(fmtCurr(toNumber(d.cs_forecast)));
+        if (d.renewals_forecast != null && isFinite(toNumber(d.renewals_forecast))) setRnDraft(fmtCurr(toNumber(d.renewals_forecast)));
+      }).catch(() => {
+        // Retry transient failures (e.g. a briefly-busy pool) so the saved
+        // call still loads on first open rather than leaving the fields blank.
+        if (cancelled || attempt >= 2) return;
+        setTimeout(() => {
+          if (!cancelled) load(attempt + 1);
+        }, 300 * (attempt + 1));
+      });
+    };
+    load(0);
     return () => {
       cancelled = true;
     };
