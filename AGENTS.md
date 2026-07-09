@@ -407,6 +407,38 @@ Token-required (`X-Admin-Token` or `Authorization: Bearer …`). Accepts
 text/csv body or multipart/form-data with `file` part. Returns
 `{ok, id, slot, filename, size, sha256, uploaded_at}`.
 
+### 5.9 `GET /api/renewals/account-forecasts/{account_id}`
+
+Latest CS / Renewals call for one renewal row (resolved via `call_key`, or
+`year_quarter` + `rounded_atr`). In addition to the latest values, the
+response now includes a **`history`** array — the full append-only audit
+trail for that `call_key`, newest-first, sourced from `account_call_events`:
+
+```json
+{
+  "ok": true,
+  "call_key": "001ABC::2027Q1::1320",
+  "cs_forecast": 500000.0,
+  "renewals_forecast": 250000.0,
+  "elt_forecast": 750000.0,
+  "history": [
+    {
+      "cs_forecast": 500000.0,
+      "renewals_forecast": 250000.0,
+      "elt_forecast": 750000.0,
+      "effective_date": "2026-07-09T14:03:11.101Z",
+      "edited_by_email": "jesse@zendesk.com",
+      "edited_by_display": "Jesse",
+      "source": "modal_done"
+    }
+  ]
+}
+```
+
+`history` is display-only and read by the account card's "Updates" section
+to show who changed CS / Renewals forecast and when. It is additive — the
+prior single-call fields are unchanged, so the frozen contract holds.
+
 ---
 
 ## 6. Common change patterns

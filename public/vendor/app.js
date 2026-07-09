@@ -201,6 +201,8 @@ const FIELD_KEYS = {
   CC_OFFCYCLE: ["CC_OFFCYCLE_ARR", "CC_OFFCYCLE", "OFFCYCLE_CC"],
   EXPANSION: ["EXPANSION", "EXPANSION_ARR"],
   DONE_DEAL: ["DONE_DEAL", "DONE"],
+  UPSIDE: ["UPSIDE", "UPSIDE_ARR", "UPSIDE_USD"],
+  DOWNSIDE: ["DOWNSIDE", "DOWNSIDE_ARR", "DOWNSIDE_USD"],
   PARTNER_NAME: ["PARTNER_NAME", "PARTNER"],
   MANAGER_SUCCESS: ["MANAGER_SUCCESS", "CS_MANAGER", "SUCCESS_MANAGER", "MANAGER"],
   BAND: ["BAND", "ATR_BAND", "ACCOUNT_BAND"]
@@ -213,8 +215,6 @@ const DROPPED_COLUMNS = /* @__PURE__ */ new Set([
   "QTD_CC",
   "FC_ONCYCLE",
   "FC_OFFCYCLE",
-  "UPSIDE",
-  "DOWNSIDE",
   "TERM_GROUPED",
   "CRM_OWNER_NAME",
   "CRM_RENEWAL_OWNER_NAME",
@@ -367,6 +367,8 @@ function buildHeaderMap(headers) {
   map.FLAG_TOP3K = find(FIELD_KEYS.FLAG_TOP3K) || "FLAG_3K";
   map.MANAGER_SUCCESS = find(FIELD_KEYS.MANAGER_SUCCESS) || "MANAGER_SUCCESS";
   map.BAND = find(FIELD_KEYS.BAND) || "BAND";
+  map.UPSIDE = find(FIELD_KEYS.UPSIDE) || "UPSIDE";
+  map.DOWNSIDE = find(FIELD_KEYS.DOWNSIDE) || "DOWNSIDE";
   return map;
 }
 function toNumber(x) {
@@ -919,7 +921,10 @@ const initialState = {
     largestAtr: false,
     csCall: true,
     renewalsCall: true,
-    eltCall: true
+    eltCall: true,
+    adjCc: true,
+    bestCase: false,
+    worstCase: false
   }
 };
 function AppProvider({ children }) {
@@ -6780,6 +6785,8 @@ function RegionQuarterTable() {
   const partnerTypeKey = hm.PARTNER_TYPE || "PARTNER_TYPE_C";
   const subregionKey = hm.SUBREGION || "PRO_FORMA_SUBREGION";
   const touchKey = hm.DAYS_SINCE_TOUCH || "DAYS_SINCE_LAST_CS_TOUCH";
+  const upsideKey = hm.UPSIDE || "UPSIDE";
+  const downsideKey = hm.DOWNSIDE || "DOWNSIDE";
   const histData = state.historicalData || [];
   const histHM = state.historicalHeaderMap || {};
   const histAtrKey = histHM.ATR_STARTING || "ATR_ARR_USD_STARTING";
@@ -7055,18 +7062,28 @@ function RegionQuarterTable() {
       const nk = r.__noteKey;
       const note = nk ? notes[nk] : null;
       let dj = null;
+      let callFc = null;
       if (typeof RenewalsCallKeys !== "undefined") {
         const ck = RenewalsCallKeys.buildCallKey(r, hm, settings);
         const fc = ck ? fcByAccount.get(ck) : null;
         const cs = fc?.cs_forecast != null ? toNumber(fc.cs_forecast) : null;
         const rn = fc?.renewals_forecast != null ? toNumber(fc.renewals_forecast) : null;
-        if (cs != null || rn != null) dj = (cs || 0) + (rn || 0);
+        if (cs != null || rn != null) {
+          dj = (cs || 0) + (rn || 0);
+          callFc = dj;
+        }
       }
       if (dj == null) {
         const djRaw = note && !note.archived && note.djForecast != null && isFinite(toNumber(note.djForecast)) ? toNumber(note.djForecast) : null;
         dj = djRaw !== null && Math.round(djRaw) !== Math.round(bu) ? djRaw : null;
       }
-      return { r, account: safeString(r[acctKey]) || "(Unnamed)", owner: safeString(r[ownerKey]), partner: safeString(r[partnerKey]), partnerType: safeString(r[partnerTypeKey]), date: safeString(r[dateKey]), atr, bu, cc, health: safeString(r[healthKey]), dj };
+      const effFc = callFc != null ? callFc : bu;
+      const adjCc = atr > 0 ? effFc / atr : 0;
+      const hasUpside = safeString(r[upsideKey]) !== "";
+      const hasDownside = safeString(r[downsideKey]) !== "";
+      const bestCase = hasUpside ? bu + toNumber(r[upsideKey]) : null;
+      const worstCase = hasDownside ? bu + toNumber(r[downsideKey]) : null;
+      return { r, account: safeString(r[acctKey]) || "(Unnamed)", owner: safeString(r[ownerKey]), partner: safeString(r[partnerKey]), partnerType: safeString(r[partnerTypeKey]), date: safeString(r[dateKey]), atr, bu, cc, adjCc, bestCase, worstCase, health: safeString(r[healthKey]), dj };
     });
     const dir = detailSort.dir === "asc" ? 1 : -1;
     return [...mapped].sort((a, b) => {
@@ -7083,6 +7100,12 @@ function RegionQuarterTable() {
           return dir * (a.bu - b.bu);
         case "cc":
           return dir * (a.cc - b.cc);
+        case "adjCc":
+          return dir * (a.adjCc - b.adjCc);
+        case "bestCase":
+          return dir * ((a.bestCase ?? -Infinity) - (b.bestCase ?? -Infinity));
+        case "worstCase":
+          return dir * ((a.worstCase ?? -Infinity) - (b.worstCase ?? -Infinity));
         case "dj":
           return dir * ((a.dj ?? -Infinity) - (b.dj ?? -Infinity));
         case "health":
@@ -7424,11 +7447,11 @@ function RegionQuarterTable() {
       alert("No rows to export");
       return;
     }
-    const hdr = ["Account", "Renewal", "ATR", "C/C FC", "ELT Call", "CC%", "Health", "Owner", "Partner", "Renewal Dictated By"];
+    const hdr = ["Account", "Renewal", "ATR", "C/C FC", "ELT Call", "CC%", "Adj CC%", "Best Case", "Worst Case", "Health", "Owner", "Partner", "Renewal Dictated By"];
     const csvRows = [hdr.join(",")];
     vis.forEach((row) => {
       const esc = escapeCsvField;
-      csvRows.push([esc(row.account), esc(row.date), row.atr, row.bu, row.dj != null ? row.dj : "", isFinite(row.cc) ? (row.cc * 100).toFixed(1) + "%" : "", esc(row.health), esc(row.owner), esc(row.partner), esc(safeString(row.r && row.r[hm.DICTATED_BY]))].join(","));
+      csvRows.push([esc(row.account), esc(row.date), row.atr, row.bu, row.dj != null ? row.dj : "", isFinite(row.cc) ? (row.cc * 100).toFixed(1) + "%" : "", isFinite(row.adjCc) ? (row.adjCc * 100).toFixed(1) + "%" : "", row.bestCase != null ? row.bestCase : "", row.worstCase != null ? row.worstCase : "", esc(row.health), esc(row.owner), esc(row.partner), esc(safeString(row.r && row.r[hm.DICTATED_BY]))].join(","));
     });
     const blob = new Blob(["\uFEFF" + csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
@@ -7439,7 +7462,7 @@ function RegionQuarterTable() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-  } }, /* @__PURE__ */ React.createElement("svg", { className: "w-3.5 h-3.5 text-gray-500 dark:text-gray-400", fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 2 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5m0 0l5-5m-5 5V3" }))))), /* @__PURE__ */ React.createElement("div", { className: "table-container compact-table", style: { maxHeight: "420px" } }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full w-full table-fixed text-[10px]" }, /* @__PURE__ */ React.createElement("thead", { className: "text-[10px] uppercase text-gray-500 dark:text-gray-400" }, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer", onClick: () => toggleSort("account") }, "Account ", sortIcon("account")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer hidden sm:table-cell", style: { width: "72px" }, onClick: () => toggleSort("date") }, "Renewal ", sortIcon("date")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer", style: { width: "68px" }, onClick: () => toggleSort("atr") }, "ATR ", sortIcon("atr")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer hidden sm:table-cell", style: { width: "68px" }, onClick: () => toggleSort("bu") }, "C/C FC ", sortIcon("bu")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer", style: { width: "68px" }, onClick: () => toggleSort("dj") }, "ELT Call ", sortIcon("dj")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer hidden sm:table-cell", style: { width: "42px" }, onClick: () => toggleSort("cc") }, "CC% ", sortIcon("cc")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer", style: { width: "62px" }, onClick: () => toggleSort("health") }, "Health ", sortIcon("health")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer hidden sm:table-cell", style: { width: "90px" }, onClick: () => toggleSort("owner") }, "Owner ", sortIcon("owner")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left hidden sm:table-cell", style: { width: "90px" } }, "Partner"), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left hidden sm:table-cell", style: { width: "110px" }, title: "Renewal Dictated By" }, "Dictated By"))), /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-gray-100 dark:divide-gray-800" }, detailRowsSorted.length === 0 && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 3, className: "px-1.5 py-2 text-center text-xs text-gray-500 sm:hidden" }, "No accounts for this selection"), /* @__PURE__ */ React.createElement("td", { colSpan: 10, className: "px-1.5 py-2 text-center text-xs text-gray-500 hidden sm:table-cell" }, "No accounts for this selection")), (detailLimit === "all" ? detailRowsSorted : detailRowsSorted.slice(0, Number(detailLimit))).map(({ r, account, owner, partner, partnerType, date, atr, bu, cc, health, dj }, idx) => /* @__PURE__ */ React.createElement(
+  } }, /* @__PURE__ */ React.createElement("svg", { className: "w-3.5 h-3.5 text-gray-500 dark:text-gray-400", fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 2 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5m0 0l5-5m-5 5V3" }))))), /* @__PURE__ */ React.createElement("div", { className: "table-container compact-table", style: { maxHeight: "420px" } }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full w-full table-fixed text-[10px]" }, /* @__PURE__ */ React.createElement("thead", { className: "text-[10px] uppercase text-gray-500 dark:text-gray-400" }, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer", onClick: () => toggleSort("account") }, "Account ", sortIcon("account")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer hidden sm:table-cell", style: { width: "72px" }, onClick: () => toggleSort("date") }, "Renewal ", sortIcon("date")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer", style: { width: "68px" }, onClick: () => toggleSort("atr") }, "ATR ", sortIcon("atr")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer hidden sm:table-cell", style: { width: "68px" }, onClick: () => toggleSort("bu") }, "C/C FC ", sortIcon("bu")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer", style: { width: "68px" }, onClick: () => toggleSort("dj") }, "ELT Call ", sortIcon("dj")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer hidden sm:table-cell", style: { width: "42px" }, onClick: () => toggleSort("cc") }, "CC% ", sortIcon("cc")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer hidden sm:table-cell", style: { width: "52px" }, title: "Effective forecast (ELT call if set, else BU FC) \u00F7 ATR", onClick: () => toggleSort("adjCc") }, "Adj CC% ", sortIcon("adjCc")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer hidden sm:table-cell", style: { width: "68px" }, title: "BU FC + Upside", onClick: () => toggleSort("bestCase") }, "Best ", sortIcon("bestCase")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-right cursor-pointer hidden sm:table-cell", style: { width: "68px" }, title: "BU FC + Downside", onClick: () => toggleSort("worstCase") }, "Worst ", sortIcon("worstCase")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer", style: { width: "62px" }, onClick: () => toggleSort("health") }, "Health ", sortIcon("health")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left cursor-pointer hidden sm:table-cell", style: { width: "90px" }, onClick: () => toggleSort("owner") }, "Owner ", sortIcon("owner")), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left hidden sm:table-cell", style: { width: "90px" } }, "Partner"), /* @__PURE__ */ React.createElement("th", { className: "px-1 py-1 text-left hidden sm:table-cell", style: { width: "110px" }, title: "Renewal Dictated By" }, "Dictated By"))), /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-gray-100 dark:divide-gray-800" }, detailRowsSorted.length === 0 && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 3, className: "px-1.5 py-2 text-center text-xs text-gray-500 sm:hidden" }, "No accounts for this selection"), /* @__PURE__ */ React.createElement("td", { colSpan: 13, className: "px-1.5 py-2 text-center text-xs text-gray-500 hidden sm:table-cell" }, "No accounts for this selection")), (detailLimit === "all" ? detailRowsSorted : detailRowsSorted.slice(0, Number(detailLimit))).map(({ r, account, owner, partner, partnerType, date, atr, bu, cc, adjCc, bestCase, worstCase, health, dj }, idx) => /* @__PURE__ */ React.createElement(
     "tr",
     {
       key: r.__uid || account + date,
@@ -7452,6 +7475,9 @@ function RegionQuarterTable() {
     /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1 text-right tabular-nums whitespace-nowrap hidden sm:table-cell" }, formatCurrencyUSD(bu)),
     /* @__PURE__ */ React.createElement("td", { className: `px-1 py-1 text-right tabular-nums whitespace-nowrap ${dj !== null ? dj < bu ? "text-red-500 dark:text-red-400 font-medium" : "text-emerald-600 dark:text-emerald-400 font-medium" : "text-gray-300 dark:text-gray-600"}` }, dj !== null ? formatCurrencyUSD(dj) : "\u2014"),
     /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1 text-right tabular-nums whitespace-nowrap hidden sm:table-cell" }, formatPercent(cc)),
+    /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1 text-right tabular-nums whitespace-nowrap hidden sm:table-cell" }, formatPercent(adjCc)),
+    /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1 text-right tabular-nums whitespace-nowrap hidden sm:table-cell" }, bestCase !== null ? formatCurrencyUSD(bestCase) : "\u2014"),
+    /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1 text-right tabular-nums whitespace-nowrap hidden sm:table-cell" }, worstCase !== null ? formatCurrencyUSD(worstCase) : "\u2014"),
     /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1" }, healthBadge(health)),
     /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1 truncate hidden sm:table-cell", title: owner || "" }, owner || "\u2014"),
     /* @__PURE__ */ React.createElement("td", { className: "px-1 py-1 truncate hidden sm:table-cell", title: partner || "" }, partner || "\u2014"),
@@ -7583,6 +7609,8 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
   const segmentKey = headerMap.SEGMENT || "PRO_FORMA_MARKET_SEGMENT";
   const summaryKey = headerMap.FORECAST_SUMMARY || "FORECAST_SUMMARY";
   const touchKey = headerMap.DAYS_SINCE_TOUCH || "DAYS_SINCE_LAST_CS_TOUCH";
+  const upsideKey = headerMap.UPSIDE || "UPSIDE";
+  const downsideKey = headerMap.DOWNSIDE || "DOWNSIDE";
   const products = Array.isArray(row.__products) ? row.__products : (safeString(row[headerMap.PRODUCT_LINES]) || "").split(/[,;|]/).map((s) => safeString(s)).filter(Boolean);
   const nk = row.__noteKey;
   const existing = nk ? notes[nk] : null;
@@ -7593,6 +7621,7 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
   });
   const [csDraft, setCsDraft] = React.useState("");
   const [rnDraft, setRnDraft] = React.useState("");
+  const [callHistory, setCallHistory] = React.useState([]);
   const _callKey = typeof RenewalsCallKeys !== "undefined" ? RenewalsCallKeys.buildCallKey(row, headerMap, settings) : null;
   const _callAccountId = safeString(row[acctIdKey]);
   React.useEffect(() => {
@@ -7607,6 +7636,7 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
         if (cancelled || !d) return;
         if (d.cs_forecast != null && isFinite(toNumber(d.cs_forecast))) setCsDraft(fmtCurr(toNumber(d.cs_forecast)));
         if (d.renewals_forecast != null && isFinite(toNumber(d.renewals_forecast))) setRnDraft(fmtCurr(toNumber(d.renewals_forecast)));
+        if (Array.isArray(d.history)) setCallHistory(d.history);
       }).catch(() => {
         // Retry transient failures (e.g. a briefly-busy pool) so the saved
         // call still loads on first open rather than leaving the fields blank.
@@ -7637,6 +7667,12 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
   const bu = toNumber(row[buKey]);
   const grr = atr > 0 ? (atr - bu) / atr : 1;
   const cc = atr > 0 ? bu / atr : 0;
+  const _effFc = _hasCall ? _eltComputed || 0 : bu;
+  const adjCc = atr > 0 ? _effFc / atr : 0;
+  const _hasUpside = safeString(row[upsideKey]) !== "";
+  const _hasDownside = safeString(row[downsideKey]) !== "";
+  const bestCase = bu + toNumber(row[upsideKey]);
+  const worstCase = bu + toNumber(row[downsideKey]);
   const renewalDt = parseDate(row[dateKey]);
   const daysToRenew = renewalDt ? Math.round((renewalDt - /* @__PURE__ */ new Date()) / 864e5) : null;
   const touchVal = toNumber(row[touchKey]);
@@ -7649,6 +7685,30 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
   const summaryText = safeString(row[summaryKey]);
   const healthColor = /green/.test(healthRaw) ? "text-emerald-600 dark:text-emerald-400" : /red/.test(healthRaw) ? "text-red-500 dark:text-red-400" : /amber|yellow|orange/.test(healthRaw) ? "text-amber-600 dark:text-amber-400" : "text-gray-500";
   const entries = React.useMemo(() => parseNoteEntries(noteDraft), [noteDraft]);
+  const callUpdates = React.useMemo(() => {
+    const hist = Array.isArray(callHistory) ? callHistory : [];
+    const out = [];
+    for (let i = 0; i < hist.length; i++) {
+      const cur = hist[i];
+      const older = hist[i + 1] || null;
+      const ts = cur.effective_date ? new Date(cur.effective_date).getTime() : null;
+      const who = safeString(cur.edited_by_display) || safeString(cur.edited_by_email) || "";
+      const curCs = cur.cs_forecast != null && isFinite(toNumber(cur.cs_forecast)) ? toNumber(cur.cs_forecast) : null;
+      const curRn = cur.renewals_forecast != null && isFinite(toNumber(cur.renewals_forecast)) ? toNumber(cur.renewals_forecast) : null;
+      const oldCs = older && older.cs_forecast != null && isFinite(toNumber(older.cs_forecast)) ? toNumber(older.cs_forecast) : null;
+      const oldRn = older && older.renewals_forecast != null && isFinite(toNumber(older.renewals_forecast)) ? toNumber(older.renewals_forecast) : null;
+      const changes = [];
+      if (cur.source === "clear" || curCs == null && curRn == null && older && (oldCs != null || oldRn != null)) {
+        changes.push("Calls cleared");
+      } else {
+        if (!older || curCs !== oldCs) changes.push(curCs == null ? "CS Forecast cleared" : `CS Forecast set to ${fmtCurr(curCs)}`);
+        if (!older || curRn !== oldRn) changes.push(curRn == null ? "Renewals Forecast cleared" : `Renewals Forecast set to ${fmtCurr(curRn)}`);
+      }
+      if (!changes.length) continue;
+      out.push({ ts, who, changes, key: `call-${ts || i}-${i}` });
+    }
+    return out;
+  }, [callHistory]);
   const handleAddEntry = () => {
     const text = newEntry.trim();
     if (!text) return;
@@ -7771,6 +7831,7 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
   })(), safeString(row[regionKey]) && /* @__PURE__ */ React.createElement("span", { className: "acct-hdr-pill" }, safeString(row[regionKey])), safeString(row[segmentKey]) && /* @__PURE__ */ React.createElement("span", { className: "acct-hdr-pill" }, safeString(row[segmentKey])), safeString(row[ownerKey]) && /* @__PURE__ */ React.createElement("span", { className: "acct-hdr-pill" }, safeString(row[ownerKey])))), /* @__PURE__ */ React.createElement("div", { className: "acct-modal-body" }, /* @__PURE__ */ React.createElement("div", { className: "acct-modal-cols" }, /* @__PURE__ */ React.createElement("div", { className: "acct-modal-sidebar space-y-3" }, /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Metrics"), [
     ["ATR", fmtCompact(atr)],
     ["BU FC", `${fmtCompact(bu)} (${formatPercent(cc)} C/C)`],
+    ["Adj. C/C %", formatPercent(adjCc)],
     ["GRR", formatPercent(grr)],
     isFinite(accountArr) ? ["Acct ARR", fmtCompact(accountArr)] : null
   ].filter(Boolean).map(([label, val]) => /* @__PURE__ */ React.createElement("div", { key: label, className: "flex justify-between items-baseline" }, /* @__PURE__ */ React.createElement("span", { className: "text-[10px] uppercase tracking-wider font-semibold text-gray-500 dark:text-gray-400" }, label), /* @__PURE__ */ React.createElement("span", { className: "text-xs font-bold text-gray-800 dark:text-gray-100 tabular-nums" }, val)))), (() => {
@@ -7784,6 +7845,8 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
     daysToRenew != null ? ["Days to renew", `${daysToRenew}d`] : null,
     isFinite(touchVal) && touchVal > 0 ? ["Days since touch", `${touchVal}d`] : null,
     largest ? ["Largest", `${largest.date || "--"} \xB7 ${fmtCompact(largest.atr || 0)}`] : null,
+    _hasUpside ? ["Best case", fmtCompact(bestCase)] : null,
+    _hasDownside ? ["Worst case", fmtCompact(worstCase)] : null,
     safeString(row[headerMap.DICTATED_BY]) ? ["Dictated by", safeString(row[headerMap.DICTATED_BY])] : null
   ].filter(Boolean).map(([label, val]) => /* @__PURE__ */ React.createElement("div", { key: label, className: "flex justify-between items-baseline" }, /* @__PURE__ */ React.createElement("span", { className: "text-[10px] uppercase tracking-wider font-semibold text-gray-500 dark:text-gray-400" }, label), /* @__PURE__ */ React.createElement("span", { className: "text-xs font-medium text-gray-800 dark:text-gray-100" }, val)))), safeString(row[partnerKey]) && /* @__PURE__ */ React.createElement("div", { className: "space-y-1 pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Partner"), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-700 dark:text-gray-200" }, safeString(row[partnerKey]))), products.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-1 pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Products"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1" }, products.map((p, i) => /* @__PURE__ */ React.createElement("span", { key: `${p}-${i}`, className: "pill-chip pill-chip-muted" }, p)))), summaryText && /* @__PURE__ */ React.createElement("div", { className: "pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "flex items-center gap-1 text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-widest hover:text-gray-700 dark:hover:text-gray-300 transition-colors", onClick: () => setShowForecast(!showForecast) }, /* @__PURE__ */ React.createElement("svg", { className: `w-3 h-3 transition-transform ${showForecast ? "rotate-90" : ""}`, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor" }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M9 5l7 7-7 7" })), "Forecast Summary"), showForecast && /* @__PURE__ */ React.createElement("div", { className: "mt-1.5 text-[11px] text-gray-700 dark:text-gray-200 leading-relaxed" }, summaryText))), /* @__PURE__ */ React.createElement("div", { className: "acct-modal-main" }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 mb-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400 mb-1" }, "CS Forecast"), /* @__PURE__ */ React.createElement("input", { className: "w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-slate-900 text-xs font-bold px-2.5 py-1.5 tabular-nums", inputMode: "decimal", placeholder: "--", value: csDraft, onChange: (e) => setCsDraft(e.target.value), onFocus: () => setCsDraft(normDj(csDraft)), onBlur: () => {
     const raw = normDj(csDraft);
@@ -7855,10 +7918,10 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
       value: noteDraft,
       onChange: (e) => setNoteDraft(e.target.value)
     }
-  ) : /* @__PURE__ */ React.createElement("div", { className: "space-y-1 min-h-[10rem]" }, entries.length === 0 && /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-400 italic py-4" }, "No notes yet. Type an update above and press Enter."), entries.map((e, i) => {
+  ) : /* @__PURE__ */ React.createElement("div", { className: "space-y-1 min-h-[10rem]" }, entries.length === 0 && callUpdates.length === 0 && /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-400 italic py-4" }, "No notes yet. Type an update above and press Enter."), entries.map((e, i) => {
     const meta = parseNoteEntryMeta(e.date);
     return /* @__PURE__ */ React.createElement("div", { key: i, className: "note-timeline-entry" }, meta.when && /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-indigo-600 dark:text-indigo-400 mb-0.5" }, meta.when), meta.author && /* @__PURE__ */ React.createElement("div", { className: "text-[9px] text-gray-500 dark:text-gray-400 mb-0.5" }, meta.author), !meta.when && !meta.author && i === 0 && /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-gray-400 mb-0.5" }, "(undated)"), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-700 dark:text-gray-200 leading-relaxed whitespace-pre-wrap", style: { wordBreak: "break-word" } }, e.text));
-  })), /* @__PURE__ */ React.createElement(NoteHistoryPanel, { history: existing ? existing.history : null }), /* @__PURE__ */ React.createElement(RelatedRenewalsPanel, { noteKey: nk, notes, accountName: safeString(row[acctKey]), onCopyFrom: copyFromRelated, onCopyAndArchive: copyAndArchiveFromRelated, onConsolidateAll: consolidateAllRelated, onDeleteRelated: onDeleteNote }), /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mt-3 pt-3 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-400 truncate" }, existing && existing.updatedAt ? `Last saved: ${formatNoteDate(existing.updatedAt)}${existing.editedByDisplay ? ` by ${existing.editedByDisplay}` : ""}` : "Not yet saved"), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-emerald", onClick: handleSave }, "Done")))))));
+  }), callUpdates.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "pt-1.5 mt-1.5 border-t border-gray-100 dark:border-gray-700 space-y-1" }, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-widest font-bold text-gray-400 mb-1" }, "Forecast call changes"), callUpdates.map((c) => /* @__PURE__ */ React.createElement("div", { key: c.key, className: "note-timeline-entry" }, c.ts && /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-indigo-600 dark:text-indigo-400 mb-0.5" }, formatNoteDate(c.ts)), c.who && /* @__PURE__ */ React.createElement("div", { className: "text-[9px] text-gray-500 dark:text-gray-400 mb-0.5" }, c.who), c.changes.map((ch, j) => /* @__PURE__ */ React.createElement("div", { key: j, className: "text-[11px] text-gray-700 dark:text-gray-200 leading-relaxed" }, ch)))))), /* @__PURE__ */ React.createElement(NoteHistoryPanel, { history: existing ? existing.history : null }), /* @__PURE__ */ React.createElement(RelatedRenewalsPanel, { noteKey: nk, notes, accountName: safeString(row[acctKey]), onCopyFrom: copyFromRelated, onCopyAndArchive: copyAndArchiveFromRelated, onConsolidateAll: consolidateAllRelated, onDeleteRelated: onDeleteNote }), /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mt-3 pt-3 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-400 truncate" }, existing && existing.updatedAt ? `Last saved: ${formatNoteDate(existing.updatedAt)}${existing.editedByDisplay ? ` by ${existing.editedByDisplay}` : ""}` : "Not yet saved"), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-emerald", onClick: handleSave }, "Done")))))));
 }
 function AccountInsightCard({ row, headerMap, settings, touchByAccount, rollups }) {
   const fmtUSD = (v) => `$${Math.round(Number(v) || 0).toLocaleString()}`;
@@ -8027,6 +8090,8 @@ function DataTable({ rows }) {
   }, []);
   const atrKey = getAtrKey(hm, settings);
   const buKey = getBuKey(hm, settings);
+  const upsideKey = hm.UPSIDE || "UPSIDE";
+  const downsideKey = hm.DOWNSIDE || "DOWNSIDE";
   const dateKey = hm.NEXT_RENEWAL_DATE || "NEXT_RENEWAL_DATE";
   const healthKey = hm.HEALTH || "CRM_HEALTH_STATUS";
   const ownerKey = hm.OWNER || "CRM_SUCCESS_OWNER_NAME";
@@ -8247,13 +8312,30 @@ function DataTable({ rows }) {
     visibleCols.quarter && { id: "quarter", label: "Qtr", key: qKey, sw: "50px" },
     visibleCols.region && { id: "region", label: "Region", key: hm.REGION || "REGION", sw: "50px" },
     visibleCols.country && { id: "country", label: "Country", key: hm.BILLING_COUNTRY || hm.COUNTRY || "COUNTRY", sw: "72px" },
-    visibleCols.segment && { id: "segment", label: "Seg", key: hm.SEGMENT || "PRO_FORMA_MARKET_SEGMENT", sw: "50px" },
-    visibleCols.health && { id: "health", label: "Health", key: healthKey, sw: "62px", render: (v) => hBadge(v) },
+    visibleCols.segment && { id: "segment", label: "Seg", key: hm.SEGMENT || "PRO_FORMA_MARKET_SEGMENT", sw: "88px", trunc: true },
+    visibleCols.health && { id: "health", label: "Health", key: healthKey, sw: "80px", render: (v) => hBadge(v) },
     visibleCols.atr && { id: "atr", label: "ATR", key: atrKey, sw: "68px", right: true, render: (v) => fmtK(v) },
     visibleCols.bufc && { id: "bufc", label: "BU FC", key: buKey, sw: "68px", right: true, render: (v) => fmtK(v) },
     visibleCols.atr && visibleCols.bufc && { id: "cc", label: "CC%", key: "__CC__", sw: "42px", right: true, render: (_, r) => {
       const a = toNumber(r[atrKey]), b = toNumber(r[buKey]);
       return a > 0 ? fmtPct(b / a) : "\u2014";
+    } },
+    visibleCols.adjCc && { id: "adjCc", label: "Adj CC%", key: "__ADJ_CC__", sw: "52px", right: true, render: (_, r) => {
+      const a = toNumber(r[atrKey]);
+      if (!(a > 0)) return "\u2014";
+      const fc = fcForRow(r);
+      const cs = fc && fc.cs_forecast != null && isFinite(toNumber(fc.cs_forecast)) ? toNumber(fc.cs_forecast) : null;
+      const rn = fc && fc.renewals_forecast != null && isFinite(toNumber(fc.renewals_forecast)) ? toNumber(fc.renewals_forecast) : null;
+      const eff = cs != null || rn != null ? (cs || 0) + (rn || 0) : toNumber(r[buKey]);
+      return /* @__PURE__ */ React.createElement("span", { title: "Effective forecast (ELT call if set, else BU FC) \u00F7 ATR" }, fmtPct(eff / a));
+    } },
+    visibleCols.bestCase && { id: "bestCase", label: "Best Case", key: "__BEST_CASE__", sw: "72px", right: true, render: (_, r) => {
+      if (safeString(r[upsideKey]) === "") return "\u2014";
+      return /* @__PURE__ */ React.createElement("span", { title: "BU FC + Upside" }, fmtK(toNumber(r[buKey]) + toNumber(r[upsideKey])));
+    } },
+    visibleCols.worstCase && { id: "worstCase", label: "Worst Case", key: "__WORST_CASE__", sw: "76px", right: true, render: (_, r) => {
+      if (safeString(r[downsideKey]) === "") return "\u2014";
+      return /* @__PURE__ */ React.createElement("span", { title: "BU FC + Downside" }, fmtK(toNumber(r[buKey]) + toNumber(r[downsideKey])));
     } },
     visibleCols.csCall && { id: "csCall", label: "CS Call", key: FC_SORT_CS, sw: "92px", right: true, render: (_, r) => {
       const fc = fcForRow(r);
@@ -8303,7 +8385,7 @@ function DataTable({ rows }) {
     visibleCols.summary && { id: "summary", label: "Forecast", key: hm.FORECAST_SUMMARY || "FORECAST_SUMMARY", sw: "110px", trunc: true },
     visibleCols.daysSinceTouch && { id: "touch", label: "Touch", key: hm.DAYS_SINCE_TOUCH || "DAYS_SINCE_LAST_CS_TOUCH", sw: "42px", right: true }
   ].filter(Boolean);
-  return /* @__PURE__ */ React.createElement("div", { className: "card p-0 overflow-hidden" }, /* @__PURE__ */ React.createElement("div", { ref: tableRef, className: "table-container compact-table", style: { maxHeight: "calc(100vh - 270px)", overflowY: "auto" } }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full w-full table-fixed text-[10px]" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, cols.map((c) => {
+  return /* @__PURE__ */ React.createElement("div", { className: "card p-0 overflow-hidden" }, /* @__PURE__ */ React.createElement("div", { ref: tableRef, className: "table-container compact-table", style: { maxHeight: "calc(100vh - 270px)", overflowY: "auto" } }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full w-full table-fixed text-[10px] acct-data-table" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, cols.map((c) => {
     const active = c.key === currentSortKey;
     return /* @__PURE__ */ React.createElement("th", { key: c.id, className: `sticky top-0 glass-thead px-1 py-1.5 text-left text-[9px] uppercase tracking-wider font-semibold whitespace-nowrap border-b z-10 ${c.right ? "text-right" : ""}`, style: { ...c.sw ? { width: c.sw } : {}, borderColor: "var(--border)" } }, /* @__PURE__ */ React.createElement("button", { className: `transition-colors hover:text-indigo-600 dark:hover:text-indigo-400 ${active ? "text-indigo-600 dark:text-indigo-400" : ""}`, onClick: () => toggleSort(c.key) }, c.label, sortIcon(c.key)));
   }))), /* @__PURE__ */ React.createElement("tbody", null, padTop > 0 && /* @__PURE__ */ React.createElement("tr", { "aria-hidden": "true", style: { height: padTop } }, /* @__PURE__ */ React.createElement("td", { colSpan: cols.length, style: { padding: 0, border: 0 } })), paged.map((r, i) => {
@@ -8315,7 +8397,7 @@ function DataTable({ rows }) {
         const name = safeString(r[c.key]) || "(Unnamed)";
         display = /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1 min-w-0" }, /* @__PURE__ */ React.createElement("span", { className: "truncate" }, name), hasNote && /* @__PURE__ */ React.createElement("span", { className: "w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0", title: "Has notes" }));
       } else if (c.render) {
-        const rendered = c.render(c.key === "__CC__" || c.key === "__PRIOR_ARR__" || c.key === "__LARGEST_DATE__" || c.key === "__LARGEST_ATR__" || c.key === FC_SORT_CS || c.key === FC_SORT_RN || c.key === FC_SORT_ELT ? null : r[c.key], r);
+        const rendered = c.render(c.key === "__CC__" || c.key === "__ADJ_CC__" || c.key === "__BEST_CASE__" || c.key === "__WORST_CASE__" || c.key === "__PRIOR_ARR__" || c.key === "__LARGEST_DATE__" || c.key === "__LARGEST_ATR__" || c.key === FC_SORT_CS || c.key === FC_SORT_RN || c.key === FC_SORT_ELT ? null : r[c.key], r);
         display = rendered == null || rendered === "" ? /* @__PURE__ */ React.createElement("span", { className: "text-gray-300 dark:text-gray-600" }, "\u2014") : rendered;
       } else {
         const v = safeString(r[c.key]);
@@ -8488,7 +8570,10 @@ function ColumnsDrawer() {
     ["summary", "Forecast Summary"],
     ["csCall", "CS Call"],
     ["renewalsCall", "Renewals Call"],
-    ["eltCall", "ELT Call"]
+    ["eltCall", "ELT Call"],
+    ["adjCc", "Adj. C/C %"],
+    ["bestCase", "Best Case"],
+    ["worstCase", "Worst Case"]
   ];
   if (!open) return null;
   return ReactDOM.createPortal(

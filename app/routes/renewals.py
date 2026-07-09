@@ -984,6 +984,43 @@ async def _fetch_latest_call(conn, call_key: str):
     )
 
 
+async def _fetch_call_history(conn, call_key: str, limit: int = 100) -> list[dict]:
+    """Full audit trail for one call_key, newest-first.
+
+    Every CS / Renewals edit appends a row to account_call_events, but the
+    single-call GET only surfaces the latest values. This returns the whole
+    revision history so the account card can show who changed the forecast
+    and when, alongside the note updates."""
+    rows = await conn.fetch(
+        """
+        SELECT cs_forecast, renewals_forecast, effective_date,
+               edited_by_email, edited_by_display, source
+        FROM account_call_events
+        WHERE call_key = $1
+        ORDER BY effective_date DESC, id DESC
+        LIMIT $2
+        """,
+        call_key,
+        int(limit),
+    )
+    history: list[dict] = []
+    for r in rows:
+        cs = float(r["cs_forecast"]) if r["cs_forecast"] is not None else None
+        rn = float(r["renewals_forecast"]) if r["renewals_forecast"] is not None else None
+        elt = (cs or 0) + (rn or 0) if cs is not None or rn is not None else None
+        eff = r["effective_date"]
+        history.append({
+            "cs_forecast": cs,
+            "renewals_forecast": rn,
+            "elt_forecast": elt,
+            "effective_date": eff.isoformat() if eff is not None and hasattr(eff, "isoformat") else None,
+            "edited_by_email": r["edited_by_email"],
+            "edited_by_display": r["edited_by_display"],
+            "source": r["source"],
+        })
+    return history
+
+
 def _totals_from_row(row) -> dict:
     cs_total = float(row["cs_total"]) if row["cs_total"] is not None else 0
     rn_total = float(row["rn_total"]) if row["rn_total"] is not None else 0
@@ -1157,6 +1194,7 @@ async def get_account_forecast(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     async with db.acquire() as conn:
         row = await _fetch_latest_call(conn, key)
+        history = await _fetch_call_history(conn, key)
     if row is None:
         return {
             "ok": True,
@@ -1176,8 +1214,9 @@ async def get_account_forecast(
             "cs_updated_by": None,
             "rn_updated_at": None,
             "rn_updated_by": None,
+            "history": history,
         }
-    return {"ok": True, **_call_event_to_dict(row)}
+    return {"ok": True, **_call_event_to_dict(row), "history": history}
 
 
 @router.put("/account-forecasts/{account_id}")
