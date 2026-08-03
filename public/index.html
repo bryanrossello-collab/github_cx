@@ -2404,6 +2404,31 @@
         visibility: visible;
         transform: translateY(0);
       }
+      /* ---- Weekly Brief: BU-forecast trend chart ---------------------- */
+      .wb-trend-headline {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 4px 12px;
+        margin: 2px 0 8px;
+      }
+      .wb-trend-headline-value {
+        font-size: 22px;
+        font-weight: 700;
+        color: #0369a1;
+      }
+      .dark .wb-trend-headline-value { color: #38bdf8; }
+      .wb-trend-headline-delta { font-size: 12px; font-weight: 600; }
+      .wb-trend-headline-sub {
+        font-size: 10px;
+        color: rgb(107 114 128);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        font-weight: 600;
+      }
+      .wb-trend-chart { width: 100%; max-width: 760px; height: auto; }
+      .wb-trend-chart text { font-variant-numeric: tabular-nums; }
     </style>
   </head>
   <body class="theme-transition">
@@ -2423,7 +2448,7 @@
     <script src="vendor/vibe-session-lock.js"></script>
 
     <!-- App (compiled from app.jsx by ./build.sh) -->
-    <script src="vendor/app.js?v=20260709b"></script>
+    <script src="vendor/app.js?v=20260803d"></script>
 
     <!--
       Container-mode toolbar tweaks. Mounted after the React app so we can
@@ -2883,24 +2908,71 @@
           });
         }
 
-        async function ensureDataAsOfBadge() {
+        // "Data as of" freshness indicator. Sourced from the refresh-status
+        // endpoint's last-successful-refresh timestamp (data_as_of); falls
+        // back to the active snapshot's effective date for CSV-only
+        // deployments where no Snowflake refresh has run yet. Cached ~60s to
+        // avoid re-fetching on every throttled applyAll pass.
+        let _dataAsOfLastFetch = 0;
+        let _dataAsOfCache = null;
+
+        function fmtRelativeAgo(iso) {
           try {
-            const res = await fetch('/api/renewals/parsed-data?slot=active', { cache: 'no-store' });
-            if (!res.ok) return;
-            const data = await res.json();
-            const eff = data.effective_date || data.mtime;
-            if (!eff) return;
-            const rightBlock = document.querySelector('.header-right-block');
-            if (!rightBlock) return;
+            const then = new Date(iso).getTime();
+            if (!then) return '';
+            const secs = Math.max(0, (Date.now() - then) / 1000);
+            if (secs < 90) return 'Updated just now';
+            const mins = Math.round(secs / 60);
+            if (mins < 90) return 'Updated ' + mins + 'm ago';
+            const hrs = Math.round(mins / 60);
+            if (hrs < 36) return 'Updated ' + hrs + 'h ago';
+            return 'Updated ' + Math.round(hrs / 24) + 'd ago';
+          } catch (_) { return ''; }
+        }
+
+        async function ensureDataAsOfBadge() {
+          const rightBlock = document.querySelector('.header-right-block');
+          if (!rightBlock) return;
+          try {
+            const now = Date.now();
+            const stale = !_dataAsOfCache || (now - _dataAsOfLastFetch) > 60000
+              || (_dataAsOfCache && _dataAsOfCache.status === 'running');
+            if (stale) {
+              const res = await fetch('/api/renewals/refresh-status', { cache: 'no-store' });
+              if (res.ok) { _dataAsOfCache = await res.json(); _dataAsOfLastFetch = now; }
+            }
+            const status = _dataAsOfCache && _dataAsOfCache.status;
+            const running = status === 'running';
+            let asOf = _dataAsOfCache && (_dataAsOfCache.data_as_of || _dataAsOfCache.finished_at);
+            // Fallback: active snapshot effective date (no refresh run yet).
+            if (!asOf) {
+              try {
+                const pres = await fetch('/api/renewals/parsed-data?slot=active', { cache: 'no-store' });
+                if (pres.ok) { const pd = await pres.json(); asOf = pd.effective_date || pd.mtime; }
+              } catch (_) {}
+            }
+            if (!asOf && !running) return;
+
             let el = document.getElementById('vibe-data-asof');
             if (!el) {
               el = document.createElement('span');
               el.id = 'vibe-data-asof';
               el.className = 'pill text-[10px]';
-              el.title = 'Active snapshot effective date (newest upload)';
               rightBlock.insertBefore(el, rightBlock.querySelector('#vibe-user-menu-wrap'));
             }
-            el.textContent = 'Active · ' + String(eff).slice(0, 10);
+            const mode = (_dataAsOfCache && _dataAsOfCache.mode) ? (' · ' + _dataAsOfCache.mode) : '';
+            let label = '';
+            if (asOf) {
+              const d = new Date(asOf);
+              label = isNaN(d.getTime()) ? String(asOf).slice(0, 10) : d.toLocaleString();
+            }
+            if (running) {
+              el.textContent = 'Refreshing…';
+              el.title = (asOf ? ('Last data as of ' + label) : 'Snowflake refresh in progress') + mode;
+            } else {
+              el.textContent = 'Data as of ' + label;
+              el.title = fmtRelativeAgo(asOf) + mode;
+            }
           } catch (_) {}
         }
 

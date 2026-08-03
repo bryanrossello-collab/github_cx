@@ -206,6 +206,25 @@
       </section>
 
       <section class="card" data-section="owner">
+        <h2>Snowflake source — Run now</h2>
+        <p class="muted">
+          Pull the dashboard's source data directly from Snowflake and load it into the
+          same versioned snapshots a CSV upload creates — for both the
+          <strong>Active</strong> and <strong>Historical</strong> slots in one job.
+          The run happens in the background (~2&nbsp;min in real mode); keep this tab
+          open — polling keeps the instance warm until it finishes.
+          <br />
+          <strong>Manual CSV upload below remains fully available</strong> as a fallback.
+        </p>
+        <div id="snowflake-settings" class="status-grid" style="margin:12px 0;"></div>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <button class="btn btn-primary" id="snowflake-run-now">Run now</button>
+          <span id="snowflake-run-state" class="muted"></span>
+        </div>
+        <div id="snowflake-run-result" style="margin-top:12px;"></div>
+      </section>
+
+      <section class="card" data-section="owner">
         <h2>Upload a new CSV</h2>
         <p class="muted">
           Every upload becomes a versioned snapshot. The dashboard uses the snapshot
@@ -516,6 +535,9 @@
       if (currentUser && currentUser.role === 'owner') {
         refreshList();
         loadTabAccessConfig();
+        refreshSnowflakeStatus().then(function (d) {
+          if (d && d.status === 'running') { setSnowflakeRunning(true); startSnowflakePolling(); }
+        });
       }
       if (currentUser && (currentUser.role === 'admin' || currentUser.role === 'owner')) refreshUsers();
     }
@@ -1033,8 +1055,118 @@
       }
     }
 
+    // ---- Snowflake source (Run now) ----
+    let _snowflakePollTimer = null;
+
+    function renderSnowflakeSettings(s) {
+      const host = $('snowflake-settings');
+      if (!host || !s) return;
+      const modePill = s.mode === 'real' ? 'pill-ok' : 'pill-warn';
+      const items = [
+        ['Mode', s.mode || '—', modePill],
+        ['Account', s.account || '—'],
+        ['Warehouse', s.warehouse || '—'],
+        ['Database', s.database || '—'],
+        ['Schema', s.schema || '—'],
+        ['Role', s.role || '—'],
+      ];
+      host.innerHTML = items.map(function (row) {
+        const label = row[0], value = row[1], pill = row[2];
+        return '<div class="status-item"><div class="status-label">' + label + '</div>' +
+          '<div class="status-value">' + (pill ? '<span class="pill ' + pill + '">' + value + '</span>' : value) + '</div></div>';
+      }).join('');
+    }
+
+    function renderRefreshResult(data) {
+      const stateEl = $('snowflake-run-state');
+      const out = $('snowflake-run-result');
+      if (!data) return;
+      const status = data.status || 'idle';
+      const statusPill = status === 'done' ? 'pill-ok'
+        : status === 'error' ? 'pill-error'
+        : status === 'running' ? 'pill-warn' : '';
+      if (stateEl) {
+        stateEl.innerHTML = '<span class="pill ' + statusPill + '">' + status + '</span>' +
+          (data.mode ? ' <span class="muted">· ' + data.mode + '</span>' : '') +
+          (data.data_as_of ? ' <span class="muted">· data as of ' + fmtDate(data.data_as_of) + '</span>' : '') +
+          (data.error ? ' <span style="color:var(--red)">· ' + data.error + '</span>' : '');
+      }
+      const slots = data.slots || {};
+      const rows = ['active', 'historical'].map(function (slot) {
+        const s = slots[slot];
+        if (!s) return '<tr><td><span class="pill pill-' + slot + '">' + slotLabel(slot) + '</span></td><td class="muted">—</td><td class="num">—</td><td class="muted">—</td></tr>';
+        const ok = !!s.ok;
+        const pill = ok ? 'pill-ok' : 'pill-error';
+        const detail = ok ? (s.effective_date ? fmtDate(s.effective_date) : '—') : (s.error || '—');
+        return '<tr>' +
+          '<td><span class="pill pill-' + slot + '">' + slotLabel(slot) + '</span></td>' +
+          '<td><span class="pill ' + pill + '">' + (ok ? 'ok' : 'failed') + '</span></td>' +
+          '<td class="num">' + (ok ? Number(s.rows || 0).toLocaleString() : '—') + '</td>' +
+          '<td class="muted">' + detail + '</td>' +
+        '</tr>';
+      }).join('');
+      if (out) out.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr>' +
+        '<th>Slot</th><th>Status</th><th class="num">Rows</th><th>Detail</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+    }
+
+    async function refreshSnowflakeStatus() {
+      try {
+        const data = await api('/api/renewals/refresh-status');
+        renderSnowflakeSettings(data.settings);
+        renderRefreshResult(data);
+        return data;
+      } catch (err) {
+        return null;
+      }
+    }
+
+    function setSnowflakeRunning(running) {
+      const btn = $('snowflake-run-now');
+      if (btn) { btn.disabled = running; btn.textContent = running ? 'Running…' : 'Run now'; }
+    }
+
+    function startSnowflakePolling() {
+      if (_snowflakePollTimer) return;
+      // Poll every 5s. The polling keeps the Cloud Run instance warm so the
+      // background job isn't killed by scale-to-zero.
+      _snowflakePollTimer = setInterval(async function () {
+        const data = await refreshSnowflakeStatus();
+        if (!data || data.status !== 'running') {
+          clearInterval(_snowflakePollTimer);
+          _snowflakePollTimer = null;
+          setSnowflakeRunning(false);
+          if (data && data.status === 'done') showToast('Snowflake refresh complete', 'ok');
+          else if (data && data.status === 'error') showToast('Snowflake refresh finished with errors', 'error');
+          refreshList();
+          refreshStatus();
+        }
+      }, 5000);
+    }
+
+    async function handleSnowflakeRunNow() {
+      setSnowflakeRunning(true);
+      try {
+        const res = await fetch('/api/renewals/refresh', { method: 'POST' });
+        const data = await res.json().catch(function () { return {}; });
+        if (res.status === 409) {
+          showToast('A refresh is already running', 'error');
+        } else if (!res.ok) {
+          throw new Error((data && (data.detail || data.error)) || (res.status + ' ' + res.statusText));
+        } else {
+          showToast('Snowflake refresh started', 'ok');
+        }
+        await refreshSnowflakeStatus();
+        startSnowflakePolling();
+      } catch (err) {
+        setSnowflakeRunning(false);
+        showToast('Run now failed: ' + err.message, 'error');
+      }
+    }
+
     // Boot — SSO admin only (no shared password)
     $('refresh-status').addEventListener('click', refreshStatus);
+    $('snowflake-run-now') && $('snowflake-run-now').addEventListener('click', handleSnowflakeRunNow);
     $('refresh-list').addEventListener('click', refreshList);
     $('refresh-users').addEventListener('click', refreshUsers);
     $('user-add-form').addEventListener('submit', handleUserAdd);

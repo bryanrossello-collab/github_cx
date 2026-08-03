@@ -184,6 +184,24 @@ The v3 rewrite came from a single big session:
 3. **User answered**: Python + FastAPI; **CSV uploads in Postgres with version history + a password-protected admin tab**; rename all DJ-flavored display strings → ELT.
 4. **I implemented** the full Python stack: 8 modules, 1 migration file, 1 Dockerfile, 1 admin UI, updated all 3 docs. Validated structurally (no live Postgres available locally).
 
+```
+Session 2 — 2026-08-03
+- User asked for: a "Weekly 100K+ Regional Brief" — CCO weekly WoW bottoms-up
+  forecast movement report (100K+ band, current quarter, by region, week
+  selector), with 4 sections + a downloadable HTML brief.
+- Delivered: additive read-only GET /api/renewals/weekly-brief (§5.10) that
+  diffs the latest vs prior active-slot account_snapshots per account on
+  BU_FC + Upside; new "Weekly Brief" React tab (WeeklyBriefTab in
+  vendor/app.js) with region + week/snapshot selectors and a client-side
+  "Download brief" HTML export styled like the exec-summary. No schema
+  change; band+quarter-filtered SQL keeps the diff bounded. Verified live
+  against a throwaway local Postgres seeded with two modified snapshots.
+- Open question / TODO: none. Residual risks — needs ≥2 snapshots to compare;
+  current-quarter auto-detection uses the fiscal-quarter mapping (override
+  via ?quarter=); a weekly cadence depends on how often CSV/Snowflake
+  snapshots land (no scheduler in-app).
+```
+
 ---
 
 ## 3. Communication protocol
@@ -438,6 +456,66 @@ trail for that `call_key`, newest-first, sourced from `account_call_events`:
 `history` is display-only and read by the account card's "Updates" section
 to show who changed CS / Renewals forecast and when. It is additive — the
 prior single-call fields are unchanged, so the frozen contract holds.
+
+### 5.10 `GET /api/renewals/weekly-brief`
+
+Powers the **Weekly Brief** dashboard tab (CCO's Weekly 100K+ Regional
+Brief). Compares two `account_snapshots` (week-over-week), scoped to the
+**100K+ band** for the **current quarter**, broken out **by region**.
+
+Query params (all optional):
+`slot` (default `active`), `current`/`prior` (pin a `csv_upload_id` pair;
+default = latest active snapshot vs the immediately-preceding one),
+`quarter` (any label spelling — `Q3\`27`, `FY27Q3`, `2027Q3`; default =
+auto-detected current fiscal quarter), `band` (default `100k+`),
+`threshold` (default `50000` — the "large mover" cutoff for explanations),
+`region` (default `''`/`__ALL__` = overall rollup). **`region` is applied
+server-side to EVERY section, including the trend series**, so the whole
+brief is uniformly region-scoped; the response's `available_regions` list is
+computed unfiltered so the UI selector stays fully populated. `region` must
+be in the frontend fetch params + effect deps or the trend won't refresh.
+
+```json
+{
+  "ok": true, "slot": "active", "band": "100k+", "threshold": 50000.0,
+  "region": "__ALL__", "available_regions": ["AMER", "APAC", "EMEA"],
+  "quarter": "Q3`27", "quarter_auto_selected": false,
+  "current": {"id": 2, "effective_date": "2026-07-27T...", ...},
+  "prior":   {"id": 1, "effective_date": "2026-07-20T...", ...},
+  "warning": null,
+  "snapshots": [ {"id": 2, "effective_date": "...", "filename": "...", "row_count": 51012}, ... ],
+  "sections": {
+    "bu_movement": {
+      "regions": [{"region": "APAC", "current": 4462552.0, "prior": 3907552.0,
+                   "delta": 555000.0, "delta_pct": 14.2, "accounts": 389}],
+      "rollup":  {"current": ..., "prior": ..., "delta": ..., "delta_pct": ..., "accounts": ...},
+      "trend":   [{"upload_id": 1, "effective_date": "...", "total_bu_fc": 3907552.0}, ...]
+    },
+    "worsened":     [{"account_id", "account_name", "region", "current_bu_fc",
+                      "prior_bu_fc", "swing", "is_large", "explanation?", "explanation_source?"}],
+    "new_forecast": [{... "current_bu_fc", "is_large", "explanation?", "explanation_source?"}],
+    "upside": {"current_total", "prior_total", "delta", "delta_pct",
+               "top_increase": [...5], "top_decrease": [...5]}
+  }
+}
+```
+
+Semantics (must stay consistent with the dashboard):
+* **BU_FC sign** — `bu_fc` is the forecasted churn/contraction amount
+  (`CC% = BU_FC / ATR`). Higher = worse. **"Worsened WoW" = BU_FC
+  increased**; `swing = current_bu_fc - prior_bu_fc`, kept when `> 0`,
+  ranked descending. `new_forecast` = prior `bu_fc == 0` and current `> 0`.
+* **Explanations are auto-pulled** for movers `>= threshold`: current
+  `forecast_summary` (source `"forecast_summary"`) else the account's saved
+  note (source `"note"`). No manual entry.
+* **Upside** is read from `raw_row->>'UPSIDE'` (not a modelled column);
+  `top_increase`/`top_decrease` are by per-account WoW `delta`.
+
+Additive and read-only — no schema change, frozen shapes untouched.
+**Performance:** every per-snapshot read is filtered to band + quarter in
+SQL (~hundreds of rows), only the single `UPSIDE` key is extracted from
+`raw_row` (never the whole JSONB blob), and the trend is one grouped query
+over the recent-snapshot window — safe for ~50k-row snapshots.
 
 ---
 

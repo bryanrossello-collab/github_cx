@@ -12,6 +12,7 @@ dependencies = [
     "pydantic-settings==2.6.1",
     "python-multipart==0.0.19",
     "structlog==24.4.0",
+    "snowflake-connector-python==3.12.3",
 ]
 
 [build-system]

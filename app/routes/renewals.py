@@ -31,6 +31,8 @@ import csv
 import hashlib
 import io
 import json
+import math
+import re
 import zipfile
 from datetime import datetime, timezone
 from typing import Optional
@@ -1412,15 +1414,16 @@ async def call_history(
 
 TAB_ACCESS_META_KEY = "tab_access"
 ALL_DASHBOARD_TABS = (
-    "region", "trending", "partner", "accounts", "notes", "historical", "targets"
+    "region", "trending", "partner", "accounts", "notes", "historical",
+    "targets", "weekly"
 )
 
 
 def _default_tab_access_matrix() -> dict[str, list[str]]:
     return {
         "owner": list(ALL_DASHBOARD_TABS),
-        "admin": ["region", "partner", "accounts", "notes", "historical", "targets"],
-        "standard": ["region", "partner", "accounts", "notes", "targets"],
+        "admin": ["region", "partner", "accounts", "notes", "historical", "targets", "weekly"],
+        "standard": ["region", "partner", "accounts", "notes", "targets", "weekly"],
     }
 
 
@@ -2038,6 +2041,621 @@ async def trending_metrics(
         "point_count": len(points),
         "latest_effective_date": latest_eff,
         "points": points,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Weekly 100K+ Regional Brief — CCO-requested week-over-week (WoW) bottoms-up
+# forecast movement report.
+#
+# Compares the latest active-slot snapshot vs a prior one (default: the
+# immediately-preceding snapshot; a specific pair can be pinned via
+# ?current=<id>&prior=<id>). Scope is FROZEN to the 100K+ band for the
+# current quarter, broken out by region.
+#
+# Sign convention (mirrors the dashboard): BU_FC is the forecasted amount of
+# churn/contraction (a positive loss number). CC% = BU_FC / ATR. Therefore
+# "worse WoW" == BU_FC INCREASED (more expected churn/contraction). The
+# adverse swing for an account is (current BU_FC - prior BU_FC) when > 0.
+#
+# All queries are bounded: every per-snapshot read is filtered to band +
+# quarter in SQL (~hundreds of rows), and we only extract the single UPSIDE
+# key out of raw_row (never the whole JSONB blob), heeding the DB-timeout
+# lessons for ~50k-row snapshots.
+# ---------------------------------------------------------------------------
+
+WEEKLY_BRIEF_BAND_DEFAULT = "100k+"
+WEEKLY_BRIEF_LARGE_SWING_DEFAULT = 50000.0  # tunable "large mover" threshold ($)
+WEEKLY_BRIEF_TREND_LIMIT = 12               # snapshots in the "over time" series
+WEEKLY_BRIEF_LIST_CAP = 100                 # max rows returned per mover list
+_EXPLANATION_MAX_CHARS = 600
+
+
+def _wb_to_number(x) -> float:
+    """Mirror the dashboard's toNumber(): strip $ , ( ) % and whitespace.
+
+    Note the client removes parentheses rather than treating them as a
+    negative sign, so we match that exactly for UPSIDE parity."""
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x) if math.isfinite(x) else 0.0
+    s = re.sub(r"[$,()%\s]", "", str(x)).replace("--", "")
+    if not s:
+        return 0.0
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _wb_normalize_quarter(label) -> Optional[tuple]:
+    """Return (fy_two_digit, quarter_num) for a well-formed quarter label.
+
+    Accepts the known spellings (anchored, whole-string match):
+      'Q3`27', "Q3'27", 'Q3 27', 'Q3-27', 'FY27Q3', 'FY27-Q3', '2027Q3', '27Q3'.
+
+    Anchoring (``fullmatch``) is deliberate: the previous unanchored
+    ``re.search`` was over-eager and would treat a malformed value like
+    'QQ3`27' as Q3 by matching a substring, silently conflating labels. We
+    still collapse a single leading duplicate 'Q' (a common CSV artifact,
+    e.g. 'QQ3`27' -> 'Q3`27') so genuine Q3 rows aren't dropped, but random
+    garbage no longer matches."""
+    if not label:
+        return None
+    s = str(label).strip().upper()
+    # Collapse a redundant leading 'Q' immediately followed by 'Q<1-4>'.
+    s = re.sub(r"^Q(?=Q[1-4])", "", s)
+    m = re.fullmatch(r"FY(\d{2})[- ]?Q([1-4])", s)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    m = re.fullmatch(r"(\d{2,4})Q([1-4])", s)
+    if m:
+        return (int(m.group(1)) % 100, int(m.group(2)))
+    m = re.fullmatch(r"Q([1-4])[`'\-\s]?(\d{2,4})", s)
+    if m:
+        return (int(m.group(2)) % 100, int(m.group(1)))
+    return None
+
+
+def _wb_current_fiscal_quarter(dt: datetime) -> tuple:
+    """Zendesk fiscal quarter for a date (FY ends Jan; FY27 = Feb26-Jan27).
+
+    Mirrors mapFiscal() in the bundled dashboard so the auto-detected
+    'current quarter' matches what a user would pick in the UI."""
+    y = dt.year
+    m0 = dt.month - 1
+    if y == 2026 and m0 == 0:
+        return (26, 1)
+    fy_num = y if m0 == 0 else y + 1
+    offset = (m0 + 11) % 12
+    q = offset // 3 + 1
+    return (fy_num % 100, q)
+
+
+# Reusable band predicate. Mirrors the client's matchesBand("100k_official"):
+# uppercase, strip spaces/$/commas, then substring-match the band token.
+_WB_BAND_PREDICATE = (
+    "UPPER(REGEXP_REPLACE(COALESCE(s.band, ''), '[ $,]', '', 'g')) "
+    "LIKE '%' || UPPER($BAND$) || '%'"
+)
+
+# Canonical region expression — blank/NULL collapses to 'Unknown' so the SQL
+# filter, the available-region list, and the Python-side region label all
+# agree (a user can select "Unknown" and match rows with no region).
+_WB_REGION_EXPR = "COALESCE(NULLIF(TRIM(s.region), ''), 'Unknown')"
+
+
+def _wb_meta_dict(row) -> Optional[dict]:
+    if row is None:
+        return None
+    eff = row["eff"]
+    return {
+        "id": int(row["id"]),
+        "slot": row["slot"],
+        "filename": row["filename"],
+        "uploaded_at": row["uploaded_at"].isoformat(),
+        "effective_date": eff.isoformat() if hasattr(eff, "isoformat") else str(eff),
+        "row_count": int(row["rc"] or 0),
+    }
+
+
+async def _wb_snapshot_meta(conn, upload_id: int) -> Optional[dict]:
+    row = await conn.fetchrow(
+        """
+        SELECT u.id, u.slot, u.filename, u.uploaded_at,
+               COALESCE(MAX(s.effective_date), u.uploaded_at) AS eff,
+               COUNT(s.id) AS rc
+        FROM csv_uploads u
+        LEFT JOIN account_snapshots s ON s.csv_upload_id = u.id
+        WHERE u.id = $1
+        GROUP BY u.id
+        """,
+        upload_id,
+    )
+    return _wb_meta_dict(row)
+
+
+async def _wb_recent_snapshots(conn, slot: str, limit: int) -> list[dict]:
+    """Recent uploads for a slot that actually have parsed snapshot rows,
+    newest-first by effective_date. Feeds the week selector + trend."""
+    rows = await conn.fetch(
+        """
+        SELECT u.id, u.slot, u.filename, u.uploaded_at,
+               MAX(s.effective_date) AS eff,
+               COUNT(s.id) AS rc
+        FROM csv_uploads u
+        INNER JOIN account_snapshots s ON s.csv_upload_id = u.id
+        WHERE u.slot = $1
+        GROUP BY u.id
+        ORDER BY MAX(s.effective_date) DESC, u.uploaded_at DESC
+        LIMIT $2
+        """,
+        slot,
+        limit,
+    )
+    return [_wb_meta_dict(r) for r in rows]
+
+
+async def _wb_prior_snapshot(conn, slot: str, current_id: int,
+                             current_eff: datetime) -> Optional[dict]:
+    """Most recent snapshot (with rows) strictly older than the current one."""
+    row = await conn.fetchrow(
+        """
+        SELECT u.id, u.slot, u.filename, u.uploaded_at,
+               MAX(s.effective_date) AS eff,
+               COUNT(s.id) AS rc
+        FROM csv_uploads u
+        INNER JOIN account_snapshots s ON s.csv_upload_id = u.id
+        WHERE u.slot = $1 AND u.id <> $2
+        GROUP BY u.id
+        HAVING MAX(s.effective_date) < $3
+        ORDER BY MAX(s.effective_date) DESC, u.uploaded_at DESC
+        LIMIT 1
+        """,
+        slot,
+        current_id,
+        current_eff,
+    )
+    return _wb_meta_dict(row)
+
+
+def _wb_band_query(sql: str, band_param_index: int) -> str:
+    """Inject the band predicate, binding it to the given $N placeholder."""
+    return sql.replace(_WB_BAND_PREDICATE,
+                       _WB_BAND_PREDICATE.replace("$BAND$", f"${band_param_index}"))
+
+
+async def _wb_load_accounts(conn, upload_id: int, band: str,
+                            quarter_labels: list[str], region: str = "") -> dict:
+    """One aggregated record per account for a snapshot, scoped to band +
+    quarter (+ optional region). Uses the structured bu_fc/forecast_summary
+    columns and extracts only the single UPSIDE key from raw_row (bounded, no
+    blob transfer). ``region`` == '' means all regions (the rollup)."""
+    sql = _wb_band_query(
+        """
+        SELECT s.account_id, s.account_name, s.region, s.bu_fc,
+               s.forecast_summary, s.raw_row->>'UPSIDE' AS upside_raw
+        FROM account_snapshots s
+        WHERE s.csv_upload_id = $1
+          AND s.year_quarter = ANY($2::text[])
+          AND ($4 = '' OR {region_expr} = $4)
+          AND {band}
+        """.format(band=_WB_BAND_PREDICATE, region_expr=_WB_REGION_EXPR),
+        3,
+    )
+    rows = await conn.fetch(sql, upload_id, quarter_labels, band, region)
+    out: dict = {}
+    for r in rows:
+        acct_id = (r["account_id"] or "").strip()
+        name = (r["account_name"] or "").strip()
+        key = acct_id or ("name:" + name.lower())
+        if not key or key == "name:":
+            continue
+        entry = out.get(key)
+        if entry is None:
+            entry = {
+                "key": key,
+                "account_id": acct_id or None,
+                "account_name": name or acct_id or "(unknown)",
+                "region": (r["region"] or "").strip() or "Unknown",
+                "bu_fc": 0.0,
+                "upside": 0.0,
+                "forecast_summary": None,
+            }
+            out[key] = entry
+        entry["bu_fc"] += float(r["bu_fc"] or 0)
+        entry["upside"] += _wb_to_number(r["upside_raw"])
+        fs = (r["forecast_summary"] or "").strip()
+        if fs and not entry["forecast_summary"]:
+            entry["forecast_summary"] = fs[:_EXPLANATION_MAX_CHARS]
+    return out
+
+
+def _wb_delta_pct(current: float, prior: float):
+    if prior == 0:
+        return None
+    return (current - prior) / abs(prior) * 100.0
+
+
+@router.get("/weekly-brief")
+async def weekly_brief(
+    request: Request,
+    slot: str = Query(default="active"),
+    current: Optional[int] = Query(default=None),
+    prior: Optional[int] = Query(default=None),
+    quarter: str = Query(default=""),
+    band: str = Query(default=WEEKLY_BRIEF_BAND_DEFAULT),
+    threshold: float = Query(default=WEEKLY_BRIEF_LARGE_SWING_DEFAULT),
+    region: str = Query(default=""),
+) -> dict:
+    """Weekly 100K+ Regional Brief: WoW bottoms-up forecast movement.
+
+    Returns structured JSON for four sections:
+      1. BU forecast movement per region + overall rollup + trend series.
+      2. Accounts that worsened WoW (BU_FC increased), ranked by adverse
+         swing; movers >= threshold carry an auto-pulled explanation.
+      3. New in-quarter forecast ($0 BU_FC prior -> forecast now).
+      4. Upside movement (total + WoW delta) with top-5 up/down drivers.
+
+    ``region`` scopes EVERY section (including the trend series) server-side
+    so the whole brief is uniformly region-filtered. '' / '__ALL__' means the
+    overall rollup (all regions summed).
+    """
+    normalised_slot = (slot or "active").strip().lower()
+    if normalised_slot not in ("active", "historical"):
+        raise HTTPException(status_code=400, detail="slot must be active or historical")
+
+    band_param = (band or WEEKLY_BRIEF_BAND_DEFAULT).strip() or WEEKLY_BRIEF_BAND_DEFAULT
+    region_f = (region or "").strip()
+    if region_f == "__ALL__":
+        region_f = ""
+    try:
+        threshold_val = float(threshold)
+    except (TypeError, ValueError):
+        threshold_val = WEEKLY_BRIEF_LARGE_SWING_DEFAULT
+
+    db = _db(request)
+    async with db.acquire() as conn:
+        recent = await _wb_recent_snapshots(conn, normalised_slot, WEEKLY_BRIEF_TREND_LIMIT)
+
+        # ---- resolve the current + prior snapshot pair --------------------
+        if current is not None:
+            current_meta = await _wb_snapshot_meta(conn, int(current))
+        else:
+            current_meta = recent[0] if recent else None
+
+        if current_meta is None or current_meta["row_count"] == 0:
+            return {
+                "ok": True,
+                "slot": normalised_slot,
+                "band": band_param,
+                "threshold": threshold_val,
+                "current": current_meta,
+                "prior": None,
+                "quarter": None,
+                "warning": "No snapshots with parsed rows are available yet.",
+                "snapshots": recent,
+                "sections": None,
+            }
+
+        current_id = current_meta["id"]
+        current_eff = datetime.fromisoformat(current_meta["effective_date"])
+
+        if prior is not None:
+            prior_meta = await _wb_snapshot_meta(conn, int(prior))
+        else:
+            prior_meta = await _wb_prior_snapshot(
+                conn, normalised_slot, current_id, current_eff
+            )
+
+        warning = None
+        if prior_meta is None:
+            warning = (
+                "Only one snapshot is available — WoW comparison needs at "
+                "least two. Showing current values with no prior baseline."
+            )
+
+        # ---- resolve the current quarter ----------------------------------
+        band_qs = _wb_band_query(
+            "SELECT s.year_quarter AS yq, COUNT(*) AS n "
+            "FROM account_snapshots s "
+            "WHERE s.csv_upload_id = $1 AND s.year_quarter IS NOT NULL "
+            "AND s.year_quarter <> '' AND " + _WB_BAND_PREDICATE + " "
+            "GROUP BY s.year_quarter",
+            2,
+        )
+        q_rows = await conn.fetch(band_qs, current_id, band_param)
+        quarter_counts = {r["yq"]: int(r["n"]) for r in q_rows}
+
+        target_norm = None
+        if quarter.strip():
+            target_norm = _wb_normalize_quarter(quarter.strip())
+        if target_norm is None:
+            target_norm = _wb_current_fiscal_quarter(datetime.now(timezone.utc))
+
+        resolved_quarter = None
+        for label in quarter_counts:
+            if _wb_normalize_quarter(label) == target_norm:
+                resolved_quarter = label
+                break
+        quarter_auto = False
+        if resolved_quarter is None:
+            quarter_auto = True
+            if quarter.strip():
+                resolved_quarter = quarter.strip()
+            elif quarter_counts:
+                # Fallback: the most-populated quarter in the band.
+                resolved_quarter = max(quarter_counts.items(), key=lambda kv: kv[1])[0]
+
+        if not resolved_quarter:
+            return {
+                "ok": True,
+                "slot": normalised_slot,
+                "band": band_param,
+                "threshold": threshold_val,
+                "current": current_meta,
+                "prior": prior_meta,
+                "quarter": None,
+                "warning": "No rows match the requested band for any quarter.",
+                "snapshots": recent,
+                "sections": None,
+            }
+
+        # Every stored label (across the trend window) that maps to the same
+        # fiscal quarter — makes the comparison resilient to format drift.
+        trend_ids = [s["id"] for s in recent]
+        for _id in (current_id, prior_meta["id"] if prior_meta else None):
+            if _id is not None and _id not in trend_ids:
+                trend_ids.append(_id)
+        resolved_pair = _wb_normalize_quarter(resolved_quarter)
+        label_qs = _wb_band_query(
+            "SELECT DISTINCT s.year_quarter AS yq FROM account_snapshots s "
+            "WHERE s.csv_upload_id = ANY($1::bigint[]) "
+            "AND s.year_quarter IS NOT NULL AND s.year_quarter <> '' "
+            "AND " + _WB_BAND_PREDICATE,
+            2,
+        )
+        all_label_rows = await conn.fetch(label_qs, trend_ids, band_param)
+        quarter_labels = sorted({
+            r["yq"] for r in all_label_rows
+            if _wb_normalize_quarter(r["yq"]) == resolved_pair
+        }) or [resolved_quarter]
+
+        # ---- available regions (UNfiltered by region so the selector stays
+        #      fully populated even when a single region is being viewed) ----
+        region_rows = await conn.fetch(
+            _wb_band_query(
+                "SELECT DISTINCT {region_expr} AS region FROM account_snapshots s "
+                "WHERE s.csv_upload_id = $1 AND s.year_quarter = ANY($2::text[]) "
+                "AND ".format(region_expr=_WB_REGION_EXPR) + _WB_BAND_PREDICATE,
+                3,
+            ),
+            current_id, quarter_labels, band_param,
+        )
+        available_regions = sorted(r["region"] for r in region_rows)
+
+        # ---- load both snapshots (bounded, region-scoped) -----------------
+        current_map = await _wb_load_accounts(
+            conn, current_id, band_param, quarter_labels, region_f
+        )
+        prior_map = (
+            await _wb_load_accounts(
+                conn, prior_meta["id"], band_param, quarter_labels, region_f
+            )
+            if prior_meta else {}
+        )
+
+        # ---- notes fallback for explanations ------------------------------
+        acct_ids = sorted({
+            e["account_id"] for e in current_map.values() if e["account_id"]
+        })
+        note_map: dict = {}
+        if acct_ids:
+            note_rows = await conn.fetch(
+                """
+                SELECT DISTINCT ON (account_id) account_id, note_text
+                FROM notes
+                WHERE account_id = ANY($1::text[])
+                  AND archived = FALSE AND COALESCE(note_text, '') <> ''
+                ORDER BY account_id, updated_at DESC
+                """,
+                acct_ids,
+            )
+            note_map = {r["account_id"]: (r["note_text"] or "").strip() for r in note_rows}
+
+        # ---- trend series (one aggregate query across the window) ---------
+        # Region-scoped server-side so the "over time" line reflects the
+        # selected region ($4 = '' means all regions == the rollup).
+        trend_qs = _wb_band_query(
+            "SELECT s.csv_upload_id AS uid, MAX(s.effective_date) AS eff, "
+            "       COALESCE(SUM(s.bu_fc), 0) AS total "
+            "FROM account_snapshots s "
+            "WHERE s.csv_upload_id = ANY($1::bigint[]) "
+            "AND s.year_quarter = ANY($2::text[]) "
+            "AND ($4 = '' OR " + _WB_REGION_EXPR + " = $4) "
+            "AND " + _WB_BAND_PREDICATE + " "
+            "GROUP BY s.csv_upload_id",
+            3,
+        )
+        trend_rows = await conn.fetch(
+            trend_qs, trend_ids, quarter_labels, band_param, region_f
+        )
+
+    # ---- build the four sections (in-memory, bounded sets) ----------------
+    def _explain(entry: dict):
+        fs = entry.get("forecast_summary")
+        if fs:
+            return fs, "forecast_summary"
+        note = note_map.get(entry["account_id"]) if entry.get("account_id") else None
+        if note:
+            return note[:_EXPLANATION_MAX_CHARS], "note"
+        return None, None
+
+    all_keys = set(current_map) | set(prior_map)
+
+    # Section 1 — BU movement per region + rollup
+    region_agg: dict = {}
+    for key in all_keys:
+        cur = current_map.get(key)
+        pri = prior_map.get(key)
+        base = cur or pri
+        region = base["region"]
+        c_bu = cur["bu_fc"] if cur else 0.0
+        p_bu = pri["bu_fc"] if pri else 0.0
+        rg = region_agg.setdefault(
+            region, {"region": region, "current": 0.0, "prior": 0.0, "accounts": 0}
+        )
+        rg["current"] += c_bu
+        rg["prior"] += p_bu
+        rg["accounts"] += 1
+    regions_out = []
+    for rg in region_agg.values():
+        delta = rg["current"] - rg["prior"]
+        regions_out.append({
+            "region": rg["region"],
+            "current": round(rg["current"], 2),
+            "prior": round(rg["prior"], 2),
+            "delta": round(delta, 2),
+            "delta_pct": _wb_delta_pct(rg["current"], rg["prior"]),
+            "accounts": rg["accounts"],
+        })
+    regions_out.sort(key=lambda r: r["current"], reverse=True)
+    roll_cur = sum(r["current"] for r in regions_out)
+    roll_pri = sum(r["prior"] for r in regions_out)
+    rollup = {
+        "current": round(roll_cur, 2),
+        "prior": round(roll_pri, 2),
+        "delta": round(roll_cur - roll_pri, 2),
+        "delta_pct": _wb_delta_pct(roll_cur, roll_pri),
+        "accounts": sum(r["accounts"] for r in regions_out),
+    }
+    trend_by_uid = {int(r["uid"]): r for r in trend_rows}
+    trend_series = []
+    for s in sorted(recent, key=lambda x: x["effective_date"]):
+        tr = trend_by_uid.get(s["id"])
+        if tr is None:
+            continue
+        trend_series.append({
+            "upload_id": s["id"],
+            "effective_date": s["effective_date"],
+            "filename": s["filename"],
+            "total_bu_fc": round(float(tr["total"] or 0), 2),
+        })
+
+    # Section 2 — worsened WoW (BU_FC increased == more churn/contraction)
+    worsened = []
+    for key in all_keys:
+        cur = current_map.get(key)
+        pri = prior_map.get(key)
+        base = cur or pri
+        c_bu = cur["bu_fc"] if cur else 0.0
+        p_bu = pri["bu_fc"] if pri else 0.0
+        swing = c_bu - p_bu
+        if swing > 0:
+            rec = {
+                "account_id": base["account_id"],
+                "account_name": base["account_name"],
+                "region": base["region"],
+                "current_bu_fc": round(c_bu, 2),
+                "prior_bu_fc": round(p_bu, 2),
+                "swing": round(swing, 2),
+                "is_large": swing >= threshold_val,
+            }
+            if rec["is_large"]:
+                exp, src = _explain(base)
+                rec["explanation"] = exp
+                rec["explanation_source"] = src
+            worsened.append(rec)
+    worsened.sort(key=lambda r: r["swing"], reverse=True)
+    worsened = worsened[:WEEKLY_BRIEF_LIST_CAP]
+
+    # Section 3 — new in-quarter forecast ($0 prior -> forecast now)
+    new_forecast = []
+    for key in all_keys:
+        cur = current_map.get(key)
+        pri = prior_map.get(key)
+        p_bu = pri["bu_fc"] if pri else 0.0
+        c_bu = cur["bu_fc"] if cur else 0.0
+        if p_bu == 0 and c_bu > 0 and cur is not None:
+            rec = {
+                "account_id": cur["account_id"],
+                "account_name": cur["account_name"],
+                "region": cur["region"],
+                "current_bu_fc": round(c_bu, 2),
+                "prior_bu_fc": round(p_bu, 2),
+                "is_large": c_bu >= threshold_val,
+            }
+            if rec["is_large"]:
+                exp, src = _explain(cur)
+                rec["explanation"] = exp
+                rec["explanation_source"] = src
+            new_forecast.append(rec)
+    new_forecast.sort(key=lambda r: r["current_bu_fc"], reverse=True)
+    new_forecast = new_forecast[:WEEKLY_BRIEF_LIST_CAP]
+
+    # Section 4 — upside movement + top-5 up/down drivers
+    up_cur_total = sum(e["upside"] for e in current_map.values())
+    up_pri_total = sum(e["upside"] for e in prior_map.values())
+    upside_movers = []
+    for key in all_keys:
+        cur = current_map.get(key)
+        pri = prior_map.get(key)
+        base = cur or pri
+        c_up = cur["upside"] if cur else 0.0
+        p_up = pri["upside"] if pri else 0.0
+        d = c_up - p_up
+        if d == 0:
+            continue
+        upside_movers.append({
+            "account_id": base["account_id"],
+            "account_name": base["account_name"],
+            "region": base["region"],
+            "current_upside": round(c_up, 2),
+            "prior_upside": round(p_up, 2),
+            "delta": round(d, 2),
+        })
+    top_increase = sorted(
+        [m for m in upside_movers if m["delta"] > 0],
+        key=lambda m: m["delta"], reverse=True,
+    )[:5]
+    top_decrease = sorted(
+        [m for m in upside_movers if m["delta"] < 0],
+        key=lambda m: m["delta"],
+    )[:5]
+
+    return {
+        "ok": True,
+        "slot": normalised_slot,
+        "band": band_param,
+        "threshold": threshold_val,
+        "region": region_f or "__ALL__",
+        "available_regions": available_regions,
+        "quarter": resolved_quarter,
+        "quarter_auto_selected": quarter_auto,
+        "quarter_labels": quarter_labels,
+        "current": current_meta,
+        "prior": prior_meta,
+        "warning": warning,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "snapshots": recent,
+        "sections": {
+            "bu_movement": {
+                "regions": regions_out,
+                "rollup": rollup,
+                "trend": trend_series,
+            },
+            "worsened": worsened,
+            "new_forecast": new_forecast,
+            "upside": {
+                "current_total": round(up_cur_total, 2),
+                "prior_total": round(up_pri_total, 2),
+                "delta": round(up_cur_total - up_pri_total, 2),
+                "delta_pct": _wb_delta_pct(up_cur_total, up_pri_total),
+                "top_increase": top_increase,
+                "top_decrease": top_decrease,
+            },
+        },
     }
 
 

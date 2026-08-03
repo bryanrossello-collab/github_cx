@@ -117,6 +117,93 @@ class Settings(BaseSettings):
     auth_dev_user: Optional[str] = Field(default=None, alias="AUTH_DEV_USER")
     db_pool_max: int = Field(default=10, alias="DB_POOL_MAX")
 
+    # ------ Snowflake source (on-demand "Run now" refresh) ----------------
+    # Connection identifiers only — mirrors the DB_* pattern via AliasChoices.
+    # There is NEVER a token or secret here: the OAuth token is read per
+    # request from the `x-pomerium-idp-access-token` header, used in memory
+    # only, and never logged/persisted (see app/warehouse.py).
+    #
+    # SNOWFLAKE_MODE:
+    #   * "real" — connect to Snowflake with authenticator='oauth' + the
+    #     per-request forwarded token.
+    #   * "simulated" — no Snowflake connection; the refresh reads the
+    #     bundled seeds/*.csv so local dev at :8765 works with no token,
+    #     no package, and no warehouse access.
+    #
+    # When NOT explicitly set, the mode is auto-selected by environment
+    # (see `effective_snowflake_mode`): **real in production, simulated in
+    # development**. This mirrors how `effective_strict_auth` keys off the
+    # `environment` field, so a prod deploy uses real Snowflake with zero
+    # env toggling while local dev stays offline. An explicit
+    # `SNOWFLAKE_MODE=real|simulated` env var always overrides.
+    snowflake_mode: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("SNOWFLAKE_MODE", "SNOWFLAKE_SIMULATE_MODE"),
+    )
+    snowflake_account: str = Field(
+        default="ZENDESK-GLOBAL",
+        validation_alias=AliasChoices("SNOWFLAKE_ACCOUNT"),
+    )
+    snowflake_warehouse: str = Field(
+        default="PUBLIC_ZENDESK_L",
+        validation_alias=AliasChoices("SNOWFLAKE_WAREHOUSE"),
+    )
+    snowflake_database: str = Field(
+        default="FOUNDATIONAL",
+        validation_alias=AliasChoices("SNOWFLAKE_DATABASE"),
+    )
+    snowflake_schema: str = Field(
+        default="CUSTOMER",
+        validation_alias=AliasChoices("SNOWFLAKE_SCHEMA"),
+    )
+    snowflake_role: str = Field(
+        default="PUBLIC",
+        validation_alias=AliasChoices("SNOWFLAKE_ROLE"),
+    )
+    # Bounded connector timeouts (seconds). The active query legitimately
+    # runs ~2 min; login/network are kept short so a stuck warehouse fails
+    # cleanly rather than hanging a worker thread.
+    snowflake_login_timeout_s: int = Field(default=30, alias="SNOWFLAKE_LOGIN_TIMEOUT_S")
+    snowflake_network_timeout_s: int = Field(default=45, alias="SNOWFLAKE_NETWORK_TIMEOUT_S")
+    snowflake_statement_timeout_s: int = Field(default=600, alias="SNOWFLAKE_STATEMENT_TIMEOUT_S")
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def effective_snowflake_mode(self) -> str:
+        """Resolved source mode — 'real' or 'simulated'.
+
+        An explicit ``SNOWFLAKE_MODE`` env var wins. Otherwise the mode is
+        derived from the environment (same signal ``effective_strict_auth``
+        uses): **simulated in development/dev/local, real everywhere else**
+        (production). This makes a prod deploy use real Snowflake with no
+        manual toggle while local dev stays offline with no token/package.
+        """
+        raw = (self.snowflake_mode or "").strip().lower()
+        if raw in ("real", "simulated"):
+            return raw
+        if self.environment.strip().lower() in ("development", "dev", "local"):
+            return "simulated"
+        return "real"
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def snowflake_simulated(self) -> bool:
+        """True when the refresh should use the bundled seeds instead of a
+        live Snowflake connection."""
+        return self.effective_snowflake_mode != "real"
+
+    def snowflake_public_dict(self) -> dict:
+        """Read-only, non-secret Snowflake connection summary for the admin
+        page + status endpoint. Never contains a token or any secret."""
+        return {
+            "mode": "simulated" if self.snowflake_simulated else "real",
+            "account": self.snowflake_account,
+            "warehouse": self.snowflake_warehouse,
+            "database": self.snowflake_database,
+            "schema": self.snowflake_schema,
+            "role": self.snowflake_role,
+        }
+
     # ---- Helpers used by the rest of the app -----------------------------
     @computed_field  # type: ignore[misc]
     @property

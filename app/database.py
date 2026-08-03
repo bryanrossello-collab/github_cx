@@ -717,6 +717,62 @@ class Database:
                 key, value,
             )
 
+    async def get_meta(self, key: str) -> Optional[str]:
+        """Read a single ``renewals_meta`` value (or None). Used by the
+        Snowflake refresh to persist/read the last-success record so it
+        survives restarts and any instance can read it."""
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT value FROM renewals_meta WHERE key = $1", key
+            )
+
+    async def persist_source_csv(
+        self,
+        *,
+        slot: str,
+        filename: str,
+        content: bytes,
+        uploaded_by: str,
+        note: Optional[str] = None,
+        effective_date=None,
+    ) -> dict:
+        """Persist CSV bytes as a new ``csv_uploads`` version AND parse them
+        into ``account_snapshots`` — the exact path ``POST /upload-csv`` uses.
+
+        Reused by the Snowflake "Run now" refresh so a generated snapshot is
+        indistinguishable from a manual CSV upload (same versioning + read
+        path). Returns the new upload id, timestamp, and parsed row count.
+        """
+        from app.ingest import resolve_effective_date
+
+        sha = hashlib.sha256(content).hexdigest()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO csv_uploads
+                    (slot, filename, content_type, size_bytes, sha256, content,
+                     uploaded_by, note)
+                VALUES ($1, $2, 'text/csv', $3, $4, $5, $6, $7)
+                RETURNING id, uploaded_at
+                """,
+                slot, filename, len(content), sha, content, uploaded_by, note,
+            )
+        eff = effective_date or resolve_effective_date(filename, row["uploaded_at"])
+        parsed_rows = await self.ingest_snapshot(
+            csv_upload_id=row["id"],
+            slot=slot,
+            effective_date=eff,
+            raw_bytes=content,
+        )
+        return {
+            "id": row["id"],
+            "uploaded_at": row["uploaded_at"],
+            "effective_date": eff,
+            "sha256": sha,
+            "size": len(content),
+            "parsed_rows": parsed_rows,
+        }
+
     async def seed_csv_uploads_if_empty(self) -> int:
         """For each (active / historical) slot, if the table has no rows
         for that slot, insert the bundled CSV from ``/app/seeds`` AND

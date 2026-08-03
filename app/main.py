@@ -30,7 +30,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from app.config import get_settings
 from app.database import Database, DatabaseUnavailable
 from app.logging_setup import configure_logging
-from app.routes import admin, auth_api, health, renewals
+from app.routes import admin, auth_api, health, refresh, renewals
 from app.auth import guest_user, resolve_user
 
 # Paths that never need a DB-provisioned identity. Skipping auth here avoids a
@@ -283,6 +283,7 @@ def create_app() -> FastAPI:
     app.include_router(admin.router)
     app.include_router(renewals.router)
     app.include_router(renewals.legacy_router)
+    app.include_router(refresh.router)
 
     # ----- Static frontend -------------------------------------------------
     if (PUBLIC_DIR / "vendor").exists():

@@ -91,6 +91,29 @@ spec:
         # - name: SEED_ON_FIRST_BOOT
         #   value: "true"
 
+        # ---- Snowflake source ("Run now") — ALL OPTIONAL -----------------
+        # Everything below is ALREADY defaulted in app/config.py; set these
+        # ONLY to override a default. No secrets/tokens ever go here — the
+        # OAuth token is read per request from the x-pomerium-idp-access-token
+        # header declared in spec.ingress.annotations above.
+        #
+        # SNOWFLAKE_MODE auto-selects by environment when unset: `real` in
+        # production (this manifest) and `simulated` in local dev — so a prod
+        # deploy uses real Snowflake with no toggle. Uncomment to force a mode
+        # (e.g. run `simulated` in prod for a dry run with the bundled seeds).
+        # - name: SNOWFLAKE_MODE
+        #   value: "real"              # real | simulated (default: real in prod)
+        # - name: SNOWFLAKE_ACCOUNT
+        #   value: "ZENDESK-GLOBAL"
+        # - name: SNOWFLAKE_WAREHOUSE
+        #   value: "PUBLIC_ZENDESK_L"
+        # - name: SNOWFLAKE_DATABASE
+        #   value: "FOUNDATIONAL"
+        # - name: SNOWFLAKE_SCHEMA
+        #   value: "CUSTOMER"
+        # - name: SNOWFLAKE_ROLE
+        #   value: "PUBLIC"
+
       # ---- Probes ---------------------------------------------------------
       # /healthz is always-200 once the process is alive. Cloud Run uses
       # this as the LIVENESS probe — it won't restart the container as
@@ -136,6 +159,29 @@ spec:
     # Cloud Run "Your client does not have permission to get URL /" 403.
     # Set to INTERNAL if you have a load balancer / IAP fronting this.
     type: PUBLIC
+
+    # ---- Pomerium identity header pass-through --------------------------
+    # The platform team has ALREADY enabled `pass_identity_headers` on the
+    # Pomerium side. This block does NOT turn any platform feature on — it
+    # only DECLARES which forwarded headers this app wants, so the whole
+    # thing ships in the repo and needs no platform ticket.
+    #
+    # Why the app needs it: the admin "Run now" Snowflake refresh
+    # (app/warehouse.py) authenticates each query with the signed-in user's
+    # OAuth token. The app reads that token from `x-pomerium-idp-access-token`
+    # (a JWT with aud=api://appfoundry, which Snowflake's existing External
+    # OAuth integration validates). The token is used in memory only and is
+    # NEVER logged, stored, or persisted. The id token is forwarded too for
+    # completeness / possible future use.
+    #
+    # These keys map to the Pomerium Ingress annotation the platform
+    # referenced (`ingress.pomerium.io/set_request_headers`). If your Vibe
+    # version nests annotations elsewhere (e.g. `metadata.annotations`), move
+    # this map there verbatim — the point is the declaration lives in-repo.
+    annotations:
+      ingress.pomerium.io/set_request_headers: |
+        x-pomerium-idp-access-token: ${pomerium.access_token}
+        x-pomerium-idp-id-token: ${pomerium.id_token}
 
   # ---- Secrets bundle ----------------------------------------------------
   # Declare the secrets this service needs. Vibe creates / mounts them via

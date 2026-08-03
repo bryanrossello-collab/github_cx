@@ -9,3 +9,7 @@ pydantic==2.9.2
 pydantic-settings==2.6.1
 python-multipart==0.0.19
 structlog==24.4.0
+# Snowflake source refresh ("Run now"). Synchronous connector — always run
+# via run_in_threadpool (see app/warehouse.py). Only exercised in real mode;
+# simulated mode (default) reads bundled seeds and never imports it.
+snowflake-connector-python==3.12.3

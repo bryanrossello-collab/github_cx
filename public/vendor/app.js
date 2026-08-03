@@ -866,7 +866,7 @@ const BAND_OPTIONS = [
   { value: "smb", label: "SMB accounts only" },
   { value: "digital", label: "Digital accounts only" }
 ];
-const VALID_TABS = ["region", "trending", "partner", "accounts", "notes", "historical", "targets"];
+const VALID_TABS = ["region", "trending", "partner", "accounts", "notes", "historical", "targets", "weekly"];
 const DEFAULT_QUARTERS = ["FY25Q4", "FY26Q1", "FY27Q1", "FY27Q2", "FY27Q3", "FY27Q4"];
 const initialState = {
   data: [],
@@ -4433,7 +4433,8 @@ function Tabs() {
     { id: "accounts", label: "Accounts" },
     { id: "notes", label: "Notes" },
     ...hasHist ? [{ id: "historical", label: "Historical" }] : [],
-    { id: "targets", label: "Report" }
+    { id: "targets", label: "Report" },
+    { id: "weekly", label: "Weekly Brief" }
   ].filter((t) => !allowed || allowed.has(t.id));
   void accessTick;
   return /* @__PURE__ */ React.createElement("div", { className: "tabs" }, items.map((t) => /* @__PURE__ */ React.createElement(
@@ -8777,6 +8778,327 @@ function RefreshOverlay() {
     )
   );
 }
+function generateWeeklyBriefHtml(brief, opts) {
+  const esc = escapeHtml;
+  const fmtD = fmtCompact;
+  const fmtDash = fmtCompactDash;
+  const signed = (n) => (n >= 0 ? "+" : "\u2212") + fmtD(Math.abs(n));
+  const pctS = (v) => v == null || !isFinite(v) ? "\u2014" : (v >= 0 ? "+" : "") + v.toFixed(1) + "%";
+  const genDate = (/* @__PURE__ */ new Date()).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+  const sec = brief.sections || {};
+  const bu = sec.bu_movement || { regions: [], rollup: {}, trend: [] };
+  const rollup = bu.rollup || {};
+  const upside = sec.upside || {};
+  const worsened = sec.worsened || [];
+  const newFc = sec.new_forecast || [];
+  const curEff = (brief.current && brief.current.effective_date || "").slice(0, 10);
+  const priEff = (brief.prior && brief.prior.effective_date || "").slice(0, 10) || "\u2014";
+  const scopeLine = `${esc(brief.quarter || "\u2014")} \u00b7 Band ${esc(brief.band || "100k+")} \u00b7 ${curEff} vs ${priEff}`;
+  const regionFilter = opts && opts.region && opts.region !== "__ALL__" ? opts.region : null;
+  const inRegion = (row) => !regionFilter || row.region === regionFilter;
+  // Deltas: for BU FC, a positive swing == more churn/contraction == worse (red).
+  const buDeltaColor = (n) => n > 0 ? "#ef4444" : n < 0 ? "#22c55e" : "#64748b";
+  const upDeltaColor = (n) => n > 0 ? "#22c55e" : n < 0 ? "#ef4444" : "#64748b";
+  const kpiCards = [
+    { label: "BU Forecast (C/C)", val: fmtD(rollup.current || 0), detail: `${signed(rollup.delta || 0)} WoW`, color: "#0ea5e9" },
+    { label: "New $0\u2192FC accounts", val: String(newFc.length), detail: `${newFc.filter((r) => r.is_large).length} large`, color: "#f59e0b" },
+    { label: "Worsened accounts", val: String(worsened.length), detail: `${worsened.filter((r) => r.is_large).length} \u2265 threshold`, color: "#ef4444" },
+    { label: "Upside", val: fmtD(upside.current_total || 0), detail: `${signed(upside.delta || 0)} WoW`, color: "#8b5cf6" }
+  ];
+  const regionRows = (regionFilter ? bu.regions.filter((r) => r.region === regionFilter) : bu.regions);
+  const buTable = `
+<table>
+<tr><th>Region</th><th class="r">Accounts</th><th class="r">Prior BU FC</th><th class="r">Current BU FC</th><th class="r">\u0394 $</th><th class="r">\u0394 %</th></tr>
+${regionRows.map((o) => `<tr><td style="font-weight:500">${esc(o.region)}</td><td class="r">${o.accounts}</td><td class="r">${fmtDash(o.prior)}</td><td class="r">${fmtDash(o.current)}</td><td class="r" style="color:${buDeltaColor(o.delta)};font-weight:600">${signed(o.delta)}</td><td class="r" style="color:${buDeltaColor(o.delta)}">${pctS(o.delta_pct)}</td></tr>`).join("\n")}
+${!regionFilter ? `<tr style="font-weight:700;border-top:2px solid #e5e7eb"><td>Total</td><td class="r">${rollup.accounts || 0}</td><td class="r">${fmtDash(rollup.prior)}</td><td class="r">${fmtDash(rollup.current)}</td><td class="r" style="color:${buDeltaColor(rollup.delta || 0)}">${signed(rollup.delta || 0)}</td><td class="r" style="color:${buDeltaColor(rollup.delta || 0)}">${pctS(rollup.delta_pct)}</td></tr>` : ""}
+</table>`;
+  const trendHtml = bu.trend && bu.trend.length > 1 ? (() => {
+    const rows = bu.trend.map((t, i) => {
+      const v = t.total_bu_fc || 0;
+      const prev = i > 0 ? (bu.trend[i - 1].total_bu_fc || 0) : null;
+      const d = prev == null ? null : v - prev;
+      const dp = prev == null || prev === 0 ? null : d / Math.abs(prev) * 100;
+      return { date: (t.effective_date || "").slice(0, 10), v, d, dp, file: t.filename || "" };
+    });
+    const first = rows[0], last = rows[rows.length - 1];
+    const regionLabel = regionFilter || "All regions";
+    return `
+<h3 style="font-size:12px;font-weight:700;margin:16px 0 4px">BU Forecast Trend (over time)</h3>
+<p class="sub" style="margin:0 0 6px">Latest <strong>${fmtDash(last.v)}</strong>${last.d != null ? ` <span style="color:${buDeltaColor(last.d)};font-weight:600">${signed(last.d)} (${pctS(last.dp)}) WoW</span>` : ""} &middot; ${esc(regionLabel)} &middot; ${esc(first.date)} &rarr; ${esc(last.date)}</p>
+<table>
+<tr><th>Week (date)</th><th class="r">BU FC</th><th class="r">WoW \u0394$</th><th class="r">WoW \u0394%</th></tr>
+${rows.map((r) => `<tr><td>${esc(r.date)}</td><td class="r">${fmtDash(r.v)}</td><td class="r" style="color:${r.d == null ? "#9ca3af" : buDeltaColor(r.d)};font-weight:600">${r.d == null ? "\u2014" : signed(r.d)}</td><td class="r" style="color:${r.dp == null ? "#9ca3af" : buDeltaColor(r.d)}">${r.dp == null ? "\u2014" : pctS(r.dp)}</td></tr>`).join("\n")}
+</table>`;
+  })() : "";
+  const worsenedTable = (rows) => rows.length ? `
+<table>
+<tr><th>Account</th><th>Region</th><th class="r">Prior BU FC</th><th class="r">Current BU FC</th><th class="r">Adverse swing</th><th>What happened</th></tr>
+${rows.map((d) => `<tr><td style="font-weight:500">${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r">${fmtDash(d.prior_bu_fc)}</td><td class="r">${fmtDash(d.current_bu_fc)}</td><td class="r" style="color:#ef4444;font-weight:600">${signed(d.swing)}</td><td class="note-cell" title="${esc(d.explanation || "")}">${d.is_large ? esc(d.explanation || "\u2014") : "<span style='color:#9ca3af'>below threshold</span>"}${d.explanation_source ? ` <span style="color:#9ca3af">(${esc(d.explanation_source)})</span>` : ""}</td></tr>`).join("\n")}
+</table>` : `<p style="font-size:11px;color:#9ca3af;margin:6px 0">No worsened accounts.</p>`;
+  const newFcTable = (rows) => rows.length ? `
+<table>
+<tr><th>Account</th><th>Region</th><th class="r">New BU FC</th><th>What happened</th></tr>
+${rows.map((d) => `<tr><td style="font-weight:500">${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r" style="color:#d97706;font-weight:600">${fmtDash(d.current_bu_fc)}</td><td class="note-cell" title="${esc(d.explanation || "")}">${d.is_large ? esc(d.explanation || "\u2014") : "<span style='color:#9ca3af'>below threshold</span>"}${d.explanation_source ? ` <span style="color:#9ca3af">(${esc(d.explanation_source)})</span>` : ""}</td></tr>`).join("\n")}
+</table>` : `<p style="font-size:11px;color:#9ca3af;margin:6px 0">No new in-quarter forecasts.</p>`;
+  const upsideTable = (up, down) => `
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+<div><h3 style="font-size:12px;font-weight:700;margin:0 0 6px;color:#22c55e">Top 5 driving increase</h3>${up.length ? `<table><tr><th>Account</th><th>Region</th><th class="r">\u0394 Upside</th></tr>${up.map((d) => `<tr><td>${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r" style="color:#22c55e;font-weight:600">${signed(d.delta)}</td></tr>`).join("")}</table>` : `<p style="font-size:11px;color:#9ca3af">None.</p>`}</div>
+<div><h3 style="font-size:12px;font-weight:700;margin:0 0 6px;color:#ef4444">Top 5 driving decrease</h3>${down.length ? `<table><tr><th>Account</th><th>Region</th><th class="r">\u0394 Upside</th></tr>${down.map((d) => `<tr><td>${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r" style="color:#ef4444;font-weight:600">${signed(d.delta)}</td></tr>`).join("")}</table>` : `<p style="font-size:11px;color:#9ca3af">None.</p>`}</div>
+</div>`;
+  const overallBlock = `
+<h2>Overall Rollup</h2>
+${buTable}
+${trendHtml}
+<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">Accounts that worsened WoW (${worsened.length})</h3>
+${worsenedTable(worsened)}
+<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">New in-quarter forecast \u2014 $0 \u2192 FC (${newFc.length})</h3>
+${newFcTable(newFc)}
+<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">Upside movement (${fmtDash(upside.current_total)}, ${signed(upside.delta || 0)} WoW)</h3>
+${upsideTable(upside.top_increase || [], upside.top_decrease || [])}`;
+  const regionsForBlocks = regionFilter ? [regionFilter] : bu.regions.map((r) => r.region);
+  const perRegionBlocks = regionsForBlocks.map((rname) => {
+    const rMove = bu.regions.find((r) => r.region === rname) || { current: 0, prior: 0, delta: 0, delta_pct: null, accounts: 0 };
+    const rWorse = worsened.filter((d) => d.region === rname);
+    const rNew = newFc.filter((d) => d.region === rname);
+    const rUp = (upside.top_increase || []).filter((d) => d.region === rname);
+    const rDown = (upside.top_decrease || []).filter((d) => d.region === rname);
+    return `
+<h2>Region: ${esc(rname)}</h2>
+<p class="sub" style="margin-bottom:8px">${rMove.accounts} accounts \u00b7 BU FC ${fmtDash(rMove.current)} (${signed(rMove.delta)} WoW, ${pctS(rMove.delta_pct)})</p>
+<h3 style="font-size:12px;font-weight:700;margin:10px 0 6px">Worsened WoW (${rWorse.length})</h3>
+${worsenedTable(rWorse)}
+<h3 style="font-size:12px;font-weight:700;margin:14px 0 6px">New in-quarter forecast (${rNew.length})</h3>
+${newFcTable(rNew)}
+<h3 style="font-size:12px;font-weight:700;margin:14px 0 6px">Upside movers</h3>
+${upsideTable(rUp, rDown)}`;
+  }).join("\n");
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Weekly 100K+ Regional Brief</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#fff;color:#1f2937;padding:40px;max-width:1200px;margin:0 auto;font-size:13px;line-height:1.5}
+h1{font-size:20px;font-weight:700;margin-bottom:4px}
+h2{font-size:14px;font-weight:700;margin:28px 0 10px;padding-bottom:6px;border-bottom:2px solid #e5e7eb}
+.sub{font-size:11px;color:#6b7280;margin-bottom:24px}
+.kpi-row{display:grid;grid-template-columns:repeat(${kpiCards.length},1fr);gap:12px;margin-bottom:24px}
+.kpi{border:1px solid #e5e7eb;border-radius:8px;padding:14px;text-align:center}
+.kpi .label{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;margin-bottom:4px;font-weight:600}
+.kpi .val{font-size:22px;font-weight:700}
+.kpi .detail{font-size:10px;color:#9ca3af;margin-top:2px}
+table{width:100%;border-collapse:collapse;font-size:11px;margin-top:8px}
+th{background:#f9fafb;font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:.04em;padding:8px 10px;text-align:left;border-bottom:2px solid #e5e7eb}
+td{padding:6px 10px;border-bottom:1px solid #f3f4f6;vertical-align:top}
+.r{text-align:right}
+tr:hover{background:#f9fafb}
+.note-cell{max-width:360px;font-size:10px;color:#64748b}
+@media print{body{padding:20px;font-size:11px}.kpi .val{font-size:16px}}
+</style></head><body>
+<h1>Weekly 100K+ Regional Brief</h1>
+<p class="sub">${scopeLine} &middot; Generated ${genDate}${regionFilter ? " &middot; Region: " + esc(regionFilter) : ""}</p>
+${brief.warning ? `<p style="background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:8px 12px;font-size:11px;color:#92400e;margin-bottom:16px">${esc(brief.warning)}</p>` : ""}
+<div class="kpi-row">
+${kpiCards.map((c) => `<div class="kpi"><div class="label" style="color:${c.color}">${c.label}</div><div class="val">${c.val}</div><div class="detail">${esc(c.detail)}</div></div>`).join("\n")}
+</div>
+${overallBlock}
+${perRegionBlocks}
+<p style="font-size:9px;color:#9ca3af;margin-top:24px;text-align:center">Generated ${genDate} &middot; Renewals Intelligence Studio &middot; Weekly 100K+ Regional Brief</p>
+</body></html>`;
+  try {
+    const blob = new Blob([html], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    const w = window.open(url, "_blank");
+    if (!w) {
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `Weekly_100K_Brief_${(brief.quarter || "current").replace(/[^a-zA-Z0-9]/g, "_")}.html`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
+    setTimeout(() => URL.revokeObjectURL(url), 1e4);
+  } catch (e) {
+    alert("Could not generate brief: " + e.message);
+  }
+}
+function WeeklyBriefTab() {
+  const fmtC = fmtCompactDash;
+  const fmtMoney = fmtCompact;
+  const signed = (n) => (n >= 0 ? "+" : "\u2212") + fmtMoney(Math.abs(n));
+  const pctS = (v) => v == null || !isFinite(v) ? "\u2014" : (v >= 0 ? "+" : "") + v.toFixed(1) + "%";
+  const [currentId, setCurrentId] = useState("");
+  const [priorId, setPriorId] = useState("");
+  const [region, setRegion] = useState("__ALL__");
+  const [threshold, setThreshold] = useState(50000);
+  const [brief, setBrief] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  const didInit = useRef(false);
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setErr("");
+    const qs = new URLSearchParams({ slot: "active", threshold: String(threshold || 0) });
+    if (currentId) qs.set("current", currentId);
+    if (priorId) qs.set("prior", priorId);
+    // Region is filtered SERVER-side so every section — including the trend
+    // series — is scoped consistently. It MUST be in the fetch params AND the
+    // effect deps below, otherwise the trend would ignore the selection.
+    if (region && region !== "__ALL__") qs.set("region", region);
+    fetch("/api/renewals/weekly-brief?" + qs.toString(), { cache: "no-store" }).then((r) => r.json()).then((data) => {
+      if (cancelled) return;
+      if (!data.ok) throw new Error(data.detail || "Weekly brief load failed");
+      setBrief(data);
+      if (!didInit.current) {
+        didInit.current = true;
+        if (data.current && !currentId) setCurrentId(String(data.current.id));
+        if (data.prior && !priorId) setPriorId(String(data.prior.id));
+      }
+    }).catch((e) => {
+      if (!cancelled) setErr(e.message || String(e));
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [currentId, priorId, threshold, region]);
+  const sec = brief && brief.sections;
+  const bu = sec && sec.bu_movement || { regions: [], rollup: {}, trend: [] };
+  const rollup = bu.rollup || {};
+  const upside = sec && sec.upside || {};
+  // Data is already region-scoped by the server; render it directly.
+  const worsened = sec && sec.worsened || [];
+  const newFc = sec && sec.new_forecast || [];
+  const regionRows = bu.regions || [];
+  // Region options come from the UNfiltered available_regions so the selector
+  // stays fully populated even while viewing a single region.
+  const regionOptions = brief && brief.available_regions || (bu.regions || []).map((r) => r.region);
+  const snapshots = brief && brief.snapshots || [];
+  const buDeltaColor = (n) => n > 0 ? "#ef4444" : n < 0 ? "#22c55e" : "#64748b";
+  const upDeltaColor = (n) => n > 0 ? "#22c55e" : n < 0 ? "#ef4444" : "#64748b";
+  const snapLabel = (s) => `${(s.effective_date || "").slice(0, 10)} \u00b7 ${s.filename || ("#" + s.id)}`;
+  const cell = (txt, cls) => /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 " + (cls || "") }, txt);
+  const th = (txt, cls) => /* @__PURE__ */ React.createElement("th", { key: txt, className: "px-2 py-1.5 text-left font-semibold uppercase tracking-wider " + (cls || "") }, txt);
+  // ---- controls -----------------------------------------------------------
+  const controls = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3 flex flex-wrap gap-3 items-end" },
+    /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Current snapshot"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: currentId, onChange: (e) => setCurrentId(e.target.value) }, snapshots.map((s) => /* @__PURE__ */ React.createElement("option", { key: s.id, value: String(s.id) }, snapLabel(s))))),
+    /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Compare to (prior)"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: priorId, onChange: (e) => setPriorId(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Auto (previous)"), snapshots.map((s) => /* @__PURE__ */ React.createElement("option", { key: s.id, value: String(s.id) }, snapLabel(s))))),
+    /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Region"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: region, onChange: (e) => setRegion(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "__ALL__" }, "All regions"), regionOptions.map((r) => /* @__PURE__ */ React.createElement("option", { key: r, value: r }, r)))),
+    /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Large threshold ($)"), /* @__PURE__ */ React.createElement("input", { className: "filter-input text-xs w-28", type: "number", step: "5000", value: threshold, onChange: (e) => setThreshold(Number(e.target.value) || 0) })),
+    /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-indigo ml-auto", disabled: !brief || !brief.sections, onClick: () => brief && generateWeeklyBriefHtml(brief, { region }) }, "Download brief"),
+    brief && brief.quarter && /* @__PURE__ */ React.createElement("div", { className: "w-full text-[10px] text-indigo-600 dark:text-indigo-400 font-semibold" }, "Quarter: ", brief.quarter, brief.quarter_auto_selected ? " (auto)" : "", " \u00b7 Band: ", brief.band, brief.current && brief.prior ? ` \u00b7 ${(brief.current.effective_date || "").slice(0, 10)} vs ${(brief.prior.effective_date || "").slice(0, 10)}` : ""));
+  if (loading && !brief) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500" }, "Loading weekly brief\u2026"));
+  if (err) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-red-500" }, err));
+  if (!sec) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500" }, brief && brief.warning || "Upload at least two active CSV snapshots to compare week over week."));
+  // ---- KPI tiles ----------------------------------------------------------
+  const kpis = [
+    { label: "BU Forecast (C/C)", value: fmtC(rollup.current), delta: rollup.delta, deltaColor: buDeltaColor(rollup.delta || 0), accent: "#0ea5e9" },
+    { label: "Upside", value: fmtC(upside.current_total), delta: upside.delta, deltaColor: upDeltaColor(upside.delta || 0), accent: "#8b5cf6" },
+    { label: "Worsened accounts", value: String((sec.worsened || []).length), sub: `${(sec.worsened || []).filter((r) => r.is_large).length} \u2265 threshold`, accent: "#ef4444" },
+    { label: "New $0\u2192FC", value: String((sec.new_forecast || []).length), sub: `${(sec.new_forecast || []).filter((r) => r.is_large).length} large`, accent: "#f59e0b" }
+  ];
+  const kpiRow = /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2" }, kpis.map((c, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: "glass-kpi" }, /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-label" }, c.label), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-value", style: { color: c.accent } }, c.value), c.delta != null ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub", style: { color: c.deltaColor } }, signed(c.delta), " WoW") : c.sub ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub" }, c.sub) : null)));
+  // ---- Section 1: BU movement by region ----------------------------------
+  const buRegionCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
+    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold" }, "1 \u00b7 BU forecast movement by region"),
+    /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
+      /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Region", "Accounts", "Prior BU FC", "Current BU FC", "\u0394 $", "\u0394 %"].map((h, i) => th(h, i > 0 ? "text-right" : "")))),
+      /* @__PURE__ */ React.createElement("tbody", null,
+        regionRows.map((o) => /* @__PURE__ */ React.createElement("tr", { key: o.region, className: "glass-row-accent" }, cell(o.region, "font-medium"), cell(o.accounts, "text-right tabular-nums"), cell(fmtC(o.prior), "text-right tabular-nums"), cell(fmtC(o.current), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: buDeltaColor(o.delta) } }, signed(o.delta)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: buDeltaColor(o.delta) } }, pctS(o.delta_pct)))),
+        region === "__ALL__" && /* @__PURE__ */ React.createElement("tr", { className: "font-bold border-t-2", style: { borderColor: "var(--border)" } }, cell("Total"), cell(rollup.accounts || 0, "text-right tabular-nums"), cell(fmtC(rollup.prior), "text-right tabular-nums"), cell(fmtC(rollup.current), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: buDeltaColor(rollup.delta || 0) } }, signed(rollup.delta || 0)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: buDeltaColor(rollup.delta || 0) } }, pctS(rollup.delta_pct)))))));
+  // ---- Trend chart (BU forecast over time) --------------------------------
+  const trend = bu.trend || [];
+  let trendCard = null;
+  if (trend.length > 1) {
+    // Per-point WoW deltas. BU_FC is forecasted churn/contraction, so an
+    // increase (positive delta) is WORSE (red) and a decrease is better.
+    const trendRows = trend.map((t, i) => {
+      const v = t.total_bu_fc || 0;
+      const prev = i > 0 ? (trend[i - 1].total_bu_fc || 0) : null;
+      const d = prev == null ? null : v - prev;
+      const dp = prev == null || prev === 0 ? null : d / Math.abs(prev) * 100;
+      return { date: (t.effective_date || "").slice(0, 10), v, d, dp, file: t.filename || "" };
+    });
+    const first = trendRows[0];
+    const latest = trendRows[trendRows.length - 1];
+    const regionLabel = region === "__ALL__" ? "All regions" : region;
+    // ---- chart geometry ----
+    const w = 720, h = 288, pad = { t: 28, r: 24, b: 58, l: 68 };
+    const iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
+    const vals = trendRows.map((r) => r.v);
+    const rawMin = Math.min(...vals), rawMax = Math.max(...vals);
+    const rng = rawMax - rawMin || Math.abs(rawMax) || 1;
+    let yMax = rawMax + rng * 0.12;
+    let yMin = Math.max(0, rawMin - rng * 0.12);
+    if (yMax === yMin) yMax = yMin + 1;
+    const xAt = (i) => pad.l + (trendRows.length === 1 ? 0 : i / (trendRows.length - 1)) * iw;
+    const yAt = (v) => pad.t + ih - (v - yMin) / (yMax - yMin) * ih;
+    const TICKS = 4;
+    const gridEls = [];
+    for (let i = 0; i <= TICKS; i++) {
+      const val = yMin + (yMax - yMin) * (i / TICKS);
+      const gy = yAt(val);
+      gridEls.push(/* @__PURE__ */ React.createElement("line", { key: "g" + i, x1: pad.l, y1: gy, x2: w - pad.r, y2: gy, stroke: "currentColor", strokeWidth: 1, className: "text-gray-200 dark:text-gray-700", opacity: 0.7 }));
+      gridEls.push(/* @__PURE__ */ React.createElement("text", { key: "gt" + i, x: pad.l - 8, y: gy + 3, textAnchor: "end", fontSize: 10, fill: "currentColor", className: "text-gray-500" }, fmtMoney(val)));
+    }
+    const coords = trendRows.map((r, i) => `${xAt(i).toFixed(1)},${yAt(r.v).toFixed(1)}`).join(" ");
+    const labelAll = trendRows.length <= 5;
+    const pointEls = [];
+    trendRows.forEach((r, i) => {
+      const cx = xAt(i), cy = yAt(r.v);
+      const showLabel = labelAll || i === 0 || i === trendRows.length - 1;
+      const tip = `${r.date}\nBU FC ${fmtMoney(r.v)}` + (r.d == null ? "\n(baseline)" : `\nWoW ${signed(r.d)} (${pctS(r.dp)})`);
+      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "pc" + i, cx, cy, r: 3.5, fill: "#0ea5e9" }));
+      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "ph" + i, cx, cy, r: 12, fill: "transparent" }, /* @__PURE__ */ React.createElement("title", null, tip)));
+      if (showLabel) {
+        pointEls.push(/* @__PURE__ */ React.createElement("text", { key: "pl" + i, x: cx, y: cy - 9, textAnchor: "middle", fontSize: 10, fontWeight: 700, fill: "currentColor", className: "text-sky-700 dark:text-sky-300" }, fmtMoney(r.v)));
+      }
+    });
+    const xLabelEls = trendRows.map((r, i) => /* @__PURE__ */ React.createElement("text", { key: "x" + i, x: xAt(i), y: h - pad.b + 16, textAnchor: "middle", fontSize: 9, fill: "currentColor", className: "text-gray-500" }, r.date.slice(5)));
+    const axisLine = /* @__PURE__ */ React.createElement("line", { x1: pad.l, y1: pad.t + ih, x2: w - pad.r, y2: pad.t + ih, stroke: "currentColor", strokeWidth: 1, className: "text-gray-300 dark:text-gray-600" });
+    const yTitle = /* @__PURE__ */ React.createElement("text", { x: 14, y: pad.t + ih / 2, textAnchor: "middle", fontSize: 10, fontWeight: 600, fill: "currentColor", className: "text-gray-500", transform: `rotate(-90 14 ${pad.t + ih / 2})` }, "BU FC (C/C)");
+    const xTitle = /* @__PURE__ */ React.createElement("text", { x: pad.l + iw / 2, y: h - 4, textAnchor: "middle", fontSize: 10, fontWeight: 600, fill: "currentColor", className: "text-gray-500" }, "Snapshot week (effective date)");
+    const svg = /* @__PURE__ */ React.createElement("svg", { viewBox: `0 0 ${w} ${h}`, className: "wb-trend-chart", role: "img", "aria-label": `BU forecast over time for ${regionLabel}` }, gridEls, axisLine, /* @__PURE__ */ React.createElement("polyline", { fill: "none", stroke: "#0ea5e9", strokeWidth: 2.5, strokeLinejoin: "round", strokeLinecap: "round", points: coords }), pointEls, xLabelEls, yTitle, xTitle);
+    // ---- headline callout ----
+    const headline = /* @__PURE__ */ React.createElement("div", { className: "wb-trend-headline" },
+      /* @__PURE__ */ React.createElement("div", null,
+        /* @__PURE__ */ React.createElement("span", { className: "wb-trend-headline-value tabular-nums" }, fmtC(latest.v)),
+        latest.d != null && /* @__PURE__ */ React.createElement("span", { className: "wb-trend-headline-delta tabular-nums", style: { color: buDeltaColor(latest.d) } }, "  ", signed(latest.d), " (", pctS(latest.dp), ") WoW")),
+      /* @__PURE__ */ React.createElement("div", { className: "wb-trend-headline-sub" }, "Latest BU forecast \u00b7 ", regionLabel, " \u00b7 ", first.date, " \u2192 ", latest.date));
+    // ---- companion data table ("need to see amounts") ----
+    const tableEl = /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto mt-3" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
+      /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Week (date)", "BU FC", "WoW \u0394$", "WoW \u0394%"].map((hh, i) => th(hh, i > 0 ? "text-right" : "")))),
+      /* @__PURE__ */ React.createElement("tbody", null, trendRows.map((r, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" },
+        cell(r.date, "tabular-nums"),
+        cell(fmtC(r.v), "text-right tabular-nums"),
+        /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: r.d == null ? "#9ca3af" : buDeltaColor(r.d) } }, r.d == null ? "\u2014" : signed(r.d)),
+        /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: r.dp == null ? "#9ca3af" : buDeltaColor(r.d) } }, r.dp == null ? "\u2014" : pctS(r.dp)))))));
+    trendCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3" },
+      /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-1" },
+        /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold" }, "BU forecast over time"),
+        /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500" }, "Higher = more forecasted churn/contraction")),
+      headline, svg, tableEl);
+  }
+  // ---- Section 2: worsened ------------------------------------------------
+  const worsenedCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
+    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold" }, "2 \u00b7 Accounts that worsened WoW (", worsened.length, ")"),
+    /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
+      /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", "Prior BU FC", "Current BU FC", "Adverse swing", "What happened"].map((h, i) => th(h, i >= 2 && i <= 4 ? "text-right" : "")))),
+      /* @__PURE__ */ React.createElement("tbody", null, worsened.length ? worsened.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), cell(fmtC(d.prior_bu_fc), "text-right tabular-nums"), cell(fmtC(d.current_bu_fc), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#ef4444" } }, signed(d.swing)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: d.explanation || "" }, d.is_large ? (d.explanation || "\u2014") + (d.explanation_source ? " (" + d.explanation_source + ")" : "") : /* @__PURE__ */ React.createElement("span", { className: "text-gray-400" }, "below threshold")))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 6 }, "No worsened accounts in this scope."))))));
+  // ---- Section 3: new $0->FC ----------------------------------------------
+  const newFcCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
+    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold" }, "3 \u00b7 New in-quarter forecast \u2014 $0 \u2192 FC (", newFc.length, ")"),
+    /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
+      /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", "New BU FC", "What happened"].map((h, i) => th(h, i === 2 ? "text-right" : "")))),
+      /* @__PURE__ */ React.createElement("tbody", null, newFc.length ? newFc.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#d97706" } }, fmtC(d.current_bu_fc)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: d.explanation || "" }, d.is_large ? (d.explanation || "\u2014") + (d.explanation_source ? " (" + d.explanation_source + ")" : "") : /* @__PURE__ */ React.createElement("span", { className: "text-gray-400" }, "below threshold")))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 4 }, "No new in-quarter forecasts in this scope."))))));
+  // ---- Section 4: upside movement ----------------------------------------
+  const driverTable = (rows, color, emptyTxt) => /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", "\u0394 Upside"].map((h, i) => th(h, i === 2 ? "text-right" : "")))), /* @__PURE__ */ React.createElement("tbody", null, rows.length ? rows.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color } }, signed(d.delta)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 3 }, emptyTxt))));
+  const upInc = upside.top_increase || [];
+  const upDec = upside.top_decrease || [];
+  const upsideCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
+    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold flex items-center justify-between" }, /* @__PURE__ */ React.createElement("span", null, "4 \u00b7 Upside movement"), /* @__PURE__ */ React.createElement("span", { className: "text-[10px] font-normal text-gray-500" }, "Total ", fmtC(upside.current_total), " \u00b7 ", /* @__PURE__ */ React.createElement("span", { style: { color: upDeltaColor(upside.delta || 0) } }, signed(upside.delta || 0), " WoW"))),
+    /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-3 p-3" },
+      /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-emerald-600 mb-1" }, "Top 5 driving increase"), driverTable(upInc, "#22c55e", "None.")),
+      /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-red-500 mb-1" }, "Top 5 driving decrease"), driverTable(upDec, "#ef4444", "None."))));
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, brief.warning && /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300" }, brief.warning), kpiRow, buRegionCard, trendCard, worsenedCard, newFcCard, upsideCard);
+}
 function App() {
   const { state, actions, idbReady, serverInfo, csvAutoLoadStatus } = useApp();
   const hasData = state?.data?.length > 0;
@@ -8822,7 +9144,7 @@ function App() {
       hasNotes: false
     }));
   }, [hasData, gateStep, actions]);
-  return /* @__PURE__ */ React.createElement("div", { className: "min-h-full region-font" }, gateStep === "loading" && /* @__PURE__ */ React.createElement("div", { className: "splash-shell", style: { display: "flex", alignItems: "center", justifyContent: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", color: "var(--muted)" } }, /* @__PURE__ */ React.createElement("svg", { className: "mx-auto mb-3 animate-spin", width: "32", height: "32", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2" }, /* @__PURE__ */ React.createElement("path", { d: "M21 12a9 9 0 11-6.219-8.56" })), /* @__PURE__ */ React.createElement("div", { style: { fontSize: "0.9rem", fontWeight: 600 } }, "Restoring your session..."))), /* @__PURE__ */ React.createElement("div", { className: `app-shell ${gateStep !== "done" ? "is-hidden" : ""}` }, /* @__PURE__ */ React.createElement(Header, null), /* @__PURE__ */ React.createElement("main", { className: "max-w-7xl mx-auto px-4 pt-4 pb-6 space-y-4" }, !hasData && /* @__PURE__ */ React.createElement(EmptyState, null), hasData && /* @__PURE__ */ React.createElement(React.Fragment, null, state.ui.activeTab === "partner" && /* @__PURE__ */ React.createElement(Partner, null), state.ui.activeTab === "accounts" && /* @__PURE__ */ React.createElement(Accounts, null), state.ui.activeTab === "region" && /* @__PURE__ */ React.createElement(RegionQuarterTable, null), state.ui.activeTab === "trending" && /* @__PURE__ */ React.createElement(TrendingTab, null), state.ui.activeTab === "notes" && /* @__PURE__ */ React.createElement(NotesHub, null), state.ui.activeTab === "historical" && /* @__PURE__ */ React.createElement(HistoricalTab, null), state.ui.activeTab === "targets" && /* @__PURE__ */ React.createElement(TargetsTab, null)), /* @__PURE__ */ React.createElement("footer", { className: "text-xs text-gray-500 dark:text-gray-400 text-center pt-6" }, "Data, notes, targets, and settings persist in your browser. Use Reset to clear everything.")), /* @__PURE__ */ React.createElement(ColumnsDrawer, null)), gateStep !== "done" && gateStep !== "loading" && /* @__PURE__ */ React.createElement(SplashGate, { step: gateStep, setStep: setGateStep }), /* @__PURE__ */ React.createElement(RefreshOverlay, null));
+  return /* @__PURE__ */ React.createElement("div", { className: "min-h-full region-font" }, gateStep === "loading" && /* @__PURE__ */ React.createElement("div", { className: "splash-shell", style: { display: "flex", alignItems: "center", justifyContent: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", color: "var(--muted)" } }, /* @__PURE__ */ React.createElement("svg", { className: "mx-auto mb-3 animate-spin", width: "32", height: "32", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2" }, /* @__PURE__ */ React.createElement("path", { d: "M21 12a9 9 0 11-6.219-8.56" })), /* @__PURE__ */ React.createElement("div", { style: { fontSize: "0.9rem", fontWeight: 600 } }, "Restoring your session..."))), /* @__PURE__ */ React.createElement("div", { className: `app-shell ${gateStep !== "done" ? "is-hidden" : ""}` }, /* @__PURE__ */ React.createElement(Header, null), /* @__PURE__ */ React.createElement("main", { className: "max-w-7xl mx-auto px-4 pt-4 pb-6 space-y-4" }, !hasData && /* @__PURE__ */ React.createElement(EmptyState, null), hasData && /* @__PURE__ */ React.createElement(React.Fragment, null, state.ui.activeTab === "partner" && /* @__PURE__ */ React.createElement(Partner, null), state.ui.activeTab === "accounts" && /* @__PURE__ */ React.createElement(Accounts, null), state.ui.activeTab === "region" && /* @__PURE__ */ React.createElement(RegionQuarterTable, null), state.ui.activeTab === "trending" && /* @__PURE__ */ React.createElement(TrendingTab, null), state.ui.activeTab === "notes" && /* @__PURE__ */ React.createElement(NotesHub, null), state.ui.activeTab === "historical" && /* @__PURE__ */ React.createElement(HistoricalTab, null), state.ui.activeTab === "targets" && /* @__PURE__ */ React.createElement(TargetsTab, null), state.ui.activeTab === "weekly" && /* @__PURE__ */ React.createElement(WeeklyBriefTab, null)), /* @__PURE__ */ React.createElement("footer", { className: "text-xs text-gray-500 dark:text-gray-400 text-center pt-6" }, "Data, notes, targets, and settings persist in your browser. Use Reset to clear everything.")), /* @__PURE__ */ React.createElement(ColumnsDrawer, null)), gateStep !== "done" && gateStep !== "loading" && /* @__PURE__ */ React.createElement(SplashGate, { step: gateStep, setStep: setGateStep }), /* @__PURE__ */ React.createElement(RefreshOverlay, null));
 }
 function EmptyState() {
   return /* @__PURE__ */ React.createElement("div", { className: "min-h-[60vh] bg-gradient-to-b from-indigo-50 via-white to-rose-50 dark:from-slate-900 dark:via-slate-950 dark:to-slate-900 flex items-center justify-center px-4" }, /* @__PURE__ */ React.createElement("div", { className: "card p-10 text-center shadow-xl border border-indigo-100/70 dark:border-slate-800 max-w-xl w-full" }, /* @__PURE__ */ React.createElement("div", { className: "mx-auto h-14 w-14 rounded-2xl flex items-center justify-center mb-4", style: { background: "linear-gradient(135deg,#6366f1,#06b6d4,#10b981)", boxShadow: "0 4px 16px rgba(99,102,241,0.3)" } }, /* @__PURE__ */ React.createElement("svg", { width: "28", height: "28", viewBox: "0 0 24 24", fill: "none", stroke: "#fff", strokeWidth: "2.2", strokeLinecap: "round", strokeLinejoin: "round" }, /* @__PURE__ */ React.createElement("path", { d: "M21.5 2v6h-6" }), /* @__PURE__ */ React.createElement("path", { d: "M2.5 22v-6h6" }), /* @__PURE__ */ React.createElement("path", { d: "M21.34 8A10 10 0 0 0 3.8 5.4L2.5 8" }), /* @__PURE__ */ React.createElement("path", { d: "M2.66 16A10 10 0 0 0 20.2 18.6l1.3-2.6" }))), /* @__PURE__ */ React.createElement("h3", { className: "text-2xl font-semibold mb-2" }, "Renewals Intelligence Studio"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600 dark:text-gray-300 mb-6 max-w-lg mx-auto" }, "Monitor renewal momentum, spotlight risk, and track KPI achievement."), /* @__PURE__ */ React.createElement("div", { className: "flex justify-center" }, /* @__PURE__ */ React.createElement(CSVImporter, null))));
