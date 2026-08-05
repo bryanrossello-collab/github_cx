@@ -2,7 +2,10 @@
 
 > Changes since v3.0 (see `/Users/bryan.rossello/Desktop/Renewals Studio/README.md` for full list):
 >
-> * **Mobile-snapshot endpoint removed entirely** (was 501, now 404).
+> * **Mobile-snapshot endpoint removed entirely** (was 501, now 404). The
+>   client-side mobile.html snapshot feature (auto-rebuild effect +
+>   `buildMobileSnapshot` action + `MobileSnapshot` Settings UI) was also
+>   removed in Session 10 — it was dead code POSTing to the 404 route.
 > * **Admin tab** added to the dashboard topbar via `index.html` JS injection (navigates to `/admin`).
 > * **Import CSV button hidden** in the topbar via the same injection.
 > * **CSV uploads now parsed server-side** into `account_snapshots` table on every upload (and on first-boot seed). Module: `app/ingest.py`.
@@ -319,6 +322,189 @@ Session 6 — 2026-08-05 (cache-buster v=20260805c)
   worst ordering for that account could invert (totals still correct).
 ```
 
+```
+Session 7 — 2026-08-05 (cache-buster v=20260805d)
+- User asked for: fix notes export/import so the CS Call vs Renewals Call vs
+  ELT split round-trips (bug: on import everything collapsed to ELT with no
+  split).
+- Root cause: EXPORT-only key mismatch. `confirmExport` in
+  `public/vendor/app.js` (NotesIO) looked up the calls map with the 2-part
+  NOTE key (`accountBase::period`) via `fcByAccount.get(k)`, but the calls
+  map (`useAccountForecasts().byAccount`) is keyed by the 3-part CALL_KEY
+  (`accountBase::period::roundedATR`). Every lookup missed, so every exported
+  `csCall`/`renewalsCall` was null. IMPORT (`restoreCallsFromImport`) was
+  already correct — it rebuilds the 3-part call_key from the matched row and
+  PUTs `cs_forecast`/`renewals_forecast` SEPARATELY to the audited
+  `PUT /api/renewals/account-forecasts/{account_id}` (ELT stays derived =
+  cs+rn). So the "collapse to ELT" was really "export never embedded the
+  split".
+- Fix (frontend-only, `confirmExport`): rebuild the 3-part call_key the same
+  way the inline editor/account card do — from the matched row via
+  `RenewalsCallKeys.buildCallKey(row, hm, settings)`, or from the note's own
+  metadata (`accountId`/`fq`/`atr`) via `buildCallKeyFromParts` when the note
+  doesn't match the current dataset — then look up `fcByAccount.get(callKey)`.
+  Now a note whose account has calls exports non-null `csCall`/`renewalsCall`
+  and `eltCall = cs+rn`.
+- Legacy `djForecast`-only notes (no cs/rn split): `csCall`/`renewalsCall`
+  stay null, `djForecast` is carried verbatim (unchanged wire-key semantics),
+  and `eltCall` now falls back to `djForecast` for reference only (documented
+  in the export payload's `eltCallNote`). Import skips these in
+  `restoreCallsFromImport` (filter requires csCall|renewalsCall non-null), so
+  importing the user's legacy all-null file applies notes + the 20 djForecast
+  ELT overrides WITHOUT wiping any real cs/rn call.
+- Round-trip verified via a Node harness reusing the real
+  `public/vendor/vibe-call-keys.js`: an account with CS+Renewals calls exports
+  distinct csCall=500000/renewalsCall=250000/eltCall=750000, and import emits
+  ONE PUT writing cs_forecast + renewals_forecast separately (call_key
+  001ACME::FY27Q3::1320); a legacy djForecast-only note exports
+  csCall/renewalsCall=null, eltCall=42000, and produces no PUT.
+- Export/import JSON SHAPE unchanged (the `csCall`/`renewalsCall`/`eltCall`
+  fields already existed; they're now correctly populated) and the
+  `/api/renewals/*` contract is untouched. `node --check` clean. No Python
+  change ⇒ NO server restart needed. Cache-buster bumped c → d.
+- Open question / TODO: none. Residual notes — (1) the onboarding wizard's
+  separate notes importer (`onNotesChange`, ~line 8629) still accepts only
+  version 1 and does not restore calls; the primary NotesIO importer is the
+  one that handles v2 + call restore. (2) Unmatched notes export/import their
+  split using exported metadata parts, which round-trips only if the
+  account_id/fq/atr still resolve to the same call_key.
+```
+
+```
+Session 8 — 2026-08-05 (cache-buster v=20260805g)
+- User asked for: fix a notes-import DATA-LOSS bug — a user bulk-deleted notes
+  (tombstones with Date.now()), then re-imported the same JSON; every note was
+  skipped and stayed deleted.
+- Root cause: `importNotes` (`public/vendor/app.js`, ~line 2018) had a
+  tombstone-skip guard `if (deleteTs && incomingTs <= deleteTs) return;`.
+  Re-imported notes carry their ORIGINAL (older) updatedAt, so every key with
+  a fresh tombstone was skipped → notes stayed deleted and re-synced as
+  deletes.
+- Fix (frontend-only, `importNotes`): (1) removed the tombstone-skip guard;
+  (2) a file-import is now authoritative — for a key WITH a tombstone it always
+  restores the note and clears the tombstone (`delete nextDeletes[k]`); (3) the
+  restored note's top-level `updatedAt` is bumped to
+  `max(incomingTs, deleteTs + 1, now)` so it STRICTLY beats both the local and
+  any lingering SERVER tombstone through sync — the client merge skips a note
+  when `tomb >= incomingTs`, and `migrateDeletesObject` prunes a tombstone only
+  when `note.updatedAt > tombstoneTs`, so `deleteTs + 1` (not `deleteTs`) is
+  load-bearing; (4) newer-wins preserved for keys with NO tombstone (guard
+  `if (!hasTomb && next[k] && incomingTs < currentTs) return;`), so an import
+  never downgrades a locally-newer edit. Note `history` is always preserved;
+  only `updatedAt` is bumped.
+- Server behavior (unchanged, confirmed): `note_tombstones` rows are never
+  deleted server-side and are re-sent on every GET (`get_notes`), and the PUT
+  never clears a tombstone — which is exactly why the client bump-to-beat is
+  required. No Python change ⇒ NO server restart.
+- Verified with a Node harness replaying the fixed reducer + the client
+  server-merge + `migrateDeletesObject`: after re-import both notes are
+  restored, the PUT payload's `noteDeletes` is EMPTY, updatedAt > deleteTs,
+  history preserved; after a full server GET/merge with lingering server
+  tombstones both notes survive and `noteDeletes` prunes to empty. Regression
+  check: a plain bulk-delete (no import) still removes the note and sets its
+  tombstone. `node --check` clean. Cache-buster f → g.
+- localStorage backup (`STORAGE_NOTES_BACKUP_KEY`): only a fallback when the
+  persisted notes object is EMPTY (~line 951); it doesn't clear tombstones, so
+  it's not the recovery path here. Primary recovery = apply this fix, then
+  re-import the file.
+- Open question / TODO: none. Residual note — the server keeps tombstones
+  forever; the client prunes them locally after a restore, but the server row
+  persists (harmless, since the note's higher updatedAt always wins).
+```
+
+```
+Session 9 — 2026-08-05 (cache-buster v=20260805h)
+- User asked for: fix a slow main-page reload — even when the Active snapshot is
+  unchanged, reload re-downloaded + re-parsed the ~9.7MB / ~50k-row Active CSV
+  (15-20s) instead of hitting the IndexedDB cache.
+- Root cause (evidence-based): NOT the idb-restore race. The reported
+  "Downloading the latest Active from the server…" overlay is the REFRESH
+  overlay, which only renders when `isRefresh` is true, i.e. cached data is
+  ALREADY present (`stateRef.current.data.length > 0`, app.js ~1408) — so the
+  data WAS restored from IDB and the auto-load's `idbReady` gate (app.js ~1310)
+  already waited for it. The failing condition was the cache identity itself:
+  the fast-path keyed off `uploaded_at` mtime (`info.mtimeMs <= cachedMs`,
+  app.js ~1403; server `renewals.py` data-source/info derived mtime from
+  `uploaded_at`). `uploaded_at`/`id` change on every re-materialize/re-upload
+  even when the CSV BYTES are identical, so `info.mtimeMs > cachedMs` ⇒ needless
+  re-download of unchanged content (suspect #3). Also hardened suspect #2
+  (localStorage `meta` evicted while IDB data survives ⇒ `cachedMs` lost).
+- Delivered: STABLE content-signature cache key = the upload's `sha256`.
+  * Server (Python, additive): `_resolve_latest` now SELECTs `sha256`;
+    `/data-source/info` returns additive `id` + `sha256` (frozen shape otherwise
+    untouched).
+  * Client (`public/vendor/app.js`): `importCSV`/`importHistoricalCSV` take a 4th
+    `sourceSig` arg → store `meta.sourceSig` / `meta.historicalSourceSig` AND
+    write a co-located `IDB_KEY_META`/`IDB_KEY_HIST_META` next to the cached rows
+    so the identity can't diverge if localStorage is evicted (fixes #2). The IDB
+    restore effect reads those meta keys and back-fills any missing
+    uploadedAt/sig into `state.meta` (localStorage-newer value always wins, so an
+    edit is never downgraded). Auto-load parses `info.sig` from data-source/info
+    and passes it to import. New fast-path: if BOTH server+cache expose a sig,
+    equal ⇒ cache hit (skip download) EVEN IF mtime moved; different ⇒
+    re-download; if either sig is absent (old server / local file import / pre-sig
+    cache) it falls back to the prior `mtimeMs <= cachedMs` tolerance. Configs
+    gained `getCachedSig`.
+- Guarantee: unchanged snapshot (identical bytes) always hits the cache
+  regardless of a bumped `uploaded_at`; a genuinely changed snapshot has a
+  different sha256 ⇒ still re-downloads (never serves stale). A stale/mismatched
+  cached sig only ever causes a SAFE extra download, never stale data.
+- Verified: `node --check public/vendor/app.js` + `python3 -m ast` on renewals.py
+  clean; a Node harness replaying the exact predicate + the IDB-meta restore
+  merge passed 9/9 scenarios (unchanged w/ bumped mtime → hit; changed sig →
+  download; no-sig mtime fallback both directions; first load → download;
+  localStorage-lost identity restored from IDB → hit; local-newer identity
+  preserved). Untouched: idbReady gate/first-load retry, empty-state/NoDataBanner,
+  "Restoring your session…" gate, Data-as-of/refresh flows, historical slot.
+- Python changed ⇒ SERVER RESTART REQUIRED (new `id`/`sha256` in data-source/info;
+  without it the client silently uses the mtime fallback). Cache-buster g → h.
+- Open question / TODO: none. Residual notes — (1) manual local-file "Import CSV"
+  has no server sha256, so it stores sig=null and uses the mtime fallback (prior
+  behavior); (2) if a Snowflake "Run now" re-materializes with non-deterministic
+  bytes (reordered rows / embedded run timestamp) the sha256 differs and it
+  re-downloads — treated as "changed", which is the safe direction.
+```
+
+```
+Session 10 — 2026-08-05 (cache-buster v=20260805j)
+- User asked for: fix the in-app Settings (gear panel) Notes importer — the
+  "Import Notes" button "flashed then disappeared" and "Export Notes (0)" read
+  zero despite ~81 notes; the only working import was the /admin JSON page.
+- Root cause of the flash: the DEAD mobile.html snapshot auto-rebuild feature.
+  The removed `/api/renewals/mobile-snapshot` endpoint now 404s, but the client
+  still auto-POSTed to it on EVERY data/notes change (a 4s-debounced effect),
+  churning `snapshotStatus` (building→error) which was in the AppContext value,
+  re-rendering the whole Settings modal and making the Import button flicker.
+- Delivered (frontend-only, `public/vendor/app.js`): removed the feature
+  end-to-end — the `snapshotStatus` state + `_snapshotAutoTimer`/`_lastSnapshotKey`
+  refs, the auto-rebuild `useEffect`, the `buildMobileSnapshot` action, the
+  `MobileSnapshot` component, the Settings "Mobile snapshot" UI block
+  (Rebuild now / Show in Finder / "Auto-rebuilds mobile.html…"), and
+  `snapshotStatus` from the context `value` memo (~314 lines removed). Left the
+  rest of Settings (Export CSV, Export/Import Notes, Preferences, Background)
+  and the generic `revealInFinder` action intact. No backend change (the route
+  already 404s).
+- Delivered (Export count): `NotesIO.totalNotes` was `Object.keys(notes).length`;
+  now counts all `state.notes` keys MINUS tombstones
+  (`Object.keys(notes).filter((k) => !noteDeletes[k])`), mirroring the
+  orphan-aware `NotesHub`/`noteRows` logic, so the badge shows the real total
+  (~81, including imported/orphan notes) and export includes them.
+- Import button: `NotesIO`'s non-headless render (used by the Settings "Notes"
+  section as `NotesIO, null`) unconditionally renders the hidden file input +
+  "Import Notes" + "Export Notes (N)" buttons; it is NOT gated on note count.
+  With the snapshot churn gone the panel stops re-rendering on data/notes
+  changes, so the button stays put. The separate `NotesIO {headless:true}`
+  mount only renders portals (background auto-match) and is unaffected.
+- Verified: `node --check public/vendor/app.js` clean; grep confirms zero
+  remaining `snapshotStatus`/`buildMobileSnapshot`/`MobileSnapshot`/
+  `mobile-snapshot`/`mobile.html` references. Frontend-only ⇒ NO server restart.
+  Cache-buster i → j.
+- Open question / TODO: none. Residual note — export "all" mode still spreads
+  `{ ...notes }`; since deleted notes are removed from `state.notes` on delete
+  (only tombstones remain in `noteDeletes`), this already matches the new
+  tombstone-excluding `totalNotes` in practice.
+```
+
 ---
 
 ## 3. Communication protocol
@@ -495,6 +681,20 @@ Response: `{ ok, savedAt, noteCount, deleteCount }`.
 The server applies each note as an UPSERT with newer-wins (the WHERE
 clause on `updated_at` enforces this). Tombstones are upserted, and any
 matching row in `notes` is hard-deleted in the same transaction.
+
+**Import overrides tombstones (client-side).** A deliberate file-import via
+`importNotes` (`public/vendor/app.js`) is *authoritative*: it always restores
+a note even if a newer tombstone exists in `noteDeletes`, and it clears that
+tombstone. Because the server keeps tombstones forever and re-sends them on
+every GET, the restored note's top-level `updatedAt` is bumped to
+`max(incomingTs, deleteTs + 1, now)` so it **strictly exceeds** the delete
+time — that is the only way the note survives the client server-merge
+(`tomb >= incomingTs` skip) AND gets its lingering tombstone pruned by
+`migrateDeletesObject` (which drops a tombstone only when `note.updatedAt >
+tombstoneTs`). Newer-wins is still honored for keys with NO tombstone (an
+import never downgrades a locally-newer edit). Note `history` is always
+preserved; only the top-level `updatedAt` is bumped. No server change is
+needed for this recovery — it is purely client-side.
 
 ### 5.5 `GET /api/renewals/csv-list`
 

@@ -342,7 +342,7 @@ async def _resolve_latest(conn, match: str) -> Optional[dict]:
 
     if slot_alias:
         row = await conn.fetchrow(
-            "SELECT id, slot, filename, size_bytes, content_type, uploaded_at "
+            "SELECT id, slot, filename, size_bytes, content_type, sha256, uploaded_at "
             "FROM csv_uploads WHERE slot = $1 "
             "ORDER BY uploaded_at DESC LIMIT 1",
             slot_alias,
@@ -353,7 +353,7 @@ async def _resolve_latest(conn, match: str) -> Optional[dict]:
         # caller passing the literal text still has a chance.
     if normalised:
         row = await conn.fetchrow(
-            "SELECT id, slot, filename, size_bytes, content_type, uploaded_at "
+            "SELECT id, slot, filename, size_bytes, content_type, sha256, uploaded_at "
             "FROM csv_uploads "
             "WHERE LOWER(filename) LIKE '%' || LOWER($1) || '%' "
             "ORDER BY uploaded_at DESC LIMIT 1",
@@ -361,7 +361,7 @@ async def _resolve_latest(conn, match: str) -> Optional[dict]:
         )
     else:
         row = await conn.fetchrow(
-            "SELECT id, slot, filename, size_bytes, content_type, uploaded_at "
+            "SELECT id, slot, filename, size_bytes, content_type, sha256, uploaded_at "
             "FROM csv_uploads ORDER BY uploaded_at DESC LIMIT 1"
         )
     return dict(row) if row else None
@@ -384,6 +384,14 @@ async def data_source_info(request: Request, match: str = "") -> dict:
         "mtimeMs": int(latest["uploaded_at"].timestamp() * 1000),
         "format": "csv",
         "slot": latest["slot"],
+        # `id` and `sha256` let the client cache off a STABLE snapshot
+        # identity instead of `uploaded_at` (which changes on every
+        # re-materialize/re-upload even when the CSV bytes are identical).
+        # sha256 is the content hash stored at upload time; the dashboard
+        # uses it to skip re-downloading an unchanged snapshot. Additive
+        # keys only — the frozen shape is otherwise unchanged.
+        "id": int(latest["id"]),
+        "sha256": latest.get("sha256"),
     }
 
 

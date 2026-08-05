@@ -154,6 +154,8 @@ const IDB_KEY_HM = "active_hm";
 const IDB_KEY_HEADERS = "active_headers";
 const IDB_KEY_HIST = "historical_data";
 const IDB_KEY_HIST_HM = "historical_hm";
+const IDB_KEY_META = "active_meta";
+const IDB_KEY_HIST_META = "historical_meta";
 const MAX_NOTE_HISTORY = 20;
 const normalizeThemeValue = (value) => {
   if (value === "true" || value === "dark") return "dark";
@@ -1107,30 +1109,59 @@ function AppProvider({ children }) {
     (async () => {
       try {
         const updates = {};
+        let activeMeta = null;
+        let histMeta = null;
         if (!hasActiveData) {
-          const [d, hm, h] = await Promise.all([
+          const [d, hm, h, m] = await Promise.all([
             idbGet(IDB_KEY_DATA).catch(() => null),
             idbGet(IDB_KEY_HM).catch(() => null),
-            idbGet(IDB_KEY_HEADERS).catch(() => null)
+            idbGet(IDB_KEY_HEADERS).catch(() => null),
+            idbGet(IDB_KEY_META).catch(() => null)
           ]);
           if (Array.isArray(d) && d.length) {
             updates.data = d;
             if (hm) updates.headerMap = hm;
             if (Array.isArray(h)) updates.headers = h;
+            if (m && typeof m === "object") activeMeta = m;
           }
         }
         if (!hasHistData) {
-          const [hd, hhm] = await Promise.all([
+          const [hd, hhm, hm] = await Promise.all([
             idbGet(IDB_KEY_HIST).catch(() => null),
-            idbGet(IDB_KEY_HIST_HM).catch(() => null)
+            idbGet(IDB_KEY_HIST_HM).catch(() => null),
+            idbGet(IDB_KEY_HIST_META).catch(() => null)
           ]);
           if (Array.isArray(hd) && hd.length) {
             updates.historicalData = hd;
             if (hhm) updates.historicalHeaderMap = hhm;
+            if (hm && typeof hm === "object") histMeta = hm;
           }
         }
         if (!cancelled && Object.keys(updates).length > 0) {
-          setState((prev) => ({ ...prev, ...updates }));
+          setState((prev) => {
+            const next = { ...prev, ...updates };
+            // When we restore the cached rows from IDB, also make sure the
+            // cache IDENTITY (uploadedAt + content signature) is present in
+            // meta. localStorage.meta normally already carries these, but if
+            // localStorage was evicted while IDB survived, the identity would
+            // otherwise be lost (cachedMs/cachedSig = 0/null) and the app
+            // would needlessly re-download despite having the data. Prefer any
+            // existing localStorage value and only fall back to the IDB-copy,
+            // so a locally-newer identity is never downgraded.
+            if ((activeMeta || histMeta)) {
+              const meta = { ...prev.meta };
+              if (activeMeta && updates.data) {
+                if (meta.uploadedAt == null && activeMeta.uploadedAt != null) meta.uploadedAt = activeMeta.uploadedAt;
+                if (meta.sourceSig == null && activeMeta.sourceSig != null) meta.sourceSig = activeMeta.sourceSig;
+              }
+              if (histMeta && updates.historicalData) {
+                if (meta.historicalUploadedAt == null && histMeta.uploadedAt != null) meta.historicalUploadedAt = histMeta.uploadedAt;
+                if (meta.historicalSourceSig == null && histMeta.sourceSig != null) meta.historicalSourceSig = histMeta.sourceSig;
+              }
+              next.meta = meta;
+            }
+            return next;
+          });
         }
       } catch {
       }
@@ -1145,11 +1176,8 @@ function AppProvider({ children }) {
   const [serverSyncStatus, setServerSyncStatus] = useState("idle");
   const [csvAutoLoadStatus, setCsvAutoLoadStatus] = useState("idle");
   const [refreshState, setRefreshState] = useState(null);
-  const [snapshotStatus, setSnapshotStatus] = useState({ phase: "idle" });
   const _notesPutTimer = useRef(null);
   const _notesLastPut = useRef(null);
-  const _snapshotAutoTimer = useRef(null);
-  const _lastSnapshotKey = useRef(null);
   const _autoLoadClaimed = useRef(false);
   const stateRef = useRef(state);
   useEffect(() => {
@@ -1314,7 +1342,7 @@ function AppProvider({ children }) {
     let cancelled = false;
     setCsvAutoLoadStatus("pending");
     const processSlot = (config) => new Promise((resolve) => {
-      const { slot, label, matchSubstring, fallbackToCsvList, getCachedMs, hasData, importFnName, suppressActiveError } = config;
+      const { slot, label, matchSubstring, fallbackToCsvList, getCachedMs, getCachedSig, hasData, importFnName, suppressActiveError } = config;
       // Only flips the visible status (and thus the splash) to "error" when we
       // are NOT going to retry. During retry attempts suppressActiveError is
       // true, so the status stays "pending" and the gate keeps showing the
@@ -1335,6 +1363,11 @@ function AppProvider({ children }) {
                 fetchUrl: matchSubstring ? `/api/renewals/data-source/file?match=${encodeURIComponent(matchSubstring)}` : "/api/renewals/data-source/file",
                 filename: dsInfo.filename,
                 mtimeMs: Number.isFinite(ms) ? ms : 0,
+                // Stable content identity: sha256 of the CSV bytes. Unlike
+                // mtime/id, it does NOT change when the same snapshot is
+                // re-materialized/re-uploaded, so an unchanged snapshot keeps
+                // hitting the cache.
+                sig: dsInfo.sha256 || null,
                 origin: "data-source"
               };
             }
@@ -1363,10 +1396,30 @@ function AppProvider({ children }) {
         }
         const cur = stateRef.current || {};
         const cachedMs = getCachedMs(cur);
+        const cachedSig = getCachedSig(cur);
         const haveData = hasData(cur);
-        if (haveData && info.mtimeMs && cachedMs && info.mtimeMs <= cachedMs) {
-          if (slot === "active") setCsvAutoLoadStatus("loaded");
-          return resolve(true);
+        // Cache fast-path: skip the (9.7MB / ~50k-row) download+parse when the
+        // cached snapshot is unchanged.
+        //   1) Primary — content signature (sha256). If BOTH the server and the
+        //      cache expose a signature, they are authoritative: equal => the
+        //      bytes are identical => use the cache (even if `uploaded_at`/id
+        //      moved because the snapshot was re-materialized). Different => the
+        //      snapshot genuinely changed => fall through and re-download.
+        //   2) Fallback — mtime tolerance, used ONLY when a signature is
+        //      unavailable on either side (older server without sha256, or a
+        //      cache written before signatures existed / a local file import).
+        //      Preserves the previous behavior for those paths.
+        if (haveData) {
+          if (info.sig && cachedSig) {
+            if (info.sig === cachedSig) {
+              if (slot === "active") setCsvAutoLoadStatus("loaded");
+              return resolve(true);
+            }
+            // signatures differ => changed snapshot => re-download below.
+          } else if (info.mtimeMs && cachedMs && info.mtimeMs <= cachedMs) {
+            if (slot === "active") setCsvAutoLoadStatus("loaded");
+            return resolve(true);
+          }
         }
         const activeCur = stateRef.current || {};
         const dashboardUp = Array.isArray(activeCur.data) && activeCur.data.length > 0;
@@ -1414,7 +1467,7 @@ function AppProvider({ children }) {
                   try {
                     const fn = window.__renewalsActions?.[importFnName];
                     if (fn) {
-                      fn(rows, headers, info.mtimeMs || Date.now());
+                      fn(rows, headers, info.mtimeMs || Date.now(), info.sig || null);
                       if (slot === "active") setCsvAutoLoadStatus("loaded");
                       if (isRefresh) {
                         setRefreshState((prev) => prev ? { ...prev, phase: "done", rowCount: rows.length } : prev);
@@ -1465,6 +1518,7 @@ function AppProvider({ children }) {
         matchSubstring: "2026 data",
         fallbackToCsvList: true,
         getCachedMs: (cur) => Number(cur.meta?.uploadedAt) || 0,
+        getCachedSig: (cur) => cur.meta?.sourceSig || null,
         hasData: (cur) => Array.isArray(cur.data) && cur.data.length > 0,
         importFnName: "importCSV"
       };
@@ -1492,6 +1546,7 @@ function AppProvider({ children }) {
         matchSubstring: "historical fy27",
         fallbackToCsvList: false,
         getCachedMs: (cur) => Number(cur.meta?.historicalUploadedAt) || 0,
+        getCachedSig: (cur) => cur.meta?.historicalSourceSig || null,
         hasData: (cur) => Array.isArray(cur.historicalData) && cur.historicalData.length > 0,
         importFnName: "importHistoricalCSV"
       });
@@ -1500,37 +1555,6 @@ function AppProvider({ children }) {
       cancelled = true;
     };
   }, [serverInfo, idbReady]);
-  useEffect(() => {
-    if (!serverInfo?.ok || !idbReady || !serverNotesLoaded) return;
-    if (!Array.isArray(state.data) || state.data.length === 0) return;
-    let key;
-    try {
-      key = JSON.stringify({
-        u: state.meta?.uploadedAt || 0,
-        len: state.data.length,
-        atrField: state.settings?.atrField || null,
-        buField: state.settings?.buField || null,
-        notes: state.notes || {},
-        noteDeletes: state.noteDeletes || {},
-        rateTargets: state.rateTargets || {},
-        ccData: state.ccData || {},
-        expansionTargets: state.expansionTargets || {},
-        histLen: (state.historicalData || []).length
-      });
-    } catch {
-      return;
-    }
-    if (key === _lastSnapshotKey.current) return;
-    clearTimeout(_snapshotAutoTimer.current);
-    _snapshotAutoTimer.current = setTimeout(async () => {
-      try {
-        const r = await window.__renewalsActions?.buildMobileSnapshot?.({ auto: true });
-        if (r && r.ok) _lastSnapshotKey.current = key;
-      } catch {
-      }
-    }, 4e3);
-    return () => clearTimeout(_snapshotAutoTimer.current);
-  }, [serverInfo, idbReady, serverNotesLoaded, state.data, state.notes, state.noteDeletes, state.settings, state.meta?.uploadedAt, state.rateTargets, state.ccData, state.expansionTargets, state.historicalData]);
   const actions = useMemo(() => ({
     setTheme,
     setBgTheme,
@@ -1572,239 +1596,7 @@ function AppProvider({ children }) {
         return false;
       }
     },
-    // Build the read-only mobile.html snapshot in the synced folder.
-    // Drive Desktop will sync it to the cloud; the iOS Drive app can then
-    // open it offline anywhere. Server-mode only.
-    // Pass `{ auto: true }` from the AppProvider auto-rebuild effect so
-    // guard-rail returns stay silent (no spurious red error pill) and
-    // the status panel can label the build as automatic.
-    buildMobileSnapshot: async (options) => {
-      const auto = !!(options && options.auto);
-      if (typeof window === "undefined" || window.location?.protocol === "file:") {
-        const reason = "Server is not running \u2014 start the local server first.";
-        if (!auto) setSnapshotStatus({ phase: "error", error: reason, auto });
-        return { ok: false, reason };
-      }
-      const cur = stateRef.current || {};
-      const data = cur.data || [];
-      if (!data.length) {
-        const reason = "Load a CSV first \u2014 there is nothing to snapshot.";
-        if (!auto) setSnapshotStatus({ phase: "error", error: reason, auto });
-        return { ok: false, reason };
-      }
-      setSnapshotStatus({ phase: "building", auto });
-      try {
-        const hm = cur.headerMap || {};
-        const settings = cur.settings || {};
-        const notes = cur.notes || {};
-        const atrKey = getAtrKey(hm, settings);
-        const buKey = getBuKey(hm, settings);
-        const ltgKey = hm.ATR_LTG || "ATR_ARR_USD_LTG";
-        const ownerKey = hm.OWNER_NAME || "OWNER_NAME";
-        const regionKey = hm.REGION || "REGION";
-        const countryKey = hm.BILLING_COUNTRY || "BILLING_COUNTRY";
-        const segmentKey = hm.SEGMENT || "SEGMENT";
-        const industryKey = hm.INDUSTRY_TERRITORY || "TERRITORY_INDUSTRY_C";
-        const partnerKey = hm.PARTNER || "PARTNER";
-        const partnerTypeKey = hm.PARTNER_TYPE_C || "PARTNER_TYPE_C";
-        const healthKey = hm.HEALTH || "CRM_HEALTH_STATUS";
-        const dateKey = hm.NEXT_RENEWAL_DATE || "NEXT_RENEWAL_DATE";
-        const accountIdKey = hm.ACCOUNT_ID || "CRM_ACCOUNT_ID";
-        const accountNameKey = hm.ACCOUNT_NAME || "CRM_ACCOUNT_NAME";
-        const expansionKey = hm.EXPANSION || "EXPANSION";
-        const rows = [];
-        for (let i = 0; i < data.length; i++) {
-          const r = data[i];
-          const atr = toNumber(r[atrKey]);
-          if (!(atr > 0)) continue;
-          const noteKey = r.__noteKey;
-          const note = noteKey ? notes[noteKey] : null;
-          const isLiveNote = note && !note.archived;
-          const noteText = isLiveNote ? safeString(note.note) : "";
-          const djFc = isLiveNote && note.djForecast != null && isFinite(note.djForecast) ? Number(note.djForecast) : null;
-          rows.push({
-            id: r.__uid || `r${i}`,
-            name: safeString(r[accountNameKey]),
-            accountId: safeString(r[accountIdKey]),
-            owner: safeString(r[ownerKey]),
-            region: safeString(r[regionKey]),
-            country: safeString(r[countryKey]),
-            segment: safeString(r[segmentKey]),
-            industry: safeString(r[industryKey]),
-            partner: safeString(r[partnerKey]),
-            partnerType: safeString(r[partnerTypeKey]),
-            products: Array.isArray(r.__products) ? r.__products.slice(0, 12) : [],
-            fq: safeString(r.FISCAL_QUARTER || r.YEAR_QUARTER),
-            // Band tag for the mobile filter — same threshold the
-            // Report tab uses on the laptop ($100K is the dividing line
-            // between "high-value" and "long-tail" renewals).
-            band: atr > 1e5 ? "over100k" : "under100k",
-            renewalDate: safeString(r[dateKey]),
-            atr: Math.round(atr),
-            buFc: Math.round(toNumber(r[buKey]) || 0),
-            atrLtg: Math.round(toNumber(r[ltgKey]) || 0),
-            djFc: djFc != null ? Math.round(djFc) : null,
-            health: safeString(r[healthKey]),
-            note: noteText,
-            noteUpdatedAt: isLiveNote ? note.updatedAt || null : null
-          });
-        }
-        const histData = cur.historicalData || [];
-        const histHM = cur.historicalHeaderMap || {};
-        const histQKey = histHM.FISCAL_QUARTER || histHM.YEAR_QUARTER || "FISCAL_QUARTER";
-        const histAtrKey = histHM.ATR_STARTING || "ATR_ARR_USD_STARTING";
-        const histCcKey = histHM.CC || "CC";
-        const histExpKey = histHM.EXPANSION || "EXPANSION";
-        const rateTargets = cur.rateTargets || {};
-        const ccDataMap = cur.ccData || {};
-        const HARDCODED_EXPANSION = { "FY27Q1": 5883870, "FY27Q2": 7477756, "FY27Q3": 7277845, "FY27Q4": 6375543 };
-        const expansionTargets = { ...cur.expansionTargets || {}, ...HARDCODED_EXPANSION };
-        const fcByQ = {};
-        const djByQ = {};
-        const ensureBuckets = (m, q) => {
-          if (!m[q]) m[q] = { all: { atr: 0, bu: 0, exp: 0, dj: 0, djCount: 0, count: 0 }, over100k: { atr: 0, bu: 0, exp: 0, dj: 0, djCount: 0, count: 0 }, under100k: { atr: 0, bu: 0, exp: 0, dj: 0, djCount: 0, count: 0 } };
-          return m[q];
-        };
-        for (let i = 0; i < data.length; i++) {
-          const r = data[i];
-          const atr = toNumber(r[atrKey]);
-          if (!(atr > 0)) continue;
-          const q = safeString(r.FISCAL_QUARTER || r.YEAR_QUARTER);
-          if (!q || parseFiscalLabel(q).fy === 0) continue;
-          const bu = toNumber(r[buKey]) || 0;
-          const exp = toNumber(r[expansionKey]) || 0;
-          const note = r.__noteKey ? notes[r.__noteKey] : null;
-          const dj = note && !note.archived && note.djForecast != null && isFinite(toNumber(note.djForecast)) ? toNumber(note.djForecast) : null;
-          const djVal = dj != null ? dj : bu;
-          const buckets = ensureBuckets(fcByQ, q);
-          const tgt = atr > 1e5 ? buckets.over100k : buckets.under100k;
-          [buckets.all, tgt].forEach((b) => {
-            b.atr += atr;
-            b.bu += bu;
-            b.exp += exp;
-            b.dj += djVal;
-            b.count++;
-            if (dj != null) b.djCount++;
-          });
-        }
-        const actByQ = {};
-        for (let i = 0; i < histData.length; i++) {
-          const r = histData[i];
-          const q = safeString(r[histQKey]);
-          if (!q || !isCurrentOrPastQuarter(q)) continue;
-          const atr = toNumber(r[histAtrKey]) || 0;
-          const cc = toNumber(r[histCcKey]) || 0;
-          const exp = toNumber(r[histExpKey]) || 0;
-          if (atr <= 0 && cc <= 0 && exp <= 0) continue;
-          if (!actByQ[q]) actByQ[q] = { all: { atr: 0, cc: 0, exp: 0, count: 0 }, over100k: { atr: 0, cc: 0, exp: 0, count: 0 }, under100k: { atr: 0, cc: 0, exp: 0, count: 0 } };
-          const buckets = actByQ[q];
-          const isOver = atr > 1e5;
-          [buckets.all, isOver ? buckets.over100k : buckets.under100k].forEach((b) => {
-            b.atr += atr;
-            b.cc += cc;
-            b.exp += exp;
-            b.count++;
-          });
-        }
-        const quarterSet = new Set([...Object.keys(fcByQ), ...Object.keys(actByQ)].filter((q) => q && parseFiscalLabel(q).fy > 0));
-        const quarterList = [...quarterSet].sort((a, b) => {
-          const pa = parseFiscalLabel(a), pb = parseFiscalLabel(b);
-          return pa.fy !== pb.fy ? pa.fy - pb.fy : pa.fq - pb.fq;
-        });
-        const buildBandReport = (bandKey) => {
-          return quarterList.map((q) => {
-            const fc = fcByQ[q]?.[bandKey] || { atr: 0, bu: 0, exp: 0, dj: 0, djCount: 0, count: 0 };
-            const act = actByQ[q]?.[bandKey] || null;
-            const ccData = ccDataMap[q] || {};
-            const ccActual = act?.cc || 0;
-            const buFc = fc.bu || 0;
-            const ccExpected = ccActual + buFc;
-            const qAtr = act?.atr > 0 ? act.atr : fc.atr;
-            const expVal = act?.exp > 0 ? act.exp : fc.exp;
-            const rate = qAtr > 0 ? (qAtr - ccExpected) / qAtr * 100 : null;
-            const rt = rateTargets[q] != null ? rateTargets[q] : null;
-            const vRate = rate != null && rt != null ? rate - rt : null;
-            const attain = rate != null && rt != null && rt > 0 ? rate / rt * 100 : null;
-            const payout = getPayoutPct(attain);
-            const status = vRate == null ? "pending" : vRate >= 0 ? "above" : vRate >= -2 ? "near" : "below";
-            const expTarget = expansionTargets[q] != null ? expansionTargets[q] : null;
-            const vExp = expTarget != null && expVal > 0 ? expVal - expTarget : null;
-            const regionalTarget = ccData.regional || 0;
-            const djCall = ccData.dj != null ? ccData.dj : fc.dj || 0;
-            return {
-              q,
-              atr: Math.round(qAtr),
-              bu: Math.round(buFc),
-              ccActual: Math.round(ccActual),
-              ccExpected: Math.round(ccExpected),
-              djCall: Math.round(djCall),
-              djCount: fc.djCount || 0,
-              rate: rate != null ? Math.round(rate * 10) / 10 : null,
-              rateTarget: rt,
-              vRateTarget: vRate != null ? Math.round(vRate * 10) / 10 : null,
-              attain: attain != null ? Math.round(attain * 10) / 10 : null,
-              payout,
-              status,
-              exp: Math.round(expVal),
-              expTarget: expTarget != null ? Math.round(expTarget) : null,
-              vExpTarget: vExp != null ? Math.round(vExp) : null,
-              regionalTarget: Math.round(regionalTarget),
-              hasHist: !!act,
-              count: fc.count || 0
-            };
-          });
-        };
-        const report = {
-          quarters: quarterList,
-          perBand: {
-            all: buildBandReport("all"),
-            over100k: buildBandReport("over100k"),
-            under100k: buildBandReport("under100k")
-          }
-        };
-        const noteCount = Object.values(notes).filter((n) => n && !n.archived && (n.note || n.djForecast != null)).length;
-        const payload = {
-          meta: {
-            title: "Renewals snapshot",
-            generatedAt: Date.now(),
-            generatedAtIso: (/* @__PURE__ */ new Date()).toISOString(),
-            csvName: cur.meta?.fileName || null,
-            csvMtime: cur.meta?.uploadedAt || null,
-            rowCount: rows.length,
-            noteCount,
-            quarters: quarterList,
-            hasHistorical: histData.length > 0,
-            appVersion: typeof APP_VERSION === "string" ? APP_VERSION : null
-          },
-          rows,
-          report
-        };
-        const res = await fetch("/api/renewals/mobile-snapshot", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const json = await res.json().catch(() => ({}));
-        if (!res.ok || !json?.ok) {
-          const err = json?.error || "snapshot build failed: " + res.status;
-          setSnapshotStatus({ phase: "error", error: err, auto });
-          return { ok: false, reason: err };
-        }
-        setSnapshotStatus({
-          phase: "ok",
-          size: json.size,
-          rowCount: json.rowCount,
-          savedAt: json.savedAt,
-          auto
-        });
-        return { ok: true, ...json };
-      } catch (err) {
-        const msg = err?.message || String(err);
-        setSnapshotStatus({ phase: "error", error: msg, auto });
-        return { ok: false, reason: msg };
-      }
-    },
-    importCSV: (rows, headers, uploadedAtMs) => {
+    importCSV: (rows, headers, uploadedAtMs, sourceSig) => {
       headers = trimHeaders(headers);
       for (let i = 0; i < (rows || []).length; i++) trimRow(rows[i]);
       const headerMap = buildHeaderMap(headers);
@@ -1854,18 +1646,25 @@ function AppProvider({ children }) {
         FISCAL_YEAR: headerMap.FISCAL_YEAR || "FISCAL_YEAR",
         FISCAL_QUARTER: headerMap.FISCAL_QUARTER || "FISCAL_QUARTER"
       };
+      const activeStamp = uploadedAtMs || Date.now();
+      const activeSig = sourceSig || null;
       setState((s) => ({
         ...s,
         data: enrichedMerged,
         headers,
         headerMap: finalHM,
-        meta: { ...s.meta, uploadedAt: uploadedAtMs || Date.now() }
+        meta: { ...s.meta, uploadedAt: activeStamp, sourceSig: activeSig }
       }));
       idbSet(IDB_KEY_DATA, enrichedMerged).catch(() => {
       });
       idbSet(IDB_KEY_HM, finalHM).catch(() => {
       });
       idbSet(IDB_KEY_HEADERS, headers).catch(() => {
+      });
+      // Co-locate the cache identity (stamp + content signature) with the
+      // cached rows in IDB so it can NEVER diverge from the data even if
+      // localStorage (which also holds meta) is evicted independently.
+      idbSet(IDB_KEY_META, { uploadedAt: activeStamp, sourceSig: activeSig }).catch(() => {
       });
     },
     updateRow: (id, updates) => setState((s) => ({
@@ -1908,7 +1707,7 @@ function AppProvider({ children }) {
       } catch {
       }
     },
-    importHistoricalCSV: (rows, headers, uploadedAtMs) => {
+    importHistoricalCSV: (rows, headers, uploadedAtMs, sourceSig) => {
       headers = trimHeaders(headers);
       for (let i = 0; i < (rows || []).length; i++) trimRow(rows[i]);
       const hm = buildHeaderMap(headers);
@@ -1944,15 +1743,18 @@ function AppProvider({ children }) {
         };
       });
       const stamp = Number(uploadedAtMs) || Date.now();
+      const histSig = sourceSig || null;
       setState((s) => ({
         ...s,
         historicalData: enriched,
         historicalHeaderMap: hm,
-        meta: { ...s.meta, historicalUploadedAt: stamp }
+        meta: { ...s.meta, historicalUploadedAt: stamp, historicalSourceSig: histSig }
       }));
       idbSet(IDB_KEY_HIST, enriched).catch(() => {
       });
       idbSet(IDB_KEY_HIST_HM, hm).catch(() => {
+      });
+      idbSet(IDB_KEY_HIST_META, { uploadedAt: stamp, sourceSig: histSig }).catch(() => {
       });
     },
     clearHistoricalData: () => {
@@ -2018,27 +1820,42 @@ function AppProvider({ children }) {
     importNotes: (notesObj) => setState((s) => {
       const next = { ...s.notes || {} };
       const nextDeletes = { ...s.noteDeletes || {} };
+      const now = Date.now();
       Object.entries(notesObj || {}).forEach(([k, v]) => {
         if (!k || typeof v !== "object") return;
         const rawTs = Number(v.updatedAt);
         const incomingTs = isFinite(rawTs) && rawTs > 0 ? rawTs : 0;
-        const effectiveTs = incomingTs || Date.now();
         const deleteTs = Number(nextDeletes[k]) || 0;
-        if (deleteTs && incomingTs <= deleteTs) return;
+        const hasTomb = deleteTs > 0;
         const currentTs = Number(next[k]?.updatedAt) || 0;
-        if (!next[k] || incomingTs >= currentTs) {
-          const incomingHist = Array.isArray(v.history) ? v.history : [];
-          const existingHist = next[k] ? Array.isArray(next[k].history) ? next[k].history : [] : [];
-          const seen = /* @__PURE__ */ new Set();
-          const mergedHistory = [...incomingHist, ...existingHist].filter((h) => {
-            const key = String(h.timestamp);
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-          }).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).slice(0, MAX_NOTE_HISTORY);
-          next[k] = { ...v, updatedAt: effectiveTs, history: mergedHistory };
-          if (nextDeletes[k]) delete nextDeletes[k];
-        }
+        // A deliberate file-import is AUTHORITATIVE: it always restores a note
+        // that was previously deleted (tombstoned), regardless of the note's
+        // original (older) updatedAt. Previously the tombstone-skip guard
+        // (`if (deleteTs && incomingTs <= deleteTs) return`) dropped every
+        // re-imported note when the user had bulk-deleted first, so the notes
+        // stayed deleted and re-synced as deletes. We only apply newer-wins
+        // when there is NO tombstone, so we never downgrade a locally-newer
+        // edit for a key the user did not delete.
+        if (!hasTomb && next[k] && incomingTs < currentTs) return;
+        const incomingHist = Array.isArray(v.history) ? v.history : [];
+        const existingHist = next[k] ? Array.isArray(next[k].history) ? next[k].history : [] : [];
+        const seen = /* @__PURE__ */ new Set();
+        const mergedHistory = [...incomingHist, ...existingHist].filter((h) => {
+          const key = String(h.timestamp);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        }).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).slice(0, MAX_NOTE_HISTORY);
+        // When restoring over a tombstone, the note must beat BOTH the local
+        // tombstone AND any lingering SERVER tombstone through the sync/merge:
+        // the server keeps tombstones forever and re-sends them on GET, and the
+        // client merge (and migrateDeletesObject) only lets a note survive /
+        // prune the tombstone when its updatedAt STRICTLY exceeds the delete
+        // time. So bump updatedAt to max(incomingTs, deleteTs + 1, now).
+        // Otherwise preserve the note's own timestamp (history is always kept).
+        const effectiveTs = hasTomb ? Math.max(incomingTs, deleteTs + 1, now) : (incomingTs || now);
+        next[k] = { ...v, updatedAt: effectiveTs, history: mergedHistory };
+        if (nextDeletes[k]) delete nextDeletes[k];
       });
       return { ...s, notes: next, noteDeletes: nextDeletes };
     }),
@@ -2053,6 +1870,18 @@ function AppProvider({ children }) {
       }
       if (deletes[toKey]) delete deletes[toKey];
       return { ...s, notes: next, noteDeletes: deletes };
+    }),
+    deleteNotes: (noteKeys) => setState((s) => {
+      const keys = Array.isArray(noteKeys) ? noteKeys.filter(Boolean) : [];
+      if (!keys.length) return s;
+      const next = { ...s.notes || {} };
+      const nextDeletes = { ...s.noteDeletes || {} };
+      const now = Date.now();
+      keys.forEach((k) => {
+        delete next[k];
+        nextDeletes[k] = now;
+      });
+      return { ...s, notes: next, noteDeletes: nextDeletes };
     })
   }), [setTheme, setState]);
   useEffect(() => {
@@ -2080,7 +1909,7 @@ function AppProvider({ children }) {
     return { rollupRows, accountRollups, touchByAccount };
   }, [state.data, state.headerMap, state.settings]);
   const dismissRefreshState = useCallback(() => setRefreshState(null), []);
-  const value = useMemo(() => ({ theme, bgTheme, state, actions, idbReady, serverInfo, serverSyncStatus, csvAutoLoadStatus, refreshState, dismissRefreshState, snapshotStatus, accountMeta }), [theme, bgTheme, state, actions, idbReady, serverInfo, serverSyncStatus, csvAutoLoadStatus, refreshState, dismissRefreshState, snapshotStatus, accountMeta]);
+  const value = useMemo(() => ({ theme, bgTheme, state, actions, idbReady, serverInfo, serverSyncStatus, csvAutoLoadStatus, refreshState, dismissRefreshState, accountMeta }), [theme, bgTheme, state, actions, idbReady, serverInfo, serverSyncStatus, csvAutoLoadStatus, refreshState, dismissRefreshState, accountMeta]);
   return /* @__PURE__ */ React.createElement(AppContext.Provider, { value }, children);
 }
 function CSVImporter() {
@@ -2103,7 +1932,12 @@ function NotesIO({ headless = false }) {
   const { byAccount: fcByAccount } = useAccountForecasts();
   const inputRef = useRef(null);
   const notes = state.notes || {};
-  const totalNotes = Object.keys(notes).length;
+  const noteDeletes = state.noteDeletes || {};
+  // Count ALL notes present in state (matched + orphan/imported), excluding
+  // only tombstoned keys — mirrors the orphan-aware logic in NotesHub/noteRows
+  // so the "Export Notes (N)" badge shows the real total (and export includes
+  // orphan notes) instead of dropping to 0 when no rows are loaded.
+  const totalNotes = Object.keys(notes).filter((k) => !noteDeletes[k]).length;
   const [exportMode, setExportMode] = useState("all");
   const [showExportReview, setShowExportReview] = useState(false);
   const [exportSearch, setExportSearch] = useState("");
@@ -2609,15 +2443,39 @@ ${sourceText}`;
       alert("No notes to export");
       return;
     }
+    const exportSettings = state.settings || {};
     const notesWithCalls = {};
     Object.entries(exportNotes).forEach(([k, v]) => {
-      const fc = fcByAccount && fcByAccount.get ? fcByAccount.get(k) : null;
+      // Calls live in fcByAccount keyed by the 3-part call_key
+      // (accountBase::period::roundedATR), NOT the 2-part note key
+      // (accountBase::period). Looking up by the bare note key `k` always
+      // missed, which is why every csCall/renewalsCall exported as null.
+      // Rebuild the 3-part call_key exactly like the inline editor / account
+      // card do (from the matched row, or from the note's own metadata when
+      // the note doesn't match the current dataset) before looking it up.
+      let callKey = null;
+      const row = rowsByNoteKey.get(k);
+      if (row && typeof RenewalsCallKeys !== "undefined") {
+        callKey = RenewalsCallKeys.buildCallKey(row, hm, exportSettings);
+      } else if (typeof RenewalsCallKeys !== "undefined") {
+        const parts = String(k).split("::");
+        const acctBase = safeString(v.accountId) || parts[0] || "";
+        const yq = parts[1] || safeString(v.fq) || "";
+        const atrNum = Math.round(toNumber(v.atr));
+        callKey = RenewalsCallKeys.buildCallKeyFromParts(acctBase, safeString(v.accountName), yq, isFinite(atrNum) ? atrNum : 0);
+      }
+      const fc = callKey && fcByAccount && fcByAccount.get ? fcByAccount.get(callKey) : null;
       const cs = fc && fc.cs_forecast != null && isFinite(toNumber(fc.cs_forecast)) ? toNumber(fc.cs_forecast) : null;
       const rn = fc && fc.renewals_forecast != null && isFinite(toNumber(fc.renewals_forecast)) ? toNumber(fc.renewals_forecast) : null;
+      // Legacy ELT override (single djForecast, no CS/Renewals split): reflect
+      // it into eltCall for reference when there is no live split. csCall /
+      // renewalsCall stay null (there is genuinely no split), and djForecast is
+      // still carried on the note verbatim for back-compat.
+      const legacyDj = v.djForecast != null && isFinite(toNumber(v.djForecast)) ? toNumber(v.djForecast) : null;
       const out = { ...v };
       out.csCall = cs;
       out.renewalsCall = rn;
-      out.eltCall = cs != null || rn != null ? (cs || 0) + (rn || 0) : null;
+      out.eltCall = cs != null || rn != null ? (cs || 0) + (rn || 0) : legacyDj;
       notesWithCalls[k] = out;
     });
     const payload = {
@@ -2625,7 +2483,7 @@ ${sourceText}`;
       exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
       totalNotes: exportedTotal,
       exportMode,
-      eltCallNote: "eltCall is derived (csCall + renewalsCall) and recomputed by the app on import; it is included for reference only.",
+      eltCallNote: "eltCall is derived (csCall + renewalsCall) and recomputed by the app on import; it is reference-only. When a note has no live CS/Renewals split, eltCall falls back to the legacy djForecast ELT override (csCall/renewalsCall stay null and djForecast is preserved verbatim).",
       notes: notesWithCalls
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -4313,54 +4171,6 @@ function ServerStatusPill({ serverInfo, status }) {
     cfg.text
   ) : /* @__PURE__ */ React.createElement("span", { className: "pill text-[10px]", title: cfg.title, style: { display: "inline-flex", alignItems: "center", gap: "0.35rem" } }, /* @__PURE__ */ React.createElement("span", { style: { width: 6, height: 6, borderRadius: "50%", background: cfg.dot, display: "inline-block" } }), cfg.text), modal);
 }
-function MobileSnapshot() {
-  const { actions, state, serverInfo, snapshotStatus } = useApp();
-  const hasData = (state?.data?.length || 0) > 0;
-  const inServerMode = !!serverInfo?.ok;
-  const phase = snapshotStatus?.phase || "idle";
-  const fmtSize = (n) => {
-    if (!n || !isFinite(n)) return "";
-    if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
-    if (n >= 1024) return Math.round(n / 1024) + " KB";
-    return n + " B";
-  };
-  const savedLabel = snapshotStatus?.savedAt ? new Date(snapshotStatus.savedAt).toLocaleString(void 0, { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : null;
-  const onBuild = () => {
-    actions.buildMobileSnapshot({ auto: false });
-  };
-  const onReveal = () => {
-    actions.revealInFinder("mobile.html");
-  };
-  const disabled = !inServerMode || !hasData || phase === "building";
-  let badgeClass = "smallbtn-slate";
-  let badgeText = "Awaiting first build\u2026";
-  if (!inServerMode) {
-    badgeClass = "smallbtn-amber";
-    badgeText = "Server off";
-  } else if (!hasData) {
-    badgeClass = "smallbtn-slate";
-    badgeText = "No data";
-  } else if (phase === "building") {
-    badgeClass = "smallbtn-indigo";
-    badgeText = "Syncing\u2026";
-  } else if (phase === "error") {
-    badgeClass = "smallbtn-rose";
-    badgeText = "Last build failed";
-  } else if (phase === "ok") {
-    badgeClass = "smallbtn-emerald";
-    badgeText = "Up to date";
-  }
-  return /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-1.5" }, /* @__PURE__ */ React.createElement("span", { className: "smallbtn smallbtn-xs " + badgeClass, style: { pointerEvents: "none" } }, badgeText), /* @__PURE__ */ React.createElement(
-    "button",
-    {
-      onClick: onBuild,
-      disabled,
-      className: "smallbtn smallbtn-xs " + (disabled ? "smallbtn-slate" : "smallbtn-indigo"),
-      title: "Force a rebuild now"
-    },
-    "Rebuild now"
-  ), phase === "ok" && inServerMode && /* @__PURE__ */ React.createElement("button", { onClick: onReveal, className: "smallbtn smallbtn-xs smallbtn-slate", title: "Show mobile.html in Finder" }, "Show in Finder")), /* @__PURE__ */ React.createElement("div", { className: "text-[10px] space-y-0.5", style: { color: "var(--ink-muted)" } }, /* @__PURE__ */ React.createElement("div", null, "Auto-rebuilds ", /* @__PURE__ */ React.createElement("span", { className: "font-mono" }, "mobile.html"), " whenever data or notes change. Drive Desktop syncs it to your phone within seconds."), !inServerMode && /* @__PURE__ */ React.createElement("div", null, "Start the Local App Server (", /* @__PURE__ */ React.createElement("span", { className: "font-mono" }, "manage.sh start"), ") to enable syncing."), inServerMode && !hasData && /* @__PURE__ */ React.createElement("div", null, "Load a CSV to publish the first snapshot."), phase === "ok" && /* @__PURE__ */ React.createElement("div", null, "Last sync", savedLabel ? " " + savedLabel : "", snapshotStatus.size ? " \xB7 " + fmtSize(snapshotStatus.size) : "", snapshotStatus.rowCount ? " \xB7 " + snapshotStatus.rowCount.toLocaleString() + " renewals" : ""), phase === "error" && /* @__PURE__ */ React.createElement("div", { style: { color: "#ef4444" } }, snapshotStatus?.error || "Snapshot build failed.")));
-}
 function Header() {
   const { theme, bgTheme, actions, state, serverInfo, serverSyncStatus } = useApp();
   const hasData = state?.data?.length > 0;
@@ -4385,7 +4195,7 @@ function Header() {
           if (e.target === e.currentTarget) setShowActions(false);
         }
       },
-      /* @__PURE__ */ React.createElement("div", { className: "modal-card max-w-md", onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { className: "modal-header" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("svg", { className: "w-4 h-4", style: { color: "var(--ink-muted)" }, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 1.8 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.573-1.066z" }), /* @__PURE__ */ React.createElement("circle", { cx: "12", cy: "12", r: "3" })), /* @__PURE__ */ React.createElement("span", { className: "text-xs font-semibold", style: { color: "var(--ink)" } }, "Settings")), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowActions(false), className: "smallbtn smallbtn-slate smallbtn-xs" }, "Close")), /* @__PURE__ */ React.createElement("div", { style: { padding: "0.85rem 1rem" }, className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Data"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1.5" }, /* @__PURE__ */ React.createElement(CSVImporter, null))), /* @__PURE__ */ React.createElement("div", { className: "h-px", style: { background: "var(--border)" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Notes"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1.5" }, /* @__PURE__ */ React.createElement(NotesIO, null))), /* @__PURE__ */ React.createElement("div", { className: "h-px", style: { background: "var(--border)" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Mobile snapshot"), /* @__PURE__ */ React.createElement(MobileSnapshot, null)), /* @__PURE__ */ React.createElement("div", { className: "h-px", style: { background: "var(--border)" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Preferences"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1.5 mb-3" }, /* @__PURE__ */ React.createElement("button", { onClick: () => actions.reset(), className: "smallbtn smallbtn-slate", title: "Reset all filters and settings" }, "Reset view"), /* @__PURE__ */ React.createElement("button", { onClick: toggleTheme, className: "smallbtn smallbtn-slate", title: "Toggle theme" }, theme === "dark" ? "Light mode" : "Dark mode")), /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Background"), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-7 gap-2" }, BG_THEMES.map((t) => /* @__PURE__ */ React.createElement(
+      /* @__PURE__ */ React.createElement("div", { className: "modal-card max-w-md", onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { className: "modal-header" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("svg", { className: "w-4 h-4", style: { color: "var(--ink-muted)" }, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 1.8 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.573-1.066z" }), /* @__PURE__ */ React.createElement("circle", { cx: "12", cy: "12", r: "3" })), /* @__PURE__ */ React.createElement("span", { className: "text-xs font-semibold", style: { color: "var(--ink)" } }, "Settings")), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowActions(false), className: "smallbtn smallbtn-slate smallbtn-xs" }, "Close")), /* @__PURE__ */ React.createElement("div", { style: { padding: "0.85rem 1rem" }, className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Data"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1.5" }, /* @__PURE__ */ React.createElement(CSVImporter, null))), /* @__PURE__ */ React.createElement("div", { className: "h-px", style: { background: "var(--border)" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Notes"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1.5" }, /* @__PURE__ */ React.createElement(NotesIO, null))), /* @__PURE__ */ React.createElement("div", { className: "h-px", style: { background: "var(--border)" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Preferences"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1.5 mb-3" }, /* @__PURE__ */ React.createElement("button", { onClick: () => actions.reset(), className: "smallbtn smallbtn-slate", title: "Reset all filters and settings" }, "Reset view"), /* @__PURE__ */ React.createElement("button", { onClick: toggleTheme, className: "smallbtn smallbtn-slate", title: "Toggle theme" }, theme === "dark" ? "Light mode" : "Dark mode")), /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Background"), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-7 gap-2" }, BG_THEMES.map((t) => /* @__PURE__ */ React.createElement(
         "button",
         {
           key: t.id,
@@ -5283,8 +5093,9 @@ function Partner() {
 function NotesHub() {
   const { state, actions } = useApp();
   const rows = useFilteredRows();
-  const { notes, headerMap, settings } = state;
+  const { notes, noteDeletes, headerMap, settings } = state;
   const accountKey = headerMap.ACCOUNT_NAME || "CRM_ACCOUNT_NAME";
+  const accountIdKey = headerMap.ACCOUNT_ID || "CRM_ACCOUNT_ID";
   const ownerKey = headerMap.OWNER || "CRM_SUCCESS_OWNER_NAME";
   const subregionKey = headerMap.SUBREGION || "PRO_FORMA_SUBREGION";
   const dateKey = headerMap.NEXT_RENEWAL_DATE || "NEXT_RENEWAL_DATE";
@@ -5335,6 +5146,59 @@ function NotesHub() {
         updatedAt: Number(note.updatedAt) || 0
       };
     }).filter(Boolean);
+    const datasetKeys = /* @__PURE__ */ new Set();
+    const allData = Array.isArray(state.data) ? state.data : [];
+    for (const r of allData) {
+      if (r.__noteKey) datasetKeys.add(r.__noteKey);
+    }
+    const deletes = noteDeletes || {};
+    for (const [nk, note] of Object.entries(notes || {})) {
+      if (!note) continue;
+      if (datasetKeys.has(nk)) continue;
+      if (deletes[nk]) continue;
+      const hasNoteText = safeString(note.note) !== "";
+      const hasForecast = note.djForecast != null && isFinite(toNumber(note.djForecast));
+      if (!hasNoteText && !hasForecast) continue;
+      if (!showArchived && note.archived) continue;
+      const acctName = safeString(note.accountName);
+      const acctId = safeString(note.accountId);
+      const owner = safeString(note.owner);
+      const renewalDate = safeString(note.renewalDate);
+      const fq = safeString(note.fq);
+      if (q) {
+        const hay = [acctName, owner, acctId, renewalDate, fq, note.note].map(safeString).join(" ").toLowerCase();
+        if (!hay.includes(q)) continue;
+      }
+      const synthRow = {
+        [accountKey]: acctName,
+        [accountIdKey]: acctId,
+        [ownerKey]: owner,
+        [subregionKey]: "",
+        [dateKey]: renewalDate,
+        [summaryKey]: "",
+        [atrKey]: note.atr != null ? toNumber(note.atr) : 0,
+        [buKey]: 0,
+        FISCAL_QUARTER: fq,
+        YEAR_QUARTER: fq,
+        NEXT_RENEWAL_DATE: renewalDate,
+        __noteKey: nk,
+        __uid: `note_${nk}`,
+        __orphanNote: true
+      };
+      items.push({
+        row: synthRow,
+        note,
+        noteKey: nk,
+        account: acctName || "(Unnamed)",
+        renewal: renewalDate || "\u2014",
+        subregion: "\u2014",
+        atr: toNumber(note.atr),
+        bu: 0,
+        summary: "\u2014",
+        noteText: safeString(note.note) || "\u2014",
+        updatedAt: Number(note.updatedAt) || 0
+      });
+    }
     const mul = sort.dir === "desc" ? -1 : 1;
     const cmpText = (a, b, va, vb) => va.localeCompare(vb) * mul;
     const cmpNum = (a, b, va, vb) => ((va || 0) - (vb || 0)) * mul;
@@ -5359,7 +5223,7 @@ function NotesHub() {
           return cmpNum(a, b, a.updatedAt, b.updatedAt);
       }
     });
-  }, [rows, notes, search, showArchived, sort, accountKey, ownerKey, subregionKey, dateKey, summaryKey, atrKey, buKey]);
+  }, [rows, state.data, notes, noteDeletes, search, showArchived, sort, accountKey, accountIdKey, ownerKey, subregionKey, dateKey, summaryKey, atrKey, buKey]);
   const totalNotes = noteRows.length;
   const archivedHidden = useMemo(() => {
     if (showArchived) return 0;
@@ -5396,6 +5260,40 @@ function NotesHub() {
   };
   const noteAtrTotal = useMemo(() => noteRows.reduce((s, n) => s + n.atr, 0), [noteRows]);
   const djOverrideCount = useMemo(() => noteRows.filter((n) => n.note?.djForecast != null && isFinite(toNumber(n.note.djForecast))).length, [noteRows]);
+  const [selectedKeys, setSelectedKeys] = useState(() => /* @__PURE__ */ new Set());
+  const visibleKeys = useMemo(() => noteRows.map((n) => n.noteKey), [noteRows]);
+  useEffect(() => {
+    setSelectedKeys((prev) => {
+      if (prev.size === 0) return prev;
+      const visible = new Set(visibleKeys);
+      let changed = false;
+      const next = /* @__PURE__ */ new Set();
+      prev.forEach((k) => {
+        if (visible.has(k)) next.add(k);
+        else changed = true;
+      });
+      return changed ? next : prev;
+    });
+  }, [visibleKeys]);
+  const selectedCount = selectedKeys.size;
+  const allSelected = visibleKeys.length > 0 && selectedCount === visibleKeys.length;
+  const someSelected = selectedCount > 0 && !allSelected;
+  const toggleRowSelect = (key) => setSelectedKeys((prev) => {
+    const next = new Set(prev);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    return next;
+  });
+  const toggleSelectAll = () => setSelectedKeys((prev) => {
+    if (visibleKeys.length > 0 && prev.size === visibleKeys.length) return /* @__PURE__ */ new Set();
+    return new Set(visibleKeys);
+  });
+  const bulkDeleteSelected = () => {
+    if (selectedCount === 0) return;
+    if (!window.confirm(`Delete ${selectedCount} note${selectedCount === 1 ? "" : "s"}? This can't be undone.`)) return;
+    actions.deleteNotes(Array.from(selectedKeys));
+    setSelectedKeys(/* @__PURE__ */ new Set());
+  };
   return /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", { className: "glass-strip", style: { padding: "0.75rem 1rem", flexDirection: "column", alignItems: "stretch", gap: "0.75rem", borderRadius: 16 } }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3 flex-wrap flex-1", style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { className: "glass-kpi", style: { minWidth: 90 } }, /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-label" }, "Notes"), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-value", style: { color: "#4f46e5" } }, totalNotes.toLocaleString())), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi", style: { minWidth: 90 } }, /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-label" }, "ATR Coverage"), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-value", style: { color: "#0891b2" } }, fmtCompact(noteAtrTotal))), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi", style: { minWidth: 90 } }, /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-label" }, "ELT Overrides"), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-value", style: { color: "#d97706" } }, djOverrideCount)), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi", style: { minWidth: 90 } }, /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-label" }, "Archived"), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-value", style: { color: "#64748b" } }, archivedHidden))), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement(
     "input",
     {
@@ -5404,7 +5302,9 @@ function NotesHub() {
       value: search,
       onChange: (e) => setSearch(e.target.value)
     }
-  ), /* @__PURE__ */ React.createElement("button", { className: `smallbtn ${showArchived ? "smallbtn-indigo" : "smallbtn-slate"}`, onClick: () => setShowArchived(!showArchived) }, showArchived ? "Hide archived" : "Show archived"))), /* @__PURE__ */ React.createElement("div", { className: "text-[10px]", style: { color: "var(--ink-muted)" } }, rows.length.toLocaleString(), " rows in current filters")), noteRows.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "card p-6 text-sm text-gray-500 dark:text-gray-400" }, "No notes found in the current filters. Clear filters or add a note from the Accounts table.") : /* @__PURE__ */ React.createElement("div", { className: "card p-0" }, /* @__PURE__ */ React.createElement("div", { className: "glass-strip", style: { borderRadius: "14px 14px 0 0", justifyContent: "space-between" } }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs font-semibold", style: { color: "var(--ink)" } }, "Notes table"), /* @__PURE__ */ React.createElement("span", { className: "pill-chip", style: { fontSize: "0.58rem" } }, noteRows.length.toLocaleString(), " rows")), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5 flex-wrap" }, /* @__PURE__ */ React.createElement(NotesSummaryExport, { rows }), /* @__PURE__ */ React.createElement(ExecSummaryExport, { rows }), /* @__PURE__ */ React.createElement(WeeklyUpdateExport, { rows }), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-indigo", onClick: exportNotesCsv }, "Export CSV"))), /* @__PURE__ */ React.createElement("div", { className: "table-container compact-table", style: { maxHeight: "calc(100vh - 320px)" } }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[10px]" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, [
+  ), /* @__PURE__ */ React.createElement("button", { className: `smallbtn ${showArchived ? "smallbtn-indigo" : "smallbtn-slate"}`, onClick: () => setShowArchived(!showArchived) }, showArchived ? "Hide archived" : "Show archived"))), /* @__PURE__ */ React.createElement("div", { className: "text-[10px]", style: { color: "var(--ink-muted)" } }, rows.length.toLocaleString(), " rows in current filters")), noteRows.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "card p-6 text-sm text-gray-500 dark:text-gray-400" }, "No notes found in the current filters. Clear filters or add a note from the Accounts table.") : /* @__PURE__ */ React.createElement("div", { className: "card p-0" }, /* @__PURE__ */ React.createElement("div", { className: "glass-strip", style: { borderRadius: "14px 14px 0 0", justifyContent: "space-between" } }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs font-semibold", style: { color: "var(--ink)" } }, "Notes table"), /* @__PURE__ */ React.createElement("span", { className: "pill-chip", style: { fontSize: "0.58rem" } }, noteRows.length.toLocaleString(), " rows")), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5 flex-wrap" }, selectedCount > 0 && /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-rose", onClick: bulkDeleteSelected, title: "Delete selected notes" }, "Delete selected (", selectedCount.toLocaleString(), ")"), /* @__PURE__ */ React.createElement(NotesSummaryExport, { rows }), /* @__PURE__ */ React.createElement(ExecSummaryExport, { rows }), /* @__PURE__ */ React.createElement(WeeklyUpdateExport, { rows }), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-indigo", onClick: exportNotesCsv }, "Export CSV"))), /* @__PURE__ */ React.createElement("div", { className: "table-container compact-table", style: { maxHeight: "calc(100vh - 320px)" } }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[10px]" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, /* @__PURE__ */ React.createElement("th", { key: "__select", style: { borderColor: "var(--border)", width: "2rem" }, className: "sticky top-0 glass-thead px-1.5 py-1.5 text-center border-b z-10" }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", className: "cursor-pointer align-middle", checked: allSelected, ref: (el) => {
+    if (el) el.indeterminate = someSelected;
+  }, onChange: toggleSelectAll, title: "Select all visible notes", "aria-label": "Select all visible notes" })), [
     { key: "account", label: "Account", left: true },
     { key: "renewal", label: "Renewal", left: true },
     { key: "subregion", label: "Subregion", left: true },
@@ -5420,6 +5320,7 @@ function NotesHub() {
       className: "cursor-pointer glass-row-accent transition-colors",
       onClick: () => setSelectedAccountRow(row)
     },
+    /* @__PURE__ */ React.createElement("td", { className: "px-1.5 py-1 border-b text-center", style: { borderColor: "var(--border)" }, onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", className: "cursor-pointer align-middle", checked: selectedKeys.has(noteKey), onChange: () => toggleRowSelect(noteKey), "aria-label": "Select note" })),
     /* @__PURE__ */ React.createElement("td", { className: "px-1.5 py-1 border-b whitespace-nowrap", style: { borderColor: "var(--border)" } }, account),
     /* @__PURE__ */ React.createElement("td", { className: "px-1.5 py-1 border-b whitespace-nowrap", style: { borderColor: "var(--border)" } }, renewal || "\u2014"),
     /* @__PURE__ */ React.createElement("td", { className: "px-1.5 py-1 border-b whitespace-nowrap", style: { borderColor: "var(--border)" } }, subregion || "\u2014"),
@@ -8588,101 +8489,6 @@ function ColumnsDrawer() {
     document.body
   );
 }
-function SplashGate({ step, setStep }) {
-  const { actions } = useApp();
-  const csvInputRef = useRef(null);
-  const notesInputRef = useRef(null);
-  const histInputRef = useRef(null);
-  const exitTimerRef = useRef(null);
-  const [csvStatus, setCsvStatus] = useState("idle");
-  const [notesStatus, setNotesStatus] = useState("idle");
-  const [histStatus, setHistStatus] = useState("idle");
-  const [csvMeta, setCsvMeta] = useState(null);
-  const [notesMeta, setNotesMeta] = useState(null);
-  const [histMeta, setHistMeta] = useState(null);
-  useEffect(() => () => {
-    if (exitTimerRef.current) clearTimeout(exitTimerRef.current);
-  }, []);
-  const finishSplash = () => {
-    if (exitTimerRef.current) clearTimeout(exitTimerRef.current);
-    exitTimerRef.current = setTimeout(() => setStep("done"), 650);
-  };
-  const onCsvChange = (e) => {
-    const file = e.target.files?.[0];
-    if (!file || typeof Papa === "undefined") return;
-    setCsvStatus("loading");
-    const uploadedAtMs = file.lastModified || Date.now();
-    streamParseCSV(file, {
-      onComplete: (rows, headers) => {
-        actions.importCSV(rows, headers, uploadedAtMs);
-        setCsvMeta({ name: file.name, rows: rows.length });
-        setCsvStatus("done");
-        setStep("notes");
-      },
-      onError: (err) => {
-        setCsvStatus("error");
-        alert("Error parsing CSV: " + err?.message);
-      }
-    });
-    e.target.value = "";
-  };
-  const onNotesChange = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setNotesStatus("loading");
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const parsed = JSON.parse(reader.result || "{}");
-        if (parsed.version !== 1) throw new Error("Unsupported version (expected 1)");
-        if (!parsed.notes || typeof parsed.notes !== "object") throw new Error("Missing notes object");
-        actions.importNotes(parsed.notes);
-        setNotesMeta({ name: file.name, count: Object.keys(parsed.notes || {}).length });
-        setNotesStatus("done");
-        setStep("historical");
-      } catch (err) {
-        setNotesStatus("error");
-        alert("Failed to import notes JSON: " + (err?.message || err));
-      }
-    };
-    reader.onerror = () => {
-      setNotesStatus("error");
-      alert("Failed to read notes file.");
-    };
-    reader.readAsText(file);
-    e.target.value = "";
-  };
-  const onSkipNotes = () => {
-    setNotesStatus("skipped");
-    setStep("historical");
-  };
-  const onHistChange = (e) => {
-    const file = e.target.files?.[0];
-    if (!file || typeof Papa === "undefined") return;
-    setHistStatus("loading");
-    streamParseCSV(file, {
-      onComplete: (rows, headers) => {
-        actions.importHistoricalCSV(rows, headers);
-        setHistMeta({ name: file.name, rows: rows.length });
-        setHistStatus("done");
-        finishSplash();
-      },
-      onError: (err) => {
-        setHistStatus("error");
-        alert("Error parsing historical CSV: " + err?.message);
-      }
-    });
-    e.target.value = "";
-  };
-  const onSkipHist = () => {
-    setHistStatus("skipped");
-    finishSplash();
-  };
-  const csvReady = csvStatus === "done";
-  const notesReady = notesStatus === "done" || notesStatus === "skipped";
-  const histReady = histStatus === "done" || histStatus === "skipped";
-  return /* @__PURE__ */ React.createElement("div", { className: "splash-shell" }, /* @__PURE__ */ React.createElement("div", { className: "splash-grid" }), /* @__PURE__ */ React.createElement("div", { className: "splash-orb orb-one" }), /* @__PURE__ */ React.createElement("div", { className: "splash-orb orb-two" }), /* @__PURE__ */ React.createElement("div", { className: "splash-orb orb-three" }), /* @__PURE__ */ React.createElement("div", { className: "splash-card" }, /* @__PURE__ */ React.createElement("div", { className: "splash-top" }, /* @__PURE__ */ React.createElement("div", { className: "splash-logo" }, /* @__PURE__ */ React.createElement("svg", { width: "36", height: "36", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round" }, /* @__PURE__ */ React.createElement("path", { d: "M21.5 2v6h-6" }), /* @__PURE__ */ React.createElement("path", { d: "M2.5 22v-6h6" }), /* @__PURE__ */ React.createElement("path", { d: "M21.34 8A10 10 0 0 0 3.8 5.4L2.5 8" }), /* @__PURE__ */ React.createElement("path", { d: "M2.66 16A10 10 0 0 0 20.2 18.6l1.3-2.6" })), /* @__PURE__ */ React.createElement("span", { className: "splash-logo-ring" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "splash-eyebrow" }, "Renewals Intelligence Studio ", /* @__PURE__ */ React.createElement("span", { style: { fontSize: "0.75em", opacity: 0.6 } }, "v", APP_VERSION)), /* @__PURE__ */ React.createElement("div", { className: "splash-title" }, "Load your renewals snapshot"), /* @__PURE__ */ React.createElement("p", { className: "splash-lede" }, "Upload the CSV first, then bring in your notes. We map columns, match accounts, and only then launch the dashboard."))), /* @__PURE__ */ React.createElement("div", { className: "splash-body" }, /* @__PURE__ */ React.createElement("div", { className: "splash-steps" }, /* @__PURE__ */ React.createElement("div", { className: `splash-step ${step === "csv" ? "active" : csvReady ? "done" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: "splash-step-index" }, "1"), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "splash-step-title" }, "Upload renewals CSV"), /* @__PURE__ */ React.createElement("div", { className: "splash-step-meta" }, csvMeta ? `${csvMeta.rows.toLocaleString()} rows detected` : "Required to start")), csvReady && /* @__PURE__ */ React.createElement("span", { className: "splash-step-chip" }, "Loaded")), /* @__PURE__ */ React.createElement("div", { className: `splash-step ${notesReady ? "done" : step === "notes" ? "active" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: "splash-step-index" }, "2"), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "splash-step-title" }, "Import notes JSON"), /* @__PURE__ */ React.createElement("div", { className: "splash-step-meta" }, notesMeta ? `${notesMeta.count.toLocaleString()} notes added` : notesStatus === "skipped" ? "Skipped for now" : "Match insights to accounts")), notesReady && /* @__PURE__ */ React.createElement("span", { className: "splash-step-chip" }, notesStatus === "skipped" ? "Skipped" : "Loaded")), /* @__PURE__ */ React.createElement("div", { className: `splash-step ${histReady ? "done" : step === "historical" ? "active" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: "splash-step-index" }, "3"), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "splash-step-title" }, "Historical data CSV"), /* @__PURE__ */ React.createElement("div", { className: "splash-step-meta" }, histMeta ? `${histMeta.rows.toLocaleString()} rows loaded` : histStatus === "skipped" ? "Skipped" : "Optional \u2014 closed quarter outcomes")), histReady && /* @__PURE__ */ React.createElement("span", { className: "splash-step-chip" }, histStatus === "skipped" ? "Skipped" : "Loaded"))), /* @__PURE__ */ React.createElement("div", { className: "splash-panel" }, step === "csv" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("h2", null, "Step 1: Upload your renewals CSV"), /* @__PURE__ */ React.createElement("p", null, "Start with the renewals export. We auto-map headers, calculate fiscal quarters, and prep the insights view."), /* @__PURE__ */ React.createElement("div", { className: "splash-actions" }, /* @__PURE__ */ React.createElement("input", { ref: csvInputRef, type: "file", accept: ".csv", className: "hidden", onChange: onCsvChange }), /* @__PURE__ */ React.createElement("button", { type: "button", className: "splash-btn splash-btn-primary", onClick: () => csvInputRef.current?.click(), disabled: csvStatus === "loading" }, csvStatus === "loading" ? "Uploading..." : "Upload CSV report")), csvStatus === "loading" && /* @__PURE__ */ React.createElement("div", { className: "splash-status splash-loader" }, "Parsing CSV..."), csvStatus === "error" && /* @__PURE__ */ React.createElement("div", { className: "splash-status splash-error" }, "We could not read that file. Try again."), csvMeta && /* @__PURE__ */ React.createElement("div", { className: "splash-file" }, "Loaded ", csvMeta.name, " - ", csvMeta.rows.toLocaleString(), " rows")) : step === "notes" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("h2", null, "Step 2: Import your notes pack"), /* @__PURE__ */ React.createElement("p", null, "Use the same Notes JSON export to attach personal context to accounts in this file."), /* @__PURE__ */ React.createElement("div", { className: "splash-actions" }, /* @__PURE__ */ React.createElement("input", { ref: notesInputRef, type: "file", accept: ".json,application/json", className: "hidden", onChange: onNotesChange }), /* @__PURE__ */ React.createElement("button", { type: "button", className: "splash-btn splash-btn-notes", onClick: () => notesInputRef.current?.click(), disabled: notesStatus === "loading" || notesReady }, notesStatus === "loading" ? "Importing..." : "Import notes JSON"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "splash-btn-ghost", onClick: onSkipNotes, disabled: notesStatus === "loading" || notesReady }, "Continue without notes")), notesStatus === "loading" && /* @__PURE__ */ React.createElement("div", { className: "splash-status splash-loader" }, "Syncing notes..."), notesStatus === "error" && /* @__PURE__ */ React.createElement("div", { className: "splash-status splash-error" }, "That file does not look like a Notes export."), notesMeta && /* @__PURE__ */ React.createElement("div", { className: "splash-file" }, "Loaded ", notesMeta.name, " - ", notesMeta.count.toLocaleString(), " notes")) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("h2", null, "Step 3: Historical data (optional)"), /* @__PURE__ */ React.createElement("p", null, "Upload a CSV with closed quarter outcomes to see actual renewal rates and the full-year picture alongside your open renewals."), /* @__PURE__ */ React.createElement("div", { className: "splash-actions" }, /* @__PURE__ */ React.createElement("input", { ref: histInputRef, type: "file", accept: ".csv", className: "hidden", onChange: onHistChange }), /* @__PURE__ */ React.createElement("button", { type: "button", className: "splash-btn splash-btn-primary", onClick: () => histInputRef.current?.click(), disabled: histStatus === "loading" || histReady }, histStatus === "loading" ? "Uploading..." : "Upload historical CSV"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "splash-btn-ghost", onClick: onSkipHist, disabled: histStatus === "loading" || histReady }, "Continue without historical data")), histStatus === "loading" && /* @__PURE__ */ React.createElement("div", { className: "splash-status splash-loader" }, "Parsing historical data..."), histStatus === "error" && /* @__PURE__ */ React.createElement("div", { className: "splash-status splash-error" }, "Could not parse that file. Try again."), histMeta && /* @__PURE__ */ React.createElement("div", { className: "splash-file" }, "Loaded ", histMeta.name, " - ", histMeta.rows.toLocaleString(), " rows"), histReady && /* @__PURE__ */ React.createElement("div", { className: "splash-status splash-success" }, "All set. Launching your dashboard...")))), /* @__PURE__ */ React.createElement("div", { className: "splash-foot" }, /* @__PURE__ */ React.createElement("div", null, "Step order: CSV first, then notes, then historical."), /* @__PURE__ */ React.createElement("div", null, "Files are stored server-side in Postgres and shared with all users."))));
-}
 function RefreshOverlay() {
   const { refreshState, dismissRefreshState } = useApp();
   useEffect(() => {
@@ -9293,10 +9099,10 @@ function App() {
       if ((state?.data?.length || 0) > 0) return "done";
       if (prev !== "loading") return prev;
       if (serverInfo === null) return "loading";
-      if (serverInfo?.ok && (csvAutoLoadStatus === "idle" || csvAutoLoadStatus === "pending" || csvAutoLoadStatus === "loaded")) {
+      if (serverInfo?.ok && (csvAutoLoadStatus === "idle" || csvAutoLoadStatus === "pending")) {
         return "loading";
       }
-      return "csv";
+      return "done";
     });
   }, [idbReady, state?.data?.length, serverInfo, csvAutoLoadStatus]);
   useEffect(() => {
@@ -9326,10 +9132,10 @@ function App() {
       hasNotes: false
     }));
   }, [hasData, gateStep, actions]);
-  return /* @__PURE__ */ React.createElement("div", { className: "min-h-full region-font" }, gateStep === "loading" && /* @__PURE__ */ React.createElement("div", { className: "splash-shell", style: { display: "flex", alignItems: "center", justifyContent: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", color: "var(--muted)" } }, /* @__PURE__ */ React.createElement("svg", { className: "mx-auto mb-3 animate-spin", width: "32", height: "32", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2" }, /* @__PURE__ */ React.createElement("path", { d: "M21 12a9 9 0 11-6.219-8.56" })), /* @__PURE__ */ React.createElement("div", { style: { fontSize: "0.9rem", fontWeight: 600 } }, "Restoring your session..."))), /* @__PURE__ */ React.createElement("div", { className: `app-shell ${gateStep !== "done" ? "is-hidden" : ""}` }, /* @__PURE__ */ React.createElement(Header, null), /* @__PURE__ */ React.createElement("main", { className: "max-w-7xl mx-auto px-4 pt-4 pb-6 space-y-4" }, !hasData && /* @__PURE__ */ React.createElement(EmptyState, null), hasData && /* @__PURE__ */ React.createElement(React.Fragment, null, state.ui.activeTab === "partner" && /* @__PURE__ */ React.createElement(Partner, null), state.ui.activeTab === "accounts" && /* @__PURE__ */ React.createElement(Accounts, null), state.ui.activeTab === "region" && /* @__PURE__ */ React.createElement(RegionQuarterTable, null), state.ui.activeTab === "trending" && /* @__PURE__ */ React.createElement(TrendingTab, null), state.ui.activeTab === "notes" && /* @__PURE__ */ React.createElement(NotesHub, null), state.ui.activeTab === "historical" && /* @__PURE__ */ React.createElement(HistoricalTab, null), state.ui.activeTab === "targets" && /* @__PURE__ */ React.createElement(TargetsTab, null), state.ui.activeTab === "weekly" && /* @__PURE__ */ React.createElement(WeeklyBriefTab, null)), /* @__PURE__ */ React.createElement("footer", { className: "text-xs text-gray-500 dark:text-gray-400 text-center pt-6" }, "Data, notes, targets, and settings persist in your browser. Use Reset to clear everything.")), /* @__PURE__ */ React.createElement(ColumnsDrawer, null)), gateStep !== "done" && gateStep !== "loading" && /* @__PURE__ */ React.createElement(SplashGate, { step: gateStep, setStep: setGateStep }), /* @__PURE__ */ React.createElement(RefreshOverlay, null));
+  return /* @__PURE__ */ React.createElement("div", { className: "min-h-full region-font" }, gateStep === "loading" && /* @__PURE__ */ React.createElement("div", { className: "splash-shell", style: { display: "flex", alignItems: "center", justifyContent: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", color: "var(--muted)" } }, /* @__PURE__ */ React.createElement("svg", { className: "mx-auto mb-3 animate-spin", width: "32", height: "32", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2" }, /* @__PURE__ */ React.createElement("path", { d: "M21 12a9 9 0 11-6.219-8.56" })), /* @__PURE__ */ React.createElement("div", { style: { fontSize: "0.9rem", fontWeight: 600 } }, "Restoring your session..."))), /* @__PURE__ */ React.createElement("div", { className: `app-shell ${gateStep !== "done" ? "is-hidden" : ""}` }, /* @__PURE__ */ React.createElement(Header, null), /* @__PURE__ */ React.createElement("main", { className: "max-w-7xl mx-auto px-4 pt-4 pb-6 space-y-4" }, !hasData && /* @__PURE__ */ React.createElement(NoDataBanner, null), /* @__PURE__ */ React.createElement(React.Fragment, null, state.ui.activeTab === "partner" && /* @__PURE__ */ React.createElement(Partner, null), state.ui.activeTab === "accounts" && /* @__PURE__ */ React.createElement(Accounts, null), state.ui.activeTab === "region" && /* @__PURE__ */ React.createElement(RegionQuarterTable, null), state.ui.activeTab === "trending" && /* @__PURE__ */ React.createElement(TrendingTab, null), state.ui.activeTab === "notes" && /* @__PURE__ */ React.createElement(NotesHub, null), state.ui.activeTab === "historical" && /* @__PURE__ */ React.createElement(HistoricalTab, null), state.ui.activeTab === "targets" && /* @__PURE__ */ React.createElement(TargetsTab, null), state.ui.activeTab === "weekly" && /* @__PURE__ */ React.createElement(WeeklyBriefTab, null)), /* @__PURE__ */ React.createElement("footer", { className: "text-xs text-gray-500 dark:text-gray-400 text-center pt-6" }, "Data, notes, targets, and settings persist in your browser. Use Reset to clear everything.")), /* @__PURE__ */ React.createElement(ColumnsDrawer, null)), /* @__PURE__ */ React.createElement(RefreshOverlay, null));
 }
-function EmptyState() {
-  return /* @__PURE__ */ React.createElement("div", { className: "min-h-[60vh] bg-gradient-to-b from-indigo-50 via-white to-rose-50 dark:from-slate-900 dark:via-slate-950 dark:to-slate-900 flex items-center justify-center px-4" }, /* @__PURE__ */ React.createElement("div", { className: "card p-10 text-center shadow-xl border border-indigo-100/70 dark:border-slate-800 max-w-xl w-full" }, /* @__PURE__ */ React.createElement("div", { className: "mx-auto h-14 w-14 rounded-2xl flex items-center justify-center mb-4", style: { background: "linear-gradient(135deg,#6366f1,#06b6d4,#10b981)", boxShadow: "0 4px 16px rgba(99,102,241,0.3)" } }, /* @__PURE__ */ React.createElement("svg", { width: "28", height: "28", viewBox: "0 0 24 24", fill: "none", stroke: "#fff", strokeWidth: "2.2", strokeLinecap: "round", strokeLinejoin: "round" }, /* @__PURE__ */ React.createElement("path", { d: "M21.5 2v6h-6" }), /* @__PURE__ */ React.createElement("path", { d: "M2.5 22v-6h6" }), /* @__PURE__ */ React.createElement("path", { d: "M21.34 8A10 10 0 0 0 3.8 5.4L2.5 8" }), /* @__PURE__ */ React.createElement("path", { d: "M2.66 16A10 10 0 0 0 20.2 18.6l1.3-2.6" }))), /* @__PURE__ */ React.createElement("h3", { className: "text-2xl font-semibold mb-2" }, "Renewals Intelligence Studio"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-gray-600 dark:text-gray-300 mb-6 max-w-lg mx-auto" }, "Monitor renewal momentum, spotlight risk, and track KPI achievement."), /* @__PURE__ */ React.createElement("div", { className: "flex justify-center" }, /* @__PURE__ */ React.createElement(CSVImporter, null))));
+function NoDataBanner() {
+  return /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-4 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 text-[13px] text-amber-800 dark:text-amber-200" }, /* @__PURE__ */ React.createElement("svg", { width: "18", height: "18", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round", style: { flexShrink: 0 } }, /* @__PURE__ */ React.createElement("path", { d: "M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" }), /* @__PURE__ */ React.createElement("line", { x1: "12", y1: "9", x2: "12", y2: "13" }), /* @__PURE__ */ React.createElement("line", { x1: "12", y1: "17", x2: "12.01", y2: "17" })), /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "No data loaded yet"), " \u2014 load it from Admin (CSV upload or Snowflake \u2018Run now\u2019).")), /* @__PURE__ */ React.createElement("a", { href: "/admin", className: "smallbtn smallbtn-indigo whitespace-nowrap", style: { textDecoration: "none" } }, "Go to Admin"));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(
   /* @__PURE__ */ React.createElement(ErrorBoundary, null, /* @__PURE__ */ React.createElement(AppProvider, null, /* @__PURE__ */ React.createElement(App, null)))

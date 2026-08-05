@@ -2498,7 +2498,7 @@
     <script src="vendor/vibe-session-lock.js"></script>
 
     <!-- App (compiled from app.jsx by ./build.sh) -->
-    <script src="vendor/app.js?v=20260805c"></script>
+    <script src="vendor/app.js?v=20260805j"></script>
 
     <!--
       Container-mode toolbar tweaks. Mounted after the React app so we can
@@ -2707,29 +2707,9 @@
           return null;
         }
 
-        // When the splash gate is showing, redirect CSV upload CTAs to /admin.
-        function rewireSplashCTA() {
-          // Two candidates: "Upload CSV report" in the right-hand step
-          // panel and "Step 1: Upload renewals CSV" in the left list.
-          // We rewire any button whose text starts with "Upload CSV" or
-          // matches "Upload renewals CSV".
-          document.querySelectorAll('button').forEach(function (btn) {
-            if (btn.dataset.vibeSplashRewired === '1') return;
-            const t = (btn.textContent || '').trim();
-            if (t === 'Upload CSV report' || t === 'Upload renewals CSV') {
-              btn.dataset.vibeSplashRewired = '1';
-              btn.addEventListener('click', function (ev) {
-                ev.preventDefault();
-                ev.stopPropagation();
-                window.location.href = '/admin';
-              }, true);  // capture phase so React's handler doesn't run
-              // Update the label so users know where it goes.
-              if (btn.textContent === 'Upload CSV report') {
-                btn.textContent = 'Go to Admin';
-              }
-            }
-          });
-        }
+        // NOTE: rewireSplashCTA() was removed with the onboarding wizard/splash
+        // (v3.3). Data loading now lives entirely in /admin, so there is no
+        // longer a splash CSV CTA to redirect.
 
         // ---- ELT Forecast decomposition: CS + Renewals ------------------
         //
@@ -4235,7 +4215,6 @@
             ensureEditRawGate();
             ensureDataAsOfBadge();
             sanitiseBlocklisted();
-            rewireSplashCTA();
             // Re-apply ELT tile values after React re-renders the KPI grid.
             // NOT forced: this reuses the cached totals (and only refetches
             // when the filter scope actually changed). Forcing here made the
