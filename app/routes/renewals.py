@@ -2145,6 +2145,72 @@ _WB_BAND_PREDICATE = (
 # agree (a user can select "Unknown" and match rows with no region).
 _WB_REGION_EXPR = "COALESCE(NULLIF(TRIM(s.region), ''), 'Unknown')"
 
+# Shared filter dimensions the Weekly Brief supports beyond band + quarter.
+# Each maps a filter key -> the canonical SQL expression on account_snapshots.
+# Blank/NULL collapses to 'Unknown' so the equality filter, the available-*
+# option list, and the label the user sees all agree. These mirror the
+# dimensions the rest of the dashboard filters on (region / sub-region / CS
+# manager / segment / owner) so the brief uses the same mechanism.
+_WB_FILTER_EXPRS = {
+    "region": _WB_REGION_EXPR,
+    "sub_region": "COALESCE(NULLIF(TRIM(s.subregion), ''), 'Unknown')",
+    "cs_manager": "COALESCE(NULLIF(TRIM(s.csm_manager), ''), 'Unknown')",
+    "segment": "COALESCE(NULLIF(TRIM(s.market_segment), ''), 'Unknown')",
+    "owner": "COALESCE(NULLIF(TRIM(s.csm_owner), ''), 'Unknown')",
+}
+
+# Call events are matched to snapshot accounts on the SAME identity the
+# call_key encodes — account_id + rounded_atr + quarter — but on the
+# *components* rather than the composite string. This is deliberate: the
+# call_key stored in account_call_events encodes the quarter in the app's
+# canonical spelling (e.g. 'FY27Q4'), while the CSV/snapshot year_quarter
+# column uses a different spelling for the same quarter (e.g. 'Q4`27' or
+# 'QQ4`27'). Matching on a NORMALIZED quarter avoids that format mismatch
+# silently dropping every call. account_call_events always carries a real
+# account_id, so name-only snapshot rows (which never have calls) simply
+# don't match. ROUND() rounds half away from zero, matching the client's
+# Math.round on positive ATR values.
+def _wb_qnorm(expr: str) -> str:
+    """Canonical 'YYQ<n>' token for a quarter label, format-agnostic.
+
+    Strategy: the quarter digit is always the digit right after a 'Q'; the
+    year is the remaining digit run (last two digits). Handles 'FY27Q4',
+    'Q4`27', 'QQ4`27', '2027Q4', '27Q4', etc. — all -> '27Q4'."""
+    up = f"upper({expr})"
+    year2 = (
+        "right(regexp_replace(regexp_replace(" + up + ", 'Q[1-4]', '', 'g'), "
+        "'[^0-9]', '', 'g'), 2)"
+    )
+    qnum = f"substring({up} from 'Q([1-4])')"
+    return f"({year2} || 'Q' || {qnum})"
+
+
+def _wb_filter_sql(filters: dict, start_index: int) -> tuple[str, list]:
+    """Build the shared-filter WHERE fragment (and its bound params) starting
+    at ``$start_index``. Mirrors the region-filter pattern (``expr = $N``) for
+    each active dimension, plus an optional ATR (ARR) numeric range. An empty
+    or '__ALL__' value means "don't filter this dimension"."""
+    clauses: list[str] = []
+    params: list = []
+    idx = start_index
+    for key, expr in _WB_FILTER_EXPRS.items():
+        val = (filters.get(key) or "").strip() if filters.get(key) is not None else ""
+        if val and val != "__ALL__":
+            clauses.append(f" AND {expr} = ${idx}")
+            params.append(val)
+            idx += 1
+    arr_min = filters.get("arr_min")
+    if arr_min is not None:
+        clauses.append(f" AND COALESCE(s.atr, 0) >= ${idx}")
+        params.append(float(arr_min))
+        idx += 1
+    arr_max = filters.get("arr_max")
+    if arr_max is not None:
+        clauses.append(f" AND COALESCE(s.atr, 0) <= ${idx}")
+        params.append(float(arr_max))
+        idx += 1
+    return ("".join(clauses), params)
+
 
 def _wb_meta_dict(row) -> Optional[dict]:
     if row is None:
@@ -2227,11 +2293,13 @@ def _wb_band_query(sql: str, band_param_index: int) -> str:
 
 
 async def _wb_load_accounts(conn, upload_id: int, band: str,
-                            quarter_labels: list[str], region: str = "") -> dict:
+                            quarter_labels: list[str],
+                            filters: Optional[dict] = None) -> dict:
     """One aggregated record per account for a snapshot, scoped to band +
-    quarter (+ optional region). Uses the structured bu_fc/forecast_summary
+    quarter (+ the shared filters). Uses the structured bu_fc/forecast_summary
     columns and extracts only the single UPSIDE key from raw_row (bounded, no
-    blob transfer). ``region`` == '' means all regions (the rollup)."""
+    blob transfer). An empty ``filters`` means all rows (the rollup)."""
+    filter_sql, filter_params = _wb_filter_sql(filters or {}, 4)
     sql = _wb_band_query(
         """
         SELECT s.account_id, s.account_name, s.region, s.bu_fc,
@@ -2239,12 +2307,11 @@ async def _wb_load_accounts(conn, upload_id: int, band: str,
         FROM account_snapshots s
         WHERE s.csv_upload_id = $1
           AND s.year_quarter = ANY($2::text[])
-          AND ($4 = '' OR {region_expr} = $4)
           AND {band}
-        """.format(band=_WB_BAND_PREDICATE, region_expr=_WB_REGION_EXPR),
+        """.format(band=_WB_BAND_PREDICATE) + filter_sql,
         3,
     )
-    rows = await conn.fetch(sql, upload_id, quarter_labels, band, region)
+    rows = await conn.fetch(sql, upload_id, quarter_labels, band, *filter_params)
     out: dict = {}
     for r in rows:
         acct_id = (r["account_id"] or "").strip()
@@ -2288,28 +2355,48 @@ async def weekly_brief(
     band: str = Query(default=WEEKLY_BRIEF_BAND_DEFAULT),
     threshold: float = Query(default=WEEKLY_BRIEF_LARGE_SWING_DEFAULT),
     region: str = Query(default=""),
+    sub_region: str = Query(default=""),
+    cs_manager: str = Query(default=""),
+    segment: str = Query(default=""),
+    owner: str = Query(default=""),
+    arr_min: Optional[float] = Query(default=None),
+    arr_max: Optional[float] = Query(default=None),
 ) -> dict:
     """Weekly 100K+ Regional Brief: WoW bottoms-up forecast movement.
 
     Returns structured JSON for four sections:
-      1. BU forecast movement per region + overall rollup + trend series.
+      1. BU forecast movement per region + overall rollup + trend series
+         (both the system BU total and the calls-adjusted / ELT total).
       2. Accounts that worsened WoW (BU_FC increased), ranked by adverse
          swing; movers >= threshold carry an auto-pulled explanation.
       3. New in-quarter forecast ($0 BU_FC prior -> forecast now).
       4. Upside movement (total + WoW delta) with top-5 up/down drivers.
 
-    ``region`` scopes EVERY section (including the trend series) server-side
-    so the whole brief is uniformly region-filtered. '' / '__ALL__' means the
-    overall rollup (all regions summed).
+    The shared filters (region, sub_region, cs_manager, segment, owner, ARR
+    range) plus band + quarter scope EVERY section (including BOTH trend
+    series) server-side, so the whole brief is uniformly filtered. An empty /
+    '__ALL__' value for a dimension means "all" for that dimension.
     """
     normalised_slot = (slot or "active").strip().lower()
     if normalised_slot not in ("active", "historical"):
         raise HTTPException(status_code=400, detail="slot must be active or historical")
 
     band_param = (band or WEEKLY_BRIEF_BAND_DEFAULT).strip() or WEEKLY_BRIEF_BAND_DEFAULT
-    region_f = (region or "").strip()
-    if region_f == "__ALL__":
-        region_f = ""
+
+    def _clean(v: str) -> str:
+        v = (v or "").strip()
+        return "" if v == "__ALL__" else v
+
+    filters = {
+        "region": _clean(region),
+        "sub_region": _clean(sub_region),
+        "cs_manager": _clean(cs_manager),
+        "segment": _clean(segment),
+        "owner": _clean(owner),
+        "arr_min": arr_min,
+        "arr_max": arr_max,
+    }
+    region_f = filters["region"]
     try:
         threshold_val = float(threshold)
     except (TypeError, ValueError):
@@ -2422,26 +2509,39 @@ async def weekly_brief(
             if _wb_normalize_quarter(r["yq"]) == resolved_pair
         }) or [resolved_quarter]
 
-        # ---- available regions (UNfiltered by region so the selector stays
-        #      fully populated even when a single region is being viewed) ----
-        region_rows = await conn.fetch(
-            _wb_band_query(
-                "SELECT DISTINCT {region_expr} AS region FROM account_snapshots s "
-                "WHERE s.csv_upload_id = $1 AND s.year_quarter = ANY($2::text[]) "
-                "AND ".format(region_expr=_WB_REGION_EXPR) + _WB_BAND_PREDICATE,
-                3,
-            ),
-            current_id, quarter_labels, band_param,
+        # ---- available filter options (UNfiltered by the selected filters so
+        #      every selector stays fully populated even while a value is
+        #      active). One round-trip via UNION ALL, scoped only to
+        #      band + quarter on the current snapshot. ----------------------
+        opt_scope = (
+            "FROM account_snapshots s "
+            "WHERE s.csv_upload_id = $1 AND s.year_quarter = ANY($2::text[]) "
+            "AND " + _WB_BAND_PREDICATE + " "
         )
-        available_regions = sorted(r["region"] for r in region_rows)
+        opt_sql = _wb_band_query(
+            "SELECT DISTINCT dim, val FROM ("
+            + " UNION ALL ".join(
+                f"SELECT '{dim}' AS dim, {expr} AS val " + opt_scope
+                for dim, expr in _WB_FILTER_EXPRS.items()
+            )
+            + ") t",
+            3,
+        )
+        opt_rows = await conn.fetch(opt_sql, current_id, quarter_labels, band_param)
+        available: dict[str, list] = {dim: [] for dim in _WB_FILTER_EXPRS}
+        for r in opt_rows:
+            available.setdefault(r["dim"], []).append(r["val"])
+        for dim in available:
+            available[dim] = sorted(v for v in available[dim] if v)
+        available_regions = available["region"]
 
-        # ---- load both snapshots (bounded, region-scoped) -----------------
+        # ---- load both snapshots (bounded, filter-scoped) -----------------
         current_map = await _wb_load_accounts(
-            conn, current_id, band_param, quarter_labels, region_f
+            conn, current_id, band_param, quarter_labels, filters
         )
         prior_map = (
             await _wb_load_accounts(
-                conn, prior_meta["id"], band_param, quarter_labels, region_f
+                conn, prior_meta["id"], band_param, quarter_labels, filters
             )
             if prior_meta else {}
         )
@@ -2465,21 +2565,43 @@ async def weekly_brief(
             note_map = {r["account_id"]: (r["note_text"] or "").strip() for r in note_rows}
 
         # ---- trend series (one aggregate query across the window) ---------
-        # Region-scoped server-side so the "over time" line reflects the
-        # selected region ($4 = '' means all regions == the rollup).
+        # Two totals per snapshot, filter-scoped identically to every other
+        # section:
+        #   total_bu  = SUM(BU_FC)                      (system bottoms-up)
+        #   total_adj = SUM(ELT-as-of-that-snapshot)    (calls-adjusted)
+        # The adjusted total applies, per account, the latest call
+        # (cs_forecast + renewals_forecast) whose effective_date <= the
+        # snapshot's own effective_date, else falls back to BU_FC. The
+        # per-account LATERAL uses the (call_key, effective_date DESC) index
+        # and the account set is already band+quarter+filter-scoped to a few
+        # hundred rows across a handful of snapshots, so this stays bounded.
+        trend_filter_sql, trend_filter_params = _wb_filter_sql(filters, 4)
         trend_qs = _wb_band_query(
             "SELECT s.csv_upload_id AS uid, MAX(s.effective_date) AS eff, "
-            "       COALESCE(SUM(s.bu_fc), 0) AS total "
+            "       COALESCE(SUM(s.bu_fc), 0) AS total_bu, "
+            "       COALESCE(SUM(COALESCE(c.elt, s.bu_fc)), 0) AS total_adj "
             "FROM account_snapshots s "
+            "LEFT JOIN LATERAL ("
+            "    SELECT (COALESCE(e.cs_forecast, 0) "
+            "            + COALESCE(e.renewals_forecast, 0)) AS elt "
+            "    FROM account_call_events e "
+            "    WHERE e.account_id = s.account_id "
+            "      AND e.rounded_atr = ROUND(COALESCE(s.atr, 0))::int "
+            "      AND " + _wb_qnorm("e.year_quarter") + " = "
+            + _wb_qnorm("s.year_quarter") + " "
+            "      AND e.effective_date <= s.effective_date "
+            "    ORDER BY e.effective_date DESC, e.id DESC "
+            "    LIMIT 1"
+            ") c ON TRUE "
             "WHERE s.csv_upload_id = ANY($1::bigint[]) "
             "AND s.year_quarter = ANY($2::text[]) "
-            "AND ($4 = '' OR " + _WB_REGION_EXPR + " = $4) "
             "AND " + _WB_BAND_PREDICATE + " "
-            "GROUP BY s.csv_upload_id",
+            + trend_filter_sql
+            + " GROUP BY s.csv_upload_id",
             3,
         )
         trend_rows = await conn.fetch(
-            trend_qs, trend_ids, quarter_labels, band_param, region_f
+            trend_qs, trend_ids, quarter_labels, band_param, *trend_filter_params
         )
 
     # ---- build the four sections (in-memory, bounded sets) ----------------
@@ -2536,11 +2658,15 @@ async def weekly_brief(
         tr = trend_by_uid.get(s["id"])
         if tr is None:
             continue
+        bu_total = round(float(tr["total_bu"] or 0), 2)
+        adj_total = round(float(tr["total_adj"] or 0), 2)
         trend_series.append({
             "upload_id": s["id"],
             "effective_date": s["effective_date"],
             "filename": s["filename"],
-            "total_bu_fc": round(float(tr["total"] or 0), 2),
+            "total_bu_fc": bu_total,
+            "total_adjusted_fc": adj_total,
+            "gap": round(adj_total - bu_total, 2),
         })
 
     # Section 2 — worsened WoW (BU_FC increased == more churn/contraction)
@@ -2630,7 +2756,20 @@ async def weekly_brief(
         "band": band_param,
         "threshold": threshold_val,
         "region": region_f or "__ALL__",
+        "filters": {
+            "region": filters["region"] or "__ALL__",
+            "sub_region": filters["sub_region"] or "__ALL__",
+            "cs_manager": filters["cs_manager"] or "__ALL__",
+            "segment": filters["segment"] or "__ALL__",
+            "owner": filters["owner"] or "__ALL__",
+            "arr_min": filters["arr_min"],
+            "arr_max": filters["arr_max"],
+        },
         "available_regions": available_regions,
+        "available_sub_regions": available["sub_region"],
+        "available_cs_managers": available["cs_manager"],
+        "available_segments": available["segment"],
+        "available_owners": available["owner"],
         "quarter": resolved_quarter,
         "quarter_auto_selected": quarter_auto,
         "quarter_labels": quarter_labels,

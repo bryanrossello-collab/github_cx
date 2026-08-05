@@ -95,6 +95,26 @@ def _load_seed(slot: str) -> tuple[list[str], list[tuple]]:
     return all_rows[0], all_rows[1:]
 
 
+def _user_from_token(token: str) -> Optional[str]:
+    """Best-effort extract the mapped user (email/sub) from the OAuth JWT so we
+    can pass ``user=`` to the connector — matching the ZDP reference sample and
+    the account's ``EXTERNAL_OAUTH_TOKEN_USER_MAPPING_CLAIM=['sub']`` mapping.
+
+    Decodes the JWT payload WITHOUT verifying the signature (Snowflake verifies
+    it) and WITHOUT any external dependency. Never logs the token or claims."""
+    try:
+        import base64
+        import json
+
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)  # restore base64url padding
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode()))
+        val = claims.get("email") or claims.get("sub")
+        return str(val) if val else None
+    except Exception:  # noqa: BLE001 — never fail the connect on a decode issue
+        return None
+
+
 def run_query_file(
     path: Path,
     params: list[Any],
@@ -111,7 +131,7 @@ def run_query_file(
     snowflake.connector.paramstyle = "qmark"
     sql = Path(path).read_text()
 
-    conn = snowflake.connector.connect(
+    conn_kwargs: dict[str, Any] = dict(
         account=settings.snowflake_account,
         warehouse=settings.snowflake_warehouse,
         database=settings.snowflake_database,
@@ -123,6 +143,12 @@ def run_query_file(
         network_timeout=int(settings.snowflake_network_timeout_s),
         client_session_keep_alive=False,
     )
+    # Pass the token's mapped user (email/sub) like the ZDP reference does; the
+    # OAuth External integration maps it to the Snowflake user's EMAIL_ADDRESS.
+    _mapped_user = _user_from_token(token)
+    if _mapped_user:
+        conn_kwargs["user"] = _mapped_user
+    conn = snowflake.connector.connect(**conn_kwargs)
     try:
         cur = conn.cursor()
         try:

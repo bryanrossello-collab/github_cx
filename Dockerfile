@@ -34,6 +34,7 @@ COPY app        ./app
 COPY migrations ./migrations
 COPY seeds      ./seeds
 COPY public     ./public
+COPY sql        ./sql
 
 
 ############################
@@ -68,6 +69,7 @@ COPY --from=builder /build/app        /app/app
 COPY --from=builder /build/migrations /app/migrations
 COPY --from=builder /build/seeds      /app/seeds
 COPY --from=builder /build/public     /app/public
+COPY --from=builder /build/sql        /app/sql
 
 USER app:app
 

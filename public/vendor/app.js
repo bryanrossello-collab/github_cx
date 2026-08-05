@@ -8793,8 +8793,21 @@ function generateWeeklyBriefHtml(brief, opts) {
   const newFc = sec.new_forecast || [];
   const curEff = (brief.current && brief.current.effective_date || "").slice(0, 10);
   const priEff = (brief.prior && brief.prior.effective_date || "").slice(0, 10) || "\u2014";
-  const scopeLine = `${esc(brief.quarter || "\u2014")} \u00b7 Band ${esc(brief.band || "100k+")} \u00b7 ${curEff} vs ${priEff}`;
-  const regionFilter = opts && opts.region && opts.region !== "__ALL__" ? opts.region : null;
+  // Applied filters (echoed by the server) so the exported brief states
+  // exactly what is scoping the numbers.
+  const f = brief.filters || {};
+  const filterBits = [];
+  if (f.region && f.region !== "__ALL__") filterBits.push("Region: " + f.region);
+  if (f.sub_region && f.sub_region !== "__ALL__") filterBits.push("Sub-region: " + f.sub_region);
+  if (f.cs_manager && f.cs_manager !== "__ALL__") filterBits.push("CS mgr: " + f.cs_manager);
+  if (f.segment && f.segment !== "__ALL__") filterBits.push("Segment: " + f.segment);
+  if (f.owner && f.owner !== "__ALL__") filterBits.push("Owner: " + f.owner);
+  if (f.arr_min != null) filterBits.push("ARR \u2265 " + fmtD(f.arr_min));
+  if (f.arr_max != null) filterBits.push("ARR \u2264 " + fmtD(f.arr_max));
+  const thr = opts && opts.threshold != null ? opts.threshold : brief.threshold;
+  if (thr != null) filterBits.push("Large \u2265 " + fmtD(thr));
+  const scopeLine = `${esc(brief.quarter || "\u2014")} \u00b7 Band ${esc(brief.band || "100k+")} \u00b7 ${curEff} vs ${priEff}${filterBits.length ? " \u00b7 " + esc(filterBits.join(" \u00b7 ")) : ""}`;
+  const regionFilter = f.region && f.region !== "__ALL__" ? f.region : (opts && opts.region && opts.region !== "__ALL__" ? opts.region : null);
   const inRegion = (row) => !regionFilter || row.region === regionFilter;
   // Deltas: for BU FC, a positive swing == more churn/contraction == worse (red).
   const buDeltaColor = (n) => n > 0 ? "#ef4444" : n < 0 ? "#22c55e" : "#64748b";
@@ -8815,19 +8828,25 @@ ${!regionFilter ? `<tr style="font-weight:700;border-top:2px solid #e5e7eb"><td>
   const trendHtml = bu.trend && bu.trend.length > 1 ? (() => {
     const rows = bu.trend.map((t, i) => {
       const v = t.total_bu_fc || 0;
+      const adj = t.total_adjusted_fc != null ? t.total_adjusted_fc : v;
+      const gap = t.gap != null ? t.gap : adj - v;
       const prev = i > 0 ? (bu.trend[i - 1].total_bu_fc || 0) : null;
       const d = prev == null ? null : v - prev;
       const dp = prev == null || prev === 0 ? null : d / Math.abs(prev) * 100;
-      return { date: (t.effective_date || "").slice(0, 10), v, d, dp, file: t.filename || "" };
+      return { date: (t.effective_date || "").slice(0, 10), v, adj, gap, d, dp };
     });
     const first = rows[0], last = rows[rows.length - 1];
     const regionLabel = regionFilter || "All regions";
+    const gapColor = Math.abs(last.gap) > 0.5 ? buDeltaColor(last.gap) : "#64748b";
     return `
-<h3 style="font-size:12px;font-weight:700;margin:16px 0 4px">BU Forecast Trend (over time)</h3>
-<p class="sub" style="margin:0 0 6px">Latest <strong>${fmtDash(last.v)}</strong>${last.d != null ? ` <span style="color:${buDeltaColor(last.d)};font-weight:600">${signed(last.d)} (${pctS(last.dp)}) WoW</span>` : ""} &middot; ${esc(regionLabel)} &middot; ${esc(first.date)} &rarr; ${esc(last.date)}</p>
+<h3 style="font-size:12px;font-weight:700;margin:16px 0 4px">BU vs Adjusted (ELT) Forecast Trend (over time)</h3>
+<p style="font-size:12px;margin:0 0 2px">Latest BU <strong style="color:#0369a1">${fmtDash(last.v)}</strong> &nbsp;&middot;&nbsp; Adjusted <strong style="color:#6366f1">${fmtDash(last.adj)}</strong> &nbsp;&middot;&nbsp; gap <strong style="color:${gapColor}">${signed(last.gap)}</strong></p>
+${last.d != null ? `<p class="sub" style="margin:0 0 2px;color:${buDeltaColor(last.d)};font-weight:600">BU WoW ${signed(last.d)} (${pctS(last.dp)})</p>` : ""}
+<p class="sub" style="margin:0 0 6px">${esc(regionLabel)} &middot; ${esc(first.date)} &rarr; ${esc(last.date)}</p>
+<p class="sub" style="margin:0 0 6px;font-size:9px">BU = system bottoms-up forecast &middot; Adjusted = ELT / calls applied as-of each snapshot (falls back to BU where no call exists) &middot; gap = Adjusted \u2212 BU.</p>
 <table>
-<tr><th>Week (date)</th><th class="r">BU FC</th><th class="r">WoW \u0394$</th><th class="r">WoW \u0394%</th></tr>
-${rows.map((r) => `<tr><td>${esc(r.date)}</td><td class="r">${fmtDash(r.v)}</td><td class="r" style="color:${r.d == null ? "#9ca3af" : buDeltaColor(r.d)};font-weight:600">${r.d == null ? "\u2014" : signed(r.d)}</td><td class="r" style="color:${r.dp == null ? "#9ca3af" : buDeltaColor(r.d)}">${r.dp == null ? "\u2014" : pctS(r.dp)}</td></tr>`).join("\n")}
+<tr><th>Week (date)</th><th class="r">BU FC</th><th class="r">Adjusted FC</th><th class="r">\u0394 (Adj\u2212BU)</th></tr>
+${rows.map((r) => `<tr><td>${esc(r.date)}</td><td class="r">${fmtDash(r.v)}</td><td class="r" style="color:#6366f1;font-weight:600">${fmtDash(r.adj)}</td><td class="r" style="color:${r.gap === 0 ? "#9ca3af" : buDeltaColor(r.gap)};font-weight:600">${r.gap === 0 ? "\u2014" : signed(r.gap)}</td></tr>`).join("\n")}
 </table>`;
   })() : "";
   const worsenedTable = (rows) => rows.length ? `
@@ -8893,7 +8912,7 @@ tr:hover{background:#f9fafb}
 @media print{body{padding:20px;font-size:11px}.kpi .val{font-size:16px}}
 </style></head><body>
 <h1>Weekly 100K+ Regional Brief</h1>
-<p class="sub">${scopeLine} &middot; Generated ${genDate}${regionFilter ? " &middot; Region: " + esc(regionFilter) : ""}</p>
+<p class="sub">${scopeLine} &middot; Generated ${genDate}</p>
 ${brief.warning ? `<p style="background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:8px 12px;font-size:11px;color:#92400e;margin-bottom:16px">${esc(brief.warning)}</p>` : ""}
 <div class="kpi-row">
 ${kpiCards.map((c) => `<div class="kpi"><div class="label" style="color:${c.color}">${c.label}</div><div class="val">${c.val}</div><div class="detail">${esc(c.detail)}</div></div>`).join("\n")}
@@ -8924,9 +8943,23 @@ function WeeklyBriefTab() {
   const fmtMoney = fmtCompact;
   const signed = (n) => (n >= 0 ? "+" : "\u2212") + fmtMoney(Math.abs(n));
   const pctS = (v) => v == null || !isFinite(v) ? "\u2014" : (v >= 0 ? "+" : "") + v.toFixed(1) + "%";
+  // Consume the app's shared filter state so the brief opens pre-scoped to
+  // whatever the rest of the dashboard is narrowed to (same mechanism, not a
+  // parallel one). Single-valued app selections seed the brief's dimensions;
+  // the CCO defaults (band 100k+, current quarter) remain the fallback.
+  const { state } = useApp();
+  const sf = state && state.filters || {};
+  const firstOf = (arr) => Array.isArray(arr) && arr.length === 1 ? arr[0] : "__ALL__";
+  const BAND_DEFAULT = "100k+";
   const [currentId, setCurrentId] = useState("");
   const [priorId, setPriorId] = useState("");
-  const [region, setRegion] = useState("__ALL__");
+  const [region, setRegion] = useState(() => firstOf(sf.regions));
+  const [subRegion, setSubRegion] = useState("__ALL__");
+  const [csManager, setCsManager] = useState("__ALL__");
+  const [segment, setSegment] = useState(() => firstOf(sf.segments));
+  const [owner, setOwner] = useState(() => firstOf(sf.owners));
+  const [quarter, setQuarter] = useState(() => Array.isArray(sf.quarters) && sf.quarters.length === 1 ? sf.quarters[0] : "");
+  const [band, setBand] = useState(BAND_DEFAULT);
   const [threshold, setThreshold] = useState(50000);
   const [brief, setBrief] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -8939,10 +8972,17 @@ function WeeklyBriefTab() {
     const qs = new URLSearchParams({ slot: "active", threshold: String(threshold || 0) });
     if (currentId) qs.set("current", currentId);
     if (priorId) qs.set("prior", priorId);
-    // Region is filtered SERVER-side so every section — including the trend
-    // series — is scoped consistently. It MUST be in the fetch params AND the
-    // effect deps below, otherwise the trend would ignore the selection.
+    // Every filter is applied SERVER-side so all sections — including BOTH
+    // trend series — are scoped consistently. Each active dimension MUST be
+    // in the fetch params AND the effect deps below, or the trend would
+    // ignore the selection.
     if (region && region !== "__ALL__") qs.set("region", region);
+    if (subRegion && subRegion !== "__ALL__") qs.set("sub_region", subRegion);
+    if (csManager && csManager !== "__ALL__") qs.set("cs_manager", csManager);
+    if (segment && segment !== "__ALL__") qs.set("segment", segment);
+    if (owner && owner !== "__ALL__") qs.set("owner", owner);
+    if (quarter) qs.set("quarter", quarter);
+    if (band && band !== BAND_DEFAULT) qs.set("band", band);
     fetch("/api/renewals/weekly-brief?" + qs.toString(), { cache: "no-store" }).then((r) => r.json()).then((data) => {
       if (cancelled) return;
       if (!data.ok) throw new Error(data.detail || "Weekly brief load failed");
@@ -8958,7 +8998,7 @@ function WeeklyBriefTab() {
       if (!cancelled) setLoading(false);
     });
     return () => { cancelled = true; };
-  }, [currentId, priorId, threshold, region]);
+  }, [currentId, priorId, threshold, region, subRegion, csManager, segment, owner, quarter, band]);
   const sec = brief && brief.sections;
   const bu = sec && sec.bu_movement || { regions: [], rollup: {}, trend: [] };
   const rollup = bu.rollup || {};
@@ -8967,23 +9007,61 @@ function WeeklyBriefTab() {
   const worsened = sec && sec.worsened || [];
   const newFc = sec && sec.new_forecast || [];
   const regionRows = bu.regions || [];
-  // Region options come from the UNfiltered available_regions so the selector
-  // stays fully populated even while viewing a single region.
+  // Options come from the UNfiltered available_* lists so every selector stays
+  // fully populated even while a value is active.
   const regionOptions = brief && brief.available_regions || (bu.regions || []).map((r) => r.region);
+  const subRegionOptions = brief && brief.available_sub_regions || [];
+  const csManagerOptions = brief && brief.available_cs_managers || [];
+  const segmentOptions = brief && brief.available_segments || [];
+  const ownerOptions = brief && brief.available_owners || [];
   const snapshots = brief && brief.snapshots || [];
   const buDeltaColor = (n) => n > 0 ? "#ef4444" : n < 0 ? "#22c55e" : "#64748b";
   const upDeltaColor = (n) => n > 0 ? "#22c55e" : n < 0 ? "#ef4444" : "#64748b";
   const snapLabel = (s) => `${(s.effective_date || "").slice(0, 10)} \u00b7 ${s.filename || ("#" + s.id)}`;
   const cell = (txt, cls) => /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 " + (cls || "") }, txt);
   const th = (txt, cls) => /* @__PURE__ */ React.createElement("th", { key: txt, className: "px-2 py-1.5 text-left font-semibold uppercase tracking-wider " + (cls || "") }, txt);
+  // Shared payload for both the download button and the applied-filter chips.
+  const dlOpts = { region, subRegion, csManager, segment, owner, quarter, band, threshold };
+  // A labelled <select> control that mirrors the app's filter styling. "All"
+  // maps to the sentinel "__ALL__".
+  const filterSelect = (label, value, setter, opts, allLabel) => /* @__PURE__ */ React.createElement(
+    "div",
+    { key: label },
+    /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, label),
+    /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value, onChange: (e) => setter(e.target.value) },
+      /* @__PURE__ */ React.createElement("option", { value: "__ALL__" }, allLabel || "All"),
+      (opts || []).map((o) => /* @__PURE__ */ React.createElement("option", { key: o, value: o }, o)))
+  );
   // ---- controls -----------------------------------------------------------
+  const quarterOptions = brief && brief.quarter_labels || [];
   const controls = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3 flex flex-wrap gap-3 items-end" },
     /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Current snapshot"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: currentId, onChange: (e) => setCurrentId(e.target.value) }, snapshots.map((s) => /* @__PURE__ */ React.createElement("option", { key: s.id, value: String(s.id) }, snapLabel(s))))),
     /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Compare to (prior)"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: priorId, onChange: (e) => setPriorId(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Auto (previous)"), snapshots.map((s) => /* @__PURE__ */ React.createElement("option", { key: s.id, value: String(s.id) }, snapLabel(s))))),
-    /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Region"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: region, onChange: (e) => setRegion(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "__ALL__" }, "All regions"), regionOptions.map((r) => /* @__PURE__ */ React.createElement("option", { key: r, value: r }, r)))),
+    filterSelect("Region", region, setRegion, regionOptions, "All regions"),
+    filterSelect("Sub-region", subRegion, setSubRegion, subRegionOptions, "All sub-regions"),
+    filterSelect("CS manager", csManager, setCsManager, csManagerOptions, "All CS managers"),
+    filterSelect("Segment", segment, setSegment, segmentOptions, "All segments"),
+    filterSelect("Owner", owner, setOwner, ownerOptions, "All owners"),
+    /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Quarter"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: quarter, onChange: (e) => setQuarter(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Auto (current)"), quarterOptions.map((q) => /* @__PURE__ */ React.createElement("option", { key: q, value: q }, q)), quarter && !quarterOptions.includes(quarter) ? /* @__PURE__ */ React.createElement("option", { value: quarter }, quarter) : null)),
+    /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Band"), /* @__PURE__ */ React.createElement("input", { className: "filter-input text-xs w-24", type: "text", value: band, onChange: (e) => setBand(e.target.value), placeholder: "100k+" })),
     /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Large threshold ($)"), /* @__PURE__ */ React.createElement("input", { className: "filter-input text-xs w-28", type: "number", step: "5000", value: threshold, onChange: (e) => setThreshold(Number(e.target.value) || 0) })),
-    /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-indigo ml-auto", disabled: !brief || !brief.sections, onClick: () => brief && generateWeeklyBriefHtml(brief, { region }) }, "Download brief"),
-    brief && brief.quarter && /* @__PURE__ */ React.createElement("div", { className: "w-full text-[10px] text-indigo-600 dark:text-indigo-400 font-semibold" }, "Quarter: ", brief.quarter, brief.quarter_auto_selected ? " (auto)" : "", " \u00b7 Band: ", brief.band, brief.current && brief.prior ? ` \u00b7 ${(brief.current.effective_date || "").slice(0, 10)} vs ${(brief.prior.effective_date || "").slice(0, 10)}` : ""));
+    /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-indigo ml-auto", disabled: !brief || !brief.sections, onClick: () => brief && generateWeeklyBriefHtml(brief, dlOpts) }, "Download brief"));
+  // ---- applied-filters chip strip (mirrors the Region tab's removable chips)
+  const mkChip = (key, label, onRemove, extra) => /* @__PURE__ */ React.createElement("span", { key, className: "region-filter-chip region-filter-chip-removable" + (extra ? " " + extra : "") }, /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip-label" }, label), /* @__PURE__ */ React.createElement("button", { type: "button", className: "region-filter-chip-x", "aria-label": "Clear " + label, onClick: () => onRemove() }, "\u00D7"));
+  const mutedChip = (key, label) => /* @__PURE__ */ React.createElement("span", { key, className: "region-filter-chip region-filter-chip-muted" }, label);
+  const chips = [];
+  chips.push(mutedChip("band", "Band: " + (brief && brief.band || band)));
+  chips.push(brief && brief.quarter ? mutedChip("q", "Quarter: " + brief.quarter + (brief.quarter_auto_selected ? " (auto)" : "")) : null);
+  if (region !== "__ALL__") chips.push(mkChip("region", "Region: " + region, () => setRegion("__ALL__"), "region-filter-chip-emerald"));
+  if (subRegion !== "__ALL__") chips.push(mkChip("sub", "Sub-region: " + subRegion, () => setSubRegion("__ALL__")));
+  if (csManager !== "__ALL__") chips.push(mkChip("csm", "CS mgr: " + csManager, () => setCsManager("__ALL__")));
+  if (segment !== "__ALL__") chips.push(mkChip("seg", "Segment: " + segment, () => setSegment("__ALL__")));
+  if (owner !== "__ALL__") chips.push(mkChip("own", "Owner: " + owner, () => setOwner("__ALL__")));
+  chips.push(mutedChip("thr", "Large \u2265 " + fmtMoney(threshold)));
+  if (brief && brief.current) chips.push(mutedChip("pair", "Weeks: " + (brief.prior ? (brief.prior.effective_date || "").slice(0, 10) + " \u2192 " : "") + (brief.current.effective_date || "").slice(0, 10)));
+  const anyRemovable = region !== "__ALL__" || subRegion !== "__ALL__" || csManager !== "__ALL__" || segment !== "__ALL__" || owner !== "__ALL__";
+  if (anyRemovable) chips.push(/* @__PURE__ */ React.createElement("button", { key: "reset", type: "button", className: "region-filter-reset", onClick: () => { setRegion("__ALL__"); setSubRegion("__ALL__"); setCsManager("__ALL__"); setSegment("__ALL__"); setOwner("__ALL__"); } }, "Reset filters"));
+  const chipStrip = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface px-3 py-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 flex-wrap" }, /* @__PURE__ */ React.createElement("span", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mr-1" }, "Applied filters"), /* @__PURE__ */ React.createElement("div", { className: "region-filter-summary" }, chips)));
   if (loading && !brief) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500" }, "Loading weekly brief\u2026"));
   if (err) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-red-500" }, err));
   if (!sec) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500" }, brief && brief.warning || "Upload at least two active CSV snapshots to compare week over week."));
@@ -9003,78 +9081,125 @@ function WeeklyBriefTab() {
       /* @__PURE__ */ React.createElement("tbody", null,
         regionRows.map((o) => /* @__PURE__ */ React.createElement("tr", { key: o.region, className: "glass-row-accent" }, cell(o.region, "font-medium"), cell(o.accounts, "text-right tabular-nums"), cell(fmtC(o.prior), "text-right tabular-nums"), cell(fmtC(o.current), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: buDeltaColor(o.delta) } }, signed(o.delta)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: buDeltaColor(o.delta) } }, pctS(o.delta_pct)))),
         region === "__ALL__" && /* @__PURE__ */ React.createElement("tr", { className: "font-bold border-t-2", style: { borderColor: "var(--border)" } }, cell("Total"), cell(rollup.accounts || 0, "text-right tabular-nums"), cell(fmtC(rollup.prior), "text-right tabular-nums"), cell(fmtC(rollup.current), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: buDeltaColor(rollup.delta || 0) } }, signed(rollup.delta || 0)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: buDeltaColor(rollup.delta || 0) } }, pctS(rollup.delta_pct)))))));
-  // ---- Trend chart (BU forecast over time) --------------------------------
+  // ---- Trend chart (BU vs Adjusted/ELT forecast over time) ----------------
   const trend = bu.trend || [];
   let trendCard = null;
   if (trend.length > 1) {
-    // Per-point WoW deltas. BU_FC is forecasted churn/contraction, so an
-    // increase (positive delta) is WORSE (red) and a decrease is better.
+    const BU_COLOR = "#0ea5e9", ADJ_COLOR = "#6366f1";
+    // BU_FC = forecasted churn/contraction; higher = worse. The gap
+    // (Adjusted \u2212 BU) shows how much the teams' calls move the number.
     const trendRows = trend.map((t, i) => {
-      const v = t.total_bu_fc || 0;
-      const prev = i > 0 ? (trend[i - 1].total_bu_fc || 0) : null;
-      const d = prev == null ? null : v - prev;
-      const dp = prev == null || prev === 0 ? null : d / Math.abs(prev) * 100;
-      return { date: (t.effective_date || "").slice(0, 10), v, d, dp, file: t.filename || "" };
+      const buv = t.total_bu_fc || 0;
+      const adj = t.total_adjusted_fc != null ? t.total_adjusted_fc : buv;
+      const gap = t.gap != null ? t.gap : adj - buv;
+      const prevBu = i > 0 ? (trend[i - 1].total_bu_fc || 0) : null;
+      const d = prevBu == null ? null : buv - prevBu;
+      const dp = prevBu == null || prevBu === 0 ? null : d / Math.abs(prevBu) * 100;
+      return { date: (t.effective_date || "").slice(0, 10), bu: buv, adj, gap, d, dp };
     });
     const first = trendRows[0];
     const latest = trendRows[trendRows.length - 1];
     const regionLabel = region === "__ALL__" ? "All regions" : region;
-    // ---- chart geometry ----
-    const w = 720, h = 288, pad = { t: 28, r: 24, b: 58, l: 68 };
+    // ---- chart geometry (domain spans BOTH series) ----
+    const w = 720, h = 300, pad = { t: 30, r: 24, b: 58, l: 68 };
     const iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
-    const vals = trendRows.map((r) => r.v);
-    const rawMin = Math.min(...vals), rawMax = Math.max(...vals);
-    const rng = rawMax - rawMin || Math.abs(rawMax) || 1;
-    let yMax = rawMax + rng * 0.12;
-    let yMin = Math.max(0, rawMin - rng * 0.12);
-    if (yMax === yMin) yMax = yMin + 1;
+    const allVals = trendRows.reduce((a, r) => { a.push(r.bu, r.adj); return a; }, []);
+    const dataMin = Math.min(...allVals), dataMax = Math.max(...allVals);
+    // Nice, human-friendly Y ticks (loose labeling) so the axis reads in
+    // round increments instead of raw data-max fractions.
+    const niceNum = (x, round) => {
+      if (!(x > 0)) return 1;
+      const e = Math.floor(Math.log10(x)), f = x / Math.pow(10, e);
+      const nf = round ? (f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10) : (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10);
+      return nf * Math.pow(10, e);
+    };
+    const N_TICKS = 5;
+    let lo = dataMin, hi = dataMax;
+    if (hi <= lo) hi = lo + Math.abs(lo || 1);
+    const step = niceNum(niceNum(hi - lo, false) / (N_TICKS - 1), true) || 1;
+    const yMin = Math.floor(lo / step) * step;
+    const yMax = Math.ceil(hi / step) * step;
+    const tickCount = Math.max(1, Math.round((yMax - yMin) / step));
     const xAt = (i) => pad.l + (trendRows.length === 1 ? 0 : i / (trendRows.length - 1)) * iw;
-    const yAt = (v) => pad.t + ih - (v - yMin) / (yMax - yMin) * ih;
-    const TICKS = 4;
+    const yAt = (v) => pad.t + ih - (v - yMin) / (yMax - yMin || 1) * ih;
     const gridEls = [];
-    for (let i = 0; i <= TICKS; i++) {
-      const val = yMin + (yMax - yMin) * (i / TICKS);
+    for (let i = 0; i <= tickCount; i++) {
+      const val = yMin + i * step;
       const gy = yAt(val);
       gridEls.push(/* @__PURE__ */ React.createElement("line", { key: "g" + i, x1: pad.l, y1: gy, x2: w - pad.r, y2: gy, stroke: "currentColor", strokeWidth: 1, className: "text-gray-200 dark:text-gray-700", opacity: 0.7 }));
       gridEls.push(/* @__PURE__ */ React.createElement("text", { key: "gt" + i, x: pad.l - 8, y: gy + 3, textAnchor: "end", fontSize: 10, fill: "currentColor", className: "text-gray-500" }, fmtMoney(val)));
     }
-    const coords = trendRows.map((r, i) => `${xAt(i).toFixed(1)},${yAt(r.v).toFixed(1)}`).join(" ");
-    const labelAll = trendRows.length <= 5;
+    const buCoords = trendRows.map((r, i) => `${xAt(i).toFixed(1)},${yAt(r.bu).toFixed(1)}`).join(" ");
+    const adjCoords = trendRows.map((r, i) => `${xAt(i).toFixed(1)},${yAt(r.adj).toFixed(1)}`).join(" ");
+    const GAP_EPS = 0.5;
+    const anyDiv = trendRows.some((r) => Math.abs(r.gap) > GAP_EPS);
+    // Shade the area between the two lines. Where they coincide the band has
+    // zero height (invisible); where they diverge, the gap reads at a glance.
+    const bandEl = anyDiv ? /* @__PURE__ */ React.createElement("polygon", {
+      points: trendRows.map((r, i) => `${xAt(i).toFixed(1)},${yAt(r.adj).toFixed(1)}`).concat(trendRows.map((r, i) => `${xAt(trendRows.length - 1 - i).toFixed(1)},${yAt(trendRows[trendRows.length - 1 - i].bu).toFixed(1)}`)).join(" "),
+      fill: ADJ_COLOR, opacity: 0.14, stroke: "none"
+    }) : null;
+    // Labels: one per point. A single BU label where the lines coincide; a
+    // second (Adjusted) label ONLY where they diverge, offset so the two
+    // never overlap (higher point labelled above, lower point below). To keep
+    // the chart uncluttered, only first / last / divergence points are
+    // labelled (tooltip + table carry the rest).
+    const lastIdx = trendRows.length - 1;
+    const labelAll = trendRows.length <= 4;
     const pointEls = [];
+    const labelEls = [];
     trendRows.forEach((r, i) => {
-      const cx = xAt(i), cy = yAt(r.v);
-      const showLabel = labelAll || i === 0 || i === trendRows.length - 1;
-      const tip = `${r.date}\nBU FC ${fmtMoney(r.v)}` + (r.d == null ? "\n(baseline)" : `\nWoW ${signed(r.d)} (${pctS(r.dp)})`);
-      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "pc" + i, cx, cy, r: 3.5, fill: "#0ea5e9" }));
-      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "ph" + i, cx, cy, r: 12, fill: "transparent" }, /* @__PURE__ */ React.createElement("title", null, tip)));
-      if (showLabel) {
-        pointEls.push(/* @__PURE__ */ React.createElement("text", { key: "pl" + i, x: cx, y: cy - 9, textAnchor: "middle", fontSize: 10, fontWeight: 700, fill: "currentColor", className: "text-sky-700 dark:text-sky-300" }, fmtMoney(r.v)));
+      const bx = xAt(i), by = yAt(r.bu), ay = yAt(r.adj);
+      const isDiv = Math.abs(r.gap) > GAP_EPS;
+      const tip = `${r.date}\nBU FC ${fmtMoney(r.bu)}\nAdjusted (ELT) ${fmtMoney(r.adj)}\nGap (Adj\u2212BU) ${signed(r.gap)}` + (r.d == null ? "" : `\nBU WoW ${signed(r.d)} (${pctS(r.dp)})`);
+      // BU marker at every point; Adjusted marker only where it diverges.
+      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "bc" + i, cx: bx, cy: by, r: 3, fill: BU_COLOR }));
+      if (isDiv) pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "ac" + i, cx: bx, cy: ay, r: 3.8, fill: ADJ_COLOR, stroke: "#fff", strokeWidth: 1 }));
+      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "bh" + i, cx: bx, cy: by, r: 12, fill: "transparent" }, /* @__PURE__ */ React.createElement("title", null, tip)));
+      if (isDiv) pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "ah" + i, cx: bx, cy: ay, r: 12, fill: "transparent" }, /* @__PURE__ */ React.createElement("title", null, tip)));
+      if (labelAll || i === 0 || i === lastIdx || isDiv) {
+        if (isDiv) {
+          const topIsAdj = ay <= by;
+          const topY = Math.min(ay, by), botY = Math.max(ay, by);
+          labelEls.push(/* @__PURE__ */ React.createElement("text", { key: "lt" + i, x: bx, y: topY - 8, textAnchor: "middle", fontSize: 10, fontWeight: 700, fill: topIsAdj ? ADJ_COLOR : BU_COLOR }, fmtMoney(topIsAdj ? r.adj : r.bu)));
+          labelEls.push(/* @__PURE__ */ React.createElement("text", { key: "lb" + i, x: bx, y: botY + 15, textAnchor: "middle", fontSize: 10, fontWeight: 700, fill: topIsAdj ? BU_COLOR : ADJ_COLOR }, fmtMoney(topIsAdj ? r.bu : r.adj)));
+        } else {
+          labelEls.push(/* @__PURE__ */ React.createElement("text", { key: "lc" + i, x: bx, y: by - 8, textAnchor: "middle", fontSize: 10, fontWeight: 700, fill: BU_COLOR }, fmtMoney(r.bu)));
+        }
       }
     });
     const xLabelEls = trendRows.map((r, i) => /* @__PURE__ */ React.createElement("text", { key: "x" + i, x: xAt(i), y: h - pad.b + 16, textAnchor: "middle", fontSize: 9, fill: "currentColor", className: "text-gray-500" }, r.date.slice(5)));
     const axisLine = /* @__PURE__ */ React.createElement("line", { x1: pad.l, y1: pad.t + ih, x2: w - pad.r, y2: pad.t + ih, stroke: "currentColor", strokeWidth: 1, className: "text-gray-300 dark:text-gray-600" });
-    const yTitle = /* @__PURE__ */ React.createElement("text", { x: 14, y: pad.t + ih / 2, textAnchor: "middle", fontSize: 10, fontWeight: 600, fill: "currentColor", className: "text-gray-500", transform: `rotate(-90 14 ${pad.t + ih / 2})` }, "BU FC (C/C)");
+    const yTitle = /* @__PURE__ */ React.createElement("text", { x: 14, y: pad.t + ih / 2, textAnchor: "middle", fontSize: 10, fontWeight: 600, fill: "currentColor", className: "text-gray-500", transform: `rotate(-90 14 ${pad.t + ih / 2})` }, "Forecast (C/C)");
     const xTitle = /* @__PURE__ */ React.createElement("text", { x: pad.l + iw / 2, y: h - 4, textAnchor: "middle", fontSize: 10, fontWeight: 600, fill: "currentColor", className: "text-gray-500" }, "Snapshot week (effective date)");
-    const svg = /* @__PURE__ */ React.createElement("svg", { viewBox: `0 0 ${w} ${h}`, className: "wb-trend-chart", role: "img", "aria-label": `BU forecast over time for ${regionLabel}` }, gridEls, axisLine, /* @__PURE__ */ React.createElement("polyline", { fill: "none", stroke: "#0ea5e9", strokeWidth: 2.5, strokeLinejoin: "round", strokeLinecap: "round", points: coords }), pointEls, xLabelEls, yTitle, xTitle);
-    // ---- headline callout ----
+    const svg = /* @__PURE__ */ React.createElement("svg", { viewBox: `0 0 ${w} ${h}`, className: "wb-trend-chart", role: "img", "aria-label": `BU vs adjusted forecast over time for ${regionLabel}` }, gridEls, bandEl, axisLine, /* @__PURE__ */ React.createElement("polyline", { fill: "none", stroke: BU_COLOR, strokeWidth: 2.5, strokeLinejoin: "round", strokeLinecap: "round", points: buCoords }), /* @__PURE__ */ React.createElement("polyline", { fill: "none", stroke: ADJ_COLOR, strokeWidth: 2, strokeDasharray: "6 3", strokeLinejoin: "round", strokeLinecap: "round", points: adjCoords }), pointEls, labelEls, xLabelEls, yTitle, xTitle);
+    // ---- legend ----
+    const legend = /* @__PURE__ */ React.createElement("div", { className: "wb-trend-legend" },
+      /* @__PURE__ */ React.createElement("span", { className: "wb-trend-legend-item" }, /* @__PURE__ */ React.createElement("span", { className: "wb-trend-swatch", style: { background: BU_COLOR } }), "BU forecast (system)"),
+      /* @__PURE__ */ React.createElement("span", { className: "wb-trend-legend-item" }, /* @__PURE__ */ React.createElement("span", { className: "wb-trend-swatch wb-trend-swatch-dash", style: { color: ADJ_COLOR } }), "Adjusted \u2014 ELT / calls (as-of)"));
+    // ---- headline callout (scannable: primary amounts, WoW as a separate
+    //      secondary line) ----
+    const gapColor = Math.abs(latest.gap) > GAP_EPS ? buDeltaColor(latest.gap) : "#64748b";
     const headline = /* @__PURE__ */ React.createElement("div", { className: "wb-trend-headline" },
-      /* @__PURE__ */ React.createElement("div", null,
-        /* @__PURE__ */ React.createElement("span", { className: "wb-trend-headline-value tabular-nums" }, fmtC(latest.v)),
-        latest.d != null && /* @__PURE__ */ React.createElement("span", { className: "wb-trend-headline-delta tabular-nums", style: { color: buDeltaColor(latest.d) } }, "  ", signed(latest.d), " (", pctS(latest.dp), ") WoW")),
-      /* @__PURE__ */ React.createElement("div", { className: "wb-trend-headline-sub" }, "Latest BU forecast \u00b7 ", regionLabel, " \u00b7 ", first.date, " \u2192 ", latest.date));
-    // ---- companion data table ("need to see amounts") ----
+      /* @__PURE__ */ React.createElement("div", { className: "wb-trend-headline-primary" },
+        /* @__PURE__ */ React.createElement("span", null, "Latest BU ", /* @__PURE__ */ React.createElement("b", { style: { color: BU_COLOR } }, fmtC(latest.bu))),
+        /* @__PURE__ */ React.createElement("span", null, "Adjusted ", /* @__PURE__ */ React.createElement("b", { style: { color: ADJ_COLOR } }, fmtC(latest.adj))),
+        /* @__PURE__ */ React.createElement("span", null, "gap ", /* @__PURE__ */ React.createElement("b", { style: { color: gapColor } }, signed(latest.gap)))),
+      latest.d != null && /* @__PURE__ */ React.createElement("div", { className: "wb-trend-headline-wow", style: { color: buDeltaColor(latest.d) } }, "BU WoW ", signed(latest.d), " (", pctS(latest.dp), ")"),
+      /* @__PURE__ */ React.createElement("div", { className: "wb-trend-headline-sub" }, regionLabel, " \u00b7 ", first.date, " \u2192 ", latest.date));
+    // ---- companion data table (Week \u00b7 BU FC \u00b7 Adjusted FC \u00b7 gap) ----
     const tableEl = /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto mt-3" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
-      /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Week (date)", "BU FC", "WoW \u0394$", "WoW \u0394%"].map((hh, i) => th(hh, i > 0 ? "text-right" : "")))),
+      /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Week (date)", "BU FC", "Adjusted FC", "\u0394 (Adj\u2212BU)"].map((hh, i) => th(hh, i > 0 ? "text-right" : "")))),
       /* @__PURE__ */ React.createElement("tbody", null, trendRows.map((r, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" },
         cell(r.date, "tabular-nums"),
-        cell(fmtC(r.v), "text-right tabular-nums"),
-        /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: r.d == null ? "#9ca3af" : buDeltaColor(r.d) } }, r.d == null ? "\u2014" : signed(r.d)),
-        /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: r.dp == null ? "#9ca3af" : buDeltaColor(r.d) } }, r.dp == null ? "\u2014" : pctS(r.dp)))))));
+        cell(fmtC(r.bu), "text-right tabular-nums"),
+        cell(fmtC(r.adj), "text-right tabular-nums"),
+        /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: r.gap === 0 ? "#9ca3af" : buDeltaColor(r.gap) } }, r.gap === 0 ? "\u2014" : signed(r.gap)))))));
     trendCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3" },
       /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-1" },
-        /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold" }, "BU forecast over time"),
-        /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500" }, "Higher = more forecasted churn/contraction")),
-      headline, svg, tableEl);
+        /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold" }, "BU vs adjusted (ELT) forecast over time"),
+        /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500" }, "Higher = more forecasted churn/contraction \u00b7 gap = Adj \u2212 BU")),
+      legend, headline, svg, tableEl);
   }
   // ---- Section 2: worsened ------------------------------------------------
   const worsenedCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
@@ -9097,7 +9222,7 @@ function WeeklyBriefTab() {
     /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-3 p-3" },
       /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-emerald-600 mb-1" }, "Top 5 driving increase"), driverTable(upInc, "#22c55e", "None.")),
       /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-red-500 mb-1" }, "Top 5 driving decrease"), driverTable(upDec, "#ef4444", "None."))));
-  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, brief.warning && /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300" }, brief.warning), kpiRow, buRegionCard, trendCard, worsenedCard, newFcCard, upsideCard);
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, chipStrip, brief.warning && /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300" }, brief.warning), kpiRow, buRegionCard, trendCard, worsenedCard, newFcCard, upsideCard);
 }
 function App() {
   const { state, actions, idbReady, serverInfo, csvAutoLoadStatus } = useApp();

@@ -202,6 +202,37 @@ Session 2 — 2026-08-03
   snapshots land (no scheduler in-app).
 ```
 
+```
+Session 3 — 2026-08-03/04
+- User asked for: (a) rebuild the Weekly Brief trend chart to be readable
+  (axes, ticks, tooltips, headline, amounts table) in both the tab and the
+  download; then (b) add an ADJUSTED (ELT/calls-as-of) trend series next to
+  the BU trend; and (c) make the brief use the app's SHARED filters
+  (region/sub-region/CS-manager/segment/owner/ARR) with a visible
+  applied-filters chip strip.
+- Delivered: dual-line trend (BU vs Adjusted) with legend + per-point
+  tooltips (BU, Adjusted, gap) + Week·BU·Adjusted·Δ(Adj−BU) table, in tab
+  and export. Backend weekly-brief now accepts sub_region/cs_manager/segment/
+  owner/arr_min/arr_max (region/quarter/band already), applies them to every
+  section + BOTH trend series, and returns available_* option lists + a
+  filters echo. Adjusted total = per-account latest call as-of the snapshot
+  date, matched on account_id + rounded_atr + NORMALIZED quarter via one
+  indexed LATERAL. Frontend consumes state.filters and renders removable
+  chips (reusing region-filter-chip* classes). Cache-buster → v=20260804a.
+- Verified: py_compile + node --check; live against local Postgres — filters
+  scope all sections + both trend series, and the adjusted line diverges from
+  BU by ~$1.49M on a snapshot where FY27Q3 calls apply as-of.
+- Open question / TODO: none. Residual risks — (1) accounts with no call
+  as-of a snapshot fall back to BU, so the two lines coincide when no calls
+  exist in scope (expected); (2) the adjusted series depends on call
+  cadence + snapshot cadence (calls dated after the only snapshot holding an
+  account won't show); (3) band override is a free-text token (substring
+  match), not a mapped dropdown; (4) sub-region/CS-manager aren't in the
+  app's GLOBAL filter state (they're Region-tab-local), so those two seed as
+  "All" rather than from shared state; (5) interactive UI not rendered in the
+  sandbox (SSO/data gate) — backend contract verified live instead.
+```
+
 ---
 
 ## 3. Communication protocol
@@ -469,16 +500,37 @@ default = latest active snapshot vs the immediately-preceding one),
 `quarter` (any label spelling — `Q3\`27`, `FY27Q3`, `2027Q3`; default =
 auto-detected current fiscal quarter), `band` (default `100k+`),
 `threshold` (default `50000` — the "large mover" cutoff for explanations),
-`region` (default `''`/`__ALL__` = overall rollup). **`region` is applied
-server-side to EVERY section, including the trend series**, so the whole
-brief is uniformly region-scoped; the response's `available_regions` list is
-computed unfiltered so the UI selector stays fully populated. `region` must
-be in the frontend fetch params + effect deps or the trend won't refresh.
+and the **shared filters** `region`, `sub_region`, `cs_manager`, `segment`,
+`owner` (each `''`/`__ALL__` = all for that dimension) plus an ARR range
+`arr_min`/`arr_max` (numeric, on `s.atr`). **Every filter is applied
+server-side to EVERY section AND BOTH trend series** via the same
+`($expr = $N)` pattern, so the whole brief is uniformly scoped. The
+`available_*` option lists are computed UNfiltered (band + quarter only) so
+the UI selectors stay fully populated. Each active dimension must be in the
+frontend fetch params + effect deps or the sections/trend won't refresh.
+
+**Two trend series:** each trend point carries `total_bu_fc` (system
+bottoms-up) AND `total_adjusted_fc` (the ELT / calls-adjusted total) plus
+their `gap` (= adjusted − BU). The adjusted total applies, per in-scope
+account, the latest call (`cs_forecast + renewals_forecast`) from
+`account_call_events` whose `effective_date <= that snapshot's
+effective_date` (as-of reconstruction), else falls back to `bu_fc`. Calls
+are matched to snapshot accounts on `account_id` + `rounded_atr` +
+**normalized quarter** (NOT the raw `call_key` string) because the stored
+call_key encodes the quarter in the app's spelling (`FY27Q4`) while the
+snapshot column uses another (`Q4\`27` / `QQ4\`27`). The match is one
+`LEFT JOIN LATERAL` over the `(call_key, effective_date DESC)` index, bounded
+by the already band+quarter+filter-scoped account set (a few hundred rows
+across a handful of snapshots).
 
 ```json
 {
   "ok": true, "slot": "active", "band": "100k+", "threshold": 50000.0,
-  "region": "__ALL__", "available_regions": ["AMER", "APAC", "EMEA"],
+  "region": "__ALL__",
+  "filters": {"region": "__ALL__", "sub_region": "__ALL__", "cs_manager": "__ALL__",
+              "segment": "__ALL__", "owner": "__ALL__", "arr_min": null, "arr_max": null},
+  "available_regions": ["APAC"], "available_sub_regions": ["ANZ", "Asia", ...],
+  "available_cs_managers": [...], "available_segments": [...], "available_owners": [...],
   "quarter": "Q3`27", "quarter_auto_selected": false,
   "current": {"id": 2, "effective_date": "2026-07-27T...", ...},
   "prior":   {"id": 1, "effective_date": "2026-07-20T...", ...},
@@ -489,7 +541,8 @@ be in the frontend fetch params + effect deps or the trend won't refresh.
       "regions": [{"region": "APAC", "current": 4462552.0, "prior": 3907552.0,
                    "delta": 555000.0, "delta_pct": 14.2, "accounts": 389}],
       "rollup":  {"current": ..., "prior": ..., "delta": ..., "delta_pct": ..., "accounts": ...},
-      "trend":   [{"upload_id": 1, "effective_date": "...", "total_bu_fc": 3907552.0}, ...]
+      "trend":   [{"upload_id": 1, "effective_date": "...", "total_bu_fc": 3907552.0,
+                   "total_adjusted_fc": 4013050.6, "gap": 105498.6}, ...]
     },
     "worsened":     [{"account_id", "account_name", "region", "current_bu_fc",
                       "prior_bu_fc", "swing", "is_large", "explanation?", "explanation_source?"}],
@@ -512,10 +565,23 @@ Semantics (must stay consistent with the dashboard):
   `top_increase`/`top_decrease` are by per-account WoW `delta`.
 
 Additive and read-only — no schema change, frozen shapes untouched.
-**Performance:** every per-snapshot read is filtered to band + quarter in
-SQL (~hundreds of rows), only the single `UPSIDE` key is extracted from
-`raw_row` (never the whole JSONB blob), and the trend is one grouped query
-over the recent-snapshot window — safe for ~50k-row snapshots.
+**Performance:** every per-snapshot read is filtered to band + quarter (+
+shared filters) in SQL (~hundreds of rows), only the single `UPSIDE` key is
+extracted from `raw_row` (never the whole JSONB blob), and the trend (BU +
+adjusted) is one grouped query with a single indexed `LATERAL` per row over
+the recent-snapshot window — safe for ~50k-row snapshots.
+
+**Frontend (`WeeklyBriefTab` in `public/vendor/app.js`):** consumes the
+app's shared `state.filters` (via `useApp()`) to seed region / segment /
+owner / quarter defaults, exposes selectors for region / sub-region / CS
+manager / segment / owner / quarter / band (populated from `available_*`),
+renders an **"applied filters" removable-chip strip** reusing the Region
+tab's `region-filter-chip*` classes, and draws a **dual-line trend** (BU vs
+Adjusted, distinct colors + legend + per-point tooltips showing both values
+and the gap) with a companion `Week · BU FC · Adjusted FC · Δ(Adj−BU)`
+table. `generateWeeklyBriefHtml` mirrors the same amounts table + applied
+filters in the downloadable brief. Chart/legend styles live with the other
+`.wb-trend-*` rules in `public/index.html`.
 
 ---
 

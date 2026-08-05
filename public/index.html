@@ -2407,17 +2407,31 @@
       /* ---- Weekly Brief: BU-forecast trend chart ---------------------- */
       .wb-trend-headline {
         display: flex;
+        flex-direction: column;
+        gap: 3px;
+        margin: 2px 0 10px;
+      }
+      .wb-trend-headline-primary {
+        display: flex;
         flex-wrap: wrap;
         align-items: baseline;
-        justify-content: space-between;
-        gap: 4px 12px;
-        margin: 2px 0 8px;
+        gap: 2px 20px;
+        font-size: 12px;
+        color: rgb(107 114 128);
       }
-      .wb-trend-headline-value {
-        font-size: 22px;
+      .wb-trend-headline-primary b {
+        font-size: 17px;
         font-weight: 700;
-        color: #0369a1;
+        font-variant-numeric: tabular-nums;
+        margin-left: 4px;
       }
+      .wb-trend-headline-wow {
+        font-size: 11px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+      /* Retained for backward compatibility with older markup. */
+      .wb-trend-headline-value { font-size: 22px; font-weight: 700; color: #0369a1; }
       .dark .wb-trend-headline-value { color: #38bdf8; }
       .wb-trend-headline-delta { font-size: 12px; font-weight: 600; }
       .wb-trend-headline-sub {
@@ -2429,6 +2443,28 @@
       }
       .wb-trend-chart { width: 100%; max-width: 760px; height: auto; }
       .wb-trend-chart text { font-variant-numeric: tabular-nums; }
+      .wb-trend-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 16px;
+        margin: 2px 0 6px;
+        font-size: 11px;
+        color: rgb(107 114 128);
+      }
+      .wb-trend-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+      .wb-trend-swatch {
+        display: inline-block;
+        width: 16px;
+        height: 3px;
+        border-radius: 2px;
+      }
+      .wb-trend-swatch-dash {
+        width: 16px;
+        height: 0;
+        border-top: 3px dashed currentColor;
+        border-radius: 0;
+        background: none !important;
+      }
     </style>
   </head>
   <body class="theme-transition">
@@ -2448,7 +2484,7 @@
     <script src="vendor/vibe-session-lock.js"></script>
 
     <!-- App (compiled from app.jsx by ./build.sh) -->
-    <script src="vendor/app.js?v=20260803d"></script>
+    <script src="vendor/app.js?v=20260804b"></script>
 
     <!--
       Container-mode toolbar tweaks. Mounted after the React app so we can
