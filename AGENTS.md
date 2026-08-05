@@ -233,6 +233,92 @@ Session 3 — 2026-08-03/04
   sandbox (SSO/data gate) — backend contract verified live instead.
 ```
 
+```
+Session 4 — 2026-08-04
+- User asked for: drive the Weekly Brief's account scope ENTIRELY from the
+  app's global Filters bar (state.filters) — remove the in-brief scope
+  dropdowns, keep only the snapshot pair + threshold controls, and make the
+  chip strip a read-only 3-group summary (Comparing / Scope / Large-mover
+  cutoff) reflecting the global filters.
+- Delivered (frontend-only, no backend change): WeeklyBriefTab now derives
+  region/segment/owner/quarter/band from state.filters (removed Region /
+  Sub-region / CS-manager / Segment / Owner / Quarter / Band controls +
+  the filterSelect helper). Derivation rules — region/segment/owner: pass a
+  value only when exactly ONE is selected globally (0 or 2+ ⇒ All);
+  quarter: exactly one global quarter ⇒ use it, else auto current fiscal;
+  band: unset/all/100k-family ⇒ 100k+, else global band verbatim. Dropped
+  sub_region + cs_manager from the fetch (endpoint still accepts/ignores).
+  Scope chips are now informational (mutedChip), state multi-selects as
+  "N selected · brief shows All", and a muted hint points to the top bar.
+  Effect deps include region/segment/owner/quarter/band so the brief
+  re-fetches live when the global bar changes. Cache-buster → v=20260804d.
+- Verified: node --check app.js clean. No Python change ⇒ NO server restart
+  needed (endpoint params already existed).
+- Open question / TODO: none. Residual risks — (1) global multi-select for a
+  dimension collapses to "All" for the brief (single-value endpoint); (2)
+  band forwarding: non-100k global band tokens (e.g. gt12k) don't map to the
+  stored CSV band column the endpoint substring-matches, so a non-100k band
+  would empty the brief — the 100K+ brief intentionally pins to 100k+ for the
+  100K family; (3) no ARR range in global state (band encodes ranges), so
+  arr_min/arr_max are not forwarded.
+```
+
+```
+Session 5 — 2026-08-05 (batched, cache-buster v=20260805b)
+- User asked for: (a) show BOTH explanation sources for large movers; (b) fix
+  the Upside KPI tile to use compact currency like the BU tile; (c) add a
+  DOWNSIDE section/tile mirroring Upside.
+- Delivered (a): weekly-brief large-mover records (worsened + new_forecast)
+  carry two nullable fields, `forecast_summary` + `renewals_studio_note`
+  (new _explain_fields helper; each truncated to _EXPLANATION_MAX_CHARS;
+  only is_large). Legacy explanation/explanation_source kept. Tab renders
+  two labeled blocks ("Forecast Summary:" / "Last Renewals Studio Note:")
+  via explainCell; export mirrors via explainHtml. Empty sources omitted;
+  both empty => em-dash.
+- Delivered (b): root cause was fmtCompact/fmtCompactDash not handling
+  negatives (fell through to raw). Fixed both to sign-prefix the abs value
+  (→ "-$10.5M"). The Upside tile already used fmtC, so it now matches the BU
+  tile. signed() passes abs values so no double-sign regression.
+- Delivered (c): _wb_load_accounts also extracts raw_row->>'DOWNSIDE'; a
+  single _movement_section(field) helper builds both sections.upside and
+  sections.downside (identical shape). Frontend adds a Downside KPI tile
+  (kpiRow → sm:grid-cols-5) + a "5 · Downside movement" card; export adds a
+  Downside KPI + Downside movement blocks (overall + per-region) via a
+  generalized moverTable(up, down, label).
+- Sign caveat: UPSIDE/DOWNSIDE are used as-is (no sign re-interpretation), so
+  a total/delta can be negative and the tile reads e.g. -$10.5M.
+- Verified: py_compile + node --check clean. Backend change ⇒ SERVER RESTART
+  REQUIRED (new downside section + explanation fields).
+- Open question / TODO: none. Residual risks — note text is raw saved note
+  (plain-escaped + truncated, not rich text); DOWNSIDE assumed present in
+  raw_row like UPSIDE (missing => 0 via _wb_to_number).
+```
+
+```
+Session 6 — 2026-08-05 (cache-buster v=20260805c)
+- User asked for: reframe the confusing signed Upside/Downside movement into
+  intuitive Best Case / Worst Case ABSOLUTE totals, matching the app's
+  existing Best/Worst Case columns.
+- Delivered: sections.upside/downside REPLACED by sections.best_case /
+  sections.worst_case (same shape). best_case = bu_fc + UPSIDE, worst_case =
+  bu_fc + DOWNSIDE. _movement_section generalized to take a value_fn
+  (lambda e: bu_fc + field); movers rank by per-account WoW change in the
+  case value; mover rows now carry generic current_value/prior_value/delta.
+  Frontend: KPI tiles "Best Case"/"Worst Case" (absolute compact $ + colored
+  WoW using buDeltaColor) + "4 · Best Case movement" / "5 · Worst Case
+  movement" cards via a shared caseCard helper. Export: matching KPI cards
+  (now colored WoW via detailColor) + Best/Worst Case movement blocks
+  (overall + per-region) via generalized moverTable. Delta-color convention
+  = C/C: increase (more churn) = red, decrease = green (driver increase col
+  is now red, decrease col green).
+- Matches app's Best/Worst Case column definitions (BU_FC + UPSIDE / + DOWNSIDE).
+- Verified: py_compile + node --check clean. Backend change ⇒ SERVER RESTART
+  REQUIRED (section rename best_case/worst_case).
+- Open question / TODO: none. Residual risk — assumes UPSIDE negative /
+  DOWNSIDE positive per the data convention; if a row violates that, best/
+  worst ordering for that account could invert (totals still correct).
+```
+
 ---
 
 ## 3. Communication protocol
@@ -509,6 +595,19 @@ server-side to EVERY section AND BOTH trend series** via the same
 the UI selectors stay fully populated. Each active dimension must be in the
 frontend fetch params + effect deps or the sections/trend won't refresh.
 
+**Frontend scope sourcing (as of Session 4):** the endpoint contract is
+unchanged, but the Weekly Brief tab no longer has its own scope dropdowns.
+It sources scope **entirely from the app's global Filters bar**
+(`state.filters`): `region`/`segment`/`owner` are each passed only when
+**exactly one** value is selected globally (0 or 2+ ⇒ that dimension is
+"All"); `quarter` is passed only when exactly one global quarter is
+selected (else the endpoint auto-picks the current fiscal quarter); `band`
+is derived from `filters.band` (unset/`all`/100K-family ⇒ `100k+`, else the
+global band verbatim). `sub_region` and `cs_manager` are **no longer sent**
+(the global bar has no equivalent — the endpoint still accepts/ignores
+them). The brief keeps only its own controls: current/prior snapshot
+selectors and the large-mover threshold.
+
 **Two trend series:** each trend point carries `total_bu_fc` (system
 bottoms-up) AND `total_adjusted_fc` (the ELT / calls-adjusted total) plus
 their `gap` (= adjusted − BU). The adjusted total applies, per in-scope
@@ -545,10 +644,16 @@ across a handful of snapshots).
                    "total_adjusted_fc": 4013050.6, "gap": 105498.6}, ...]
     },
     "worsened":     [{"account_id", "account_name", "region", "current_bu_fc",
-                      "prior_bu_fc", "swing", "is_large", "explanation?", "explanation_source?"}],
-    "new_forecast": [{... "current_bu_fc", "is_large", "explanation?", "explanation_source?"}],
-    "upside": {"current_total", "prior_total", "delta", "delta_pct",
-               "top_increase": [...5], "top_decrease": [...5]}
+                      "prior_bu_fc", "swing", "is_large",
+                      "forecast_summary?", "renewals_studio_note?",
+                      "explanation?", "explanation_source?"}],
+    "new_forecast": [{... "current_bu_fc", "is_large",
+                      "forecast_summary?", "renewals_studio_note?",
+                      "explanation?", "explanation_source?"}],
+    "best_case":  {"current_total", "prior_total", "delta", "delta_pct",
+                   "top_increase": [...5], "top_decrease": [...5]},
+    "worst_case": {"current_total", "prior_total", "delta", "delta_pct",
+                   "top_increase": [...5], "top_decrease": [...5]}
   }
 }
 ```
@@ -558,11 +663,29 @@ Semantics (must stay consistent with the dashboard):
   (`CC% = BU_FC / ATR`). Higher = worse. **"Worsened WoW" = BU_FC
   increased**; `swing = current_bu_fc - prior_bu_fc`, kept when `> 0`,
   ranked descending. `new_forecast` = prior `bu_fc == 0` and current `> 0`.
-* **Explanations are auto-pulled** for movers `>= threshold`: current
-  `forecast_summary` (source `"forecast_summary"`) else the account's saved
-  note (source `"note"`). No manual entry.
-* **Upside** is read from `raw_row->>'UPSIDE'` (not a modelled column);
-  `top_increase`/`top_decrease` are by per-account WoW `delta`.
+* **Explanations are auto-pulled** for movers `>= threshold`, as TWO
+  separate nullable fields (each truncated to `_EXPLANATION_MAX_CHARS`):
+  `forecast_summary` (the account's current-snapshot forecast summary) and
+  `renewals_studio_note` (the account's most recent saved app note, via
+  `note_map[account_id]`). Each is present only when it has content. The UI
+  and export render them as two clearly-labeled blocks ("Forecast Summary:"
+  then "Last Renewals Studio Note:"), omitting any empty source; both empty
+  shows nothing. The legacy single `explanation`/`explanation_source` fields
+  are still emitted for back-compat (forecast_summary preferred, else note).
+  No manual entry.
+* **Best Case / Worst Case** are absolute forecasted-C/C totals matching the
+  app's existing Best/Worst Case columns:
+  `best_case = bu_fc + UPSIDE`, `worst_case = bu_fc + DOWNSIDE` (UPSIDE arrives
+  negative, DOWNSIDE positive, so `best_case <= bu <= worst_case` — best case
+  = least churn). UPSIDE/DOWNSIDE are read from `raw_row->>'UPSIDE'` /
+  `raw_row->>'DOWNSIDE'`. Both sections share the same shape, built by one
+  `_movement_section(value_fn)` helper where `value_fn(entry) = bu_fc + field`;
+  `top_increase`/`top_decrease` rank accounts by per-account WoW change in the
+  Best/Worst Case value (`current − prior`). **Delta-color convention (C/C):**
+  an INCREASE in forecasted C/C = worse = red; a decrease = better = green —
+  same as the BU/worsened coloring, applied to tiles, movement cards, and
+  drivers in both the tab and the export. (The prior signed `upside`/`downside`
+  movement sections were replaced by these.)
 
 Additive and read-only — no schema change, frozen shapes untouched.
 **Performance:** every per-snapshot read is filtered to band + quarter (+

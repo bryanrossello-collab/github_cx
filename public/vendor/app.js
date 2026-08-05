@@ -667,18 +667,22 @@ function formatCurrencyInput(val) {
 }
 function fmtCompact(v) {
   const n = Number(v) || 0;
-  if (n >= 1e9) return `$${(n / 1e9).toFixed(1)}B`;
-  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
-  if (n >= 1e3) return `$${Math.round(n / 1e3)}K`;
-  return `$${Math.round(n).toLocaleString()}`;
+  const s = n < 0 ? "-" : "";
+  const a = Math.abs(n);
+  if (a >= 1e9) return `${s}$${(a / 1e9).toFixed(1)}B`;
+  if (a >= 1e6) return `${s}$${(a / 1e6).toFixed(1)}M`;
+  if (a >= 1e3) return `${s}$${Math.round(a / 1e3)}K`;
+  return `${s}$${Math.round(a).toLocaleString()}`;
 }
 function fmtCompactDash(v) {
   const n = Number(v) || 0;
   if (!n) return "\u2014";
-  if (n >= 1e9) return `$${(n / 1e9).toFixed(1)}B`;
-  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
-  if (n >= 1e3) return `$${(n / 1e3).toFixed(0)}K`;
-  return `$${Math.round(n)}`;
+  const s = n < 0 ? "-" : "";
+  const a = Math.abs(n);
+  if (a >= 1e9) return `${s}$${(a / 1e9).toFixed(1)}B`;
+  if (a >= 1e6) return `${s}$${(a / 1e6).toFixed(1)}M`;
+  if (a >= 1e3) return `${s}$${(a / 1e3).toFixed(0)}K`;
+  return `${s}$${Math.round(a)}`;
 }
 function fmtPctValue(v) {
   return v != null && isFinite(v) ? `${v.toFixed(1)}%` : "\u2014";
@@ -8788,7 +8792,8 @@ function generateWeeklyBriefHtml(brief, opts) {
   const sec = brief.sections || {};
   const bu = sec.bu_movement || { regions: [], rollup: {}, trend: [] };
   const rollup = bu.rollup || {};
-  const upside = sec.upside || {};
+  const bestCase = sec.best_case || {};
+  const worstCase = sec.worst_case || {};
   const worsened = sec.worsened || [];
   const newFc = sec.new_forecast || [];
   const curEff = (brief.current && brief.current.effective_date || "").slice(0, 10);
@@ -8813,10 +8818,11 @@ function generateWeeklyBriefHtml(brief, opts) {
   const buDeltaColor = (n) => n > 0 ? "#ef4444" : n < 0 ? "#22c55e" : "#64748b";
   const upDeltaColor = (n) => n > 0 ? "#22c55e" : n < 0 ? "#ef4444" : "#64748b";
   const kpiCards = [
-    { label: "BU Forecast (C/C)", val: fmtD(rollup.current || 0), detail: `${signed(rollup.delta || 0)} WoW`, color: "#0ea5e9" },
+    { label: "BU Forecast (C/C)", val: fmtD(rollup.current || 0), detail: `${signed(rollup.delta || 0)} WoW`, detailColor: buDeltaColor(rollup.delta || 0), color: "#0ea5e9" },
     { label: "New $0\u2192FC accounts", val: String(newFc.length), detail: `${newFc.filter((r) => r.is_large).length} large`, color: "#f59e0b" },
     { label: "Worsened accounts", val: String(worsened.length), detail: `${worsened.filter((r) => r.is_large).length} \u2265 threshold`, color: "#ef4444" },
-    { label: "Upside", val: fmtD(upside.current_total || 0), detail: `${signed(upside.delta || 0)} WoW`, color: "#8b5cf6" }
+    { label: "Best Case", val: fmtD(bestCase.current_total || 0), detail: `${signed(bestCase.delta || 0)} WoW`, detailColor: buDeltaColor(bestCase.delta || 0), color: "#8b5cf6" },
+    { label: "Worst Case", val: fmtD(worstCase.current_total || 0), detail: `${signed(worstCase.delta || 0)} WoW`, detailColor: buDeltaColor(worstCase.delta || 0), color: "#0d9488" }
   ];
   const regionRows = (regionFilter ? bu.regions.filter((r) => r.region === regionFilter) : bu.regions);
   const buTable = `
@@ -8849,21 +8855,36 @@ ${last.d != null ? `<p class="sub" style="margin:0 0 2px;color:${buDeltaColor(la
 ${rows.map((r) => `<tr><td>${esc(r.date)}</td><td class="r">${fmtDash(r.v)}</td><td class="r" style="color:#6366f1;font-weight:600">${fmtDash(r.adj)}</td><td class="r" style="color:${r.gap === 0 ? "#9ca3af" : buDeltaColor(r.gap)};font-weight:600">${r.gap === 0 ? "\u2014" : signed(r.gap)}</td></tr>`).join("\n")}
 </table>`;
   })() : "";
+  // "What happened" cell: two clearly-labeled source blocks (Forecast Summary
+  // + Last Renewals Studio Note). Each block appears only when its source has
+  // content; both empty => em-dash; below-threshold => muted placeholder.
+  const explainAttr = (d) => [d.forecast_summary ? "Forecast Summary: " + d.forecast_summary : "", d.renewals_studio_note ? "Last Renewals Studio Note: " + d.renewals_studio_note : ""].filter(Boolean).join(" \u2014 ");
+  const explainHtml = (d) => {
+    if (!d.is_large) return "<span style='color:#9ca3af'>below threshold</span>";
+    const parts = [];
+    if (d.forecast_summary) parts.push(`<div><span style="font-weight:600;color:#374151">Forecast Summary:</span> ${esc(d.forecast_summary)}</div>`);
+    if (d.renewals_studio_note) parts.push(`<div style="margin-top:2px"><span style="font-weight:600;color:#374151">Last Renewals Studio Note:</span> ${esc(d.renewals_studio_note)}</div>`);
+    return parts.length ? parts.join("") : "\u2014";
+  };
   const worsenedTable = (rows) => rows.length ? `
 <table>
 <tr><th>Account</th><th>Region</th><th class="r">Prior BU FC</th><th class="r">Current BU FC</th><th class="r">Adverse swing</th><th>What happened</th></tr>
-${rows.map((d) => `<tr><td style="font-weight:500">${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r">${fmtDash(d.prior_bu_fc)}</td><td class="r">${fmtDash(d.current_bu_fc)}</td><td class="r" style="color:#ef4444;font-weight:600">${signed(d.swing)}</td><td class="note-cell" title="${esc(d.explanation || "")}">${d.is_large ? esc(d.explanation || "\u2014") : "<span style='color:#9ca3af'>below threshold</span>"}${d.explanation_source ? ` <span style="color:#9ca3af">(${esc(d.explanation_source)})</span>` : ""}</td></tr>`).join("\n")}
+${rows.map((d) => `<tr><td style="font-weight:500">${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r">${fmtDash(d.prior_bu_fc)}</td><td class="r">${fmtDash(d.current_bu_fc)}</td><td class="r" style="color:#ef4444;font-weight:600">${signed(d.swing)}</td><td class="note-cell" title="${esc(explainAttr(d))}">${explainHtml(d)}</td></tr>`).join("\n")}
 </table>` : `<p style="font-size:11px;color:#9ca3af;margin:6px 0">No worsened accounts.</p>`;
   const newFcTable = (rows) => rows.length ? `
 <table>
 <tr><th>Account</th><th>Region</th><th class="r">New BU FC</th><th>What happened</th></tr>
-${rows.map((d) => `<tr><td style="font-weight:500">${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r" style="color:#d97706;font-weight:600">${fmtDash(d.current_bu_fc)}</td><td class="note-cell" title="${esc(d.explanation || "")}">${d.is_large ? esc(d.explanation || "\u2014") : "<span style='color:#9ca3af'>below threshold</span>"}${d.explanation_source ? ` <span style="color:#9ca3af">(${esc(d.explanation_source)})</span>` : ""}</td></tr>`).join("\n")}
+${rows.map((d) => `<tr><td style="font-weight:500">${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r" style="color:#d97706;font-weight:600">${fmtDash(d.current_bu_fc)}</td><td class="note-cell" title="${esc(explainAttr(d))}">${explainHtml(d)}</td></tr>`).join("\n")}
 </table>` : `<p style="font-size:11px;color:#9ca3af;margin:6px 0">No new in-quarter forecasts.</p>`;
-  const upsideTable = (up, down) => `
+  // C/C convention: increase = more churn/contraction = worse (red); decrease
+  // = better (green).
+  const moverTable = (up, down, deltaLabel) => `
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-<div><h3 style="font-size:12px;font-weight:700;margin:0 0 6px;color:#22c55e">Top 5 driving increase</h3>${up.length ? `<table><tr><th>Account</th><th>Region</th><th class="r">\u0394 Upside</th></tr>${up.map((d) => `<tr><td>${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r" style="color:#22c55e;font-weight:600">${signed(d.delta)}</td></tr>`).join("")}</table>` : `<p style="font-size:11px;color:#9ca3af">None.</p>`}</div>
-<div><h3 style="font-size:12px;font-weight:700;margin:0 0 6px;color:#ef4444">Top 5 driving decrease</h3>${down.length ? `<table><tr><th>Account</th><th>Region</th><th class="r">\u0394 Upside</th></tr>${down.map((d) => `<tr><td>${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r" style="color:#ef4444;font-weight:600">${signed(d.delta)}</td></tr>`).join("")}</table>` : `<p style="font-size:11px;color:#9ca3af">None.</p>`}</div>
+<div><h3 style="font-size:12px;font-weight:700;margin:0 0 6px;color:#ef4444">Top 5 driving increase (more C/C)</h3>${up.length ? `<table><tr><th>Account</th><th>Region</th><th class="r">${esc(deltaLabel)}</th></tr>${up.map((d) => `<tr><td>${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r" style="color:#ef4444;font-weight:600">${signed(d.delta)}</td></tr>`).join("")}</table>` : `<p style="font-size:11px;color:#9ca3af">None.</p>`}</div>
+<div><h3 style="font-size:12px;font-weight:700;margin:0 0 6px;color:#22c55e">Top 5 driving decrease (less C/C)</h3>${down.length ? `<table><tr><th>Account</th><th>Region</th><th class="r">${esc(deltaLabel)}</th></tr>${down.map((d) => `<tr><td>${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r" style="color:#22c55e;font-weight:600">${signed(d.delta)}</td></tr>`).join("")}</table>` : `<p style="font-size:11px;color:#9ca3af">None.</p>`}</div>
 </div>`;
+  const bestCaseTable = (up, down) => moverTable(up, down, "\u0394 Best Case");
+  const worstCaseTable = (up, down) => moverTable(up, down, "\u0394 Worst Case");
   const overallBlock = `
 <h2>Overall Rollup</h2>
 ${buTable}
@@ -8872,15 +8893,19 @@ ${trendHtml}
 ${worsenedTable(worsened)}
 <h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">New in-quarter forecast \u2014 $0 \u2192 FC (${newFc.length})</h3>
 ${newFcTable(newFc)}
-<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">Upside movement (${fmtDash(upside.current_total)}, ${signed(upside.delta || 0)} WoW)</h3>
-${upsideTable(upside.top_increase || [], upside.top_decrease || [])}`;
+<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">Best Case movement (${fmtDash(bestCase.current_total)}, <span style="color:${buDeltaColor(bestCase.delta || 0)}">${signed(bestCase.delta || 0)} WoW</span>)</h3>
+${bestCaseTable(bestCase.top_increase || [], bestCase.top_decrease || [])}
+<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">Worst Case movement (${fmtDash(worstCase.current_total)}, <span style="color:${buDeltaColor(worstCase.delta || 0)}">${signed(worstCase.delta || 0)} WoW</span>)</h3>
+${worstCaseTable(worstCase.top_increase || [], worstCase.top_decrease || [])}`;
   const regionsForBlocks = regionFilter ? [regionFilter] : bu.regions.map((r) => r.region);
   const perRegionBlocks = regionsForBlocks.map((rname) => {
     const rMove = bu.regions.find((r) => r.region === rname) || { current: 0, prior: 0, delta: 0, delta_pct: null, accounts: 0 };
     const rWorse = worsened.filter((d) => d.region === rname);
     const rNew = newFc.filter((d) => d.region === rname);
-    const rUp = (upside.top_increase || []).filter((d) => d.region === rname);
-    const rDown = (upside.top_decrease || []).filter((d) => d.region === rname);
+    const rBcUp = (bestCase.top_increase || []).filter((d) => d.region === rname);
+    const rBcDown = (bestCase.top_decrease || []).filter((d) => d.region === rname);
+    const rWcUp = (worstCase.top_increase || []).filter((d) => d.region === rname);
+    const rWcDown = (worstCase.top_decrease || []).filter((d) => d.region === rname);
     return `
 <h2>Region: ${esc(rname)}</h2>
 <p class="sub" style="margin-bottom:8px">${rMove.accounts} accounts \u00b7 BU FC ${fmtDash(rMove.current)} (${signed(rMove.delta)} WoW, ${pctS(rMove.delta_pct)})</p>
@@ -8888,8 +8913,10 @@ ${upsideTable(upside.top_increase || [], upside.top_decrease || [])}`;
 ${worsenedTable(rWorse)}
 <h3 style="font-size:12px;font-weight:700;margin:14px 0 6px">New in-quarter forecast (${rNew.length})</h3>
 ${newFcTable(rNew)}
-<h3 style="font-size:12px;font-weight:700;margin:14px 0 6px">Upside movers</h3>
-${upsideTable(rUp, rDown)}`;
+<h3 style="font-size:12px;font-weight:700;margin:14px 0 6px">Best Case movers</h3>
+${bestCaseTable(rBcUp, rBcDown)}
+<h3 style="font-size:12px;font-weight:700;margin:14px 0 6px">Worst Case movers</h3>
+${worstCaseTable(rWcUp, rWcDown)}`;
   }).join("\n");
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Weekly 100K+ Regional Brief</title>
 <style>
@@ -8915,7 +8942,7 @@ tr:hover{background:#f9fafb}
 <p class="sub">${scopeLine} &middot; Generated ${genDate}</p>
 ${brief.warning ? `<p style="background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:8px 12px;font-size:11px;color:#92400e;margin-bottom:16px">${esc(brief.warning)}</p>` : ""}
 <div class="kpi-row">
-${kpiCards.map((c) => `<div class="kpi"><div class="label" style="color:${c.color}">${c.label}</div><div class="val">${c.val}</div><div class="detail">${esc(c.detail)}</div></div>`).join("\n")}
+${kpiCards.map((c) => `<div class="kpi"><div class="label" style="color:${c.color}">${c.label}</div><div class="val">${c.val}</div><div class="detail"${c.detailColor ? ` style="color:${c.detailColor};font-weight:600"` : ""}>${esc(c.detail)}</div></div>`).join("\n")}
 </div>
 ${overallBlock}
 ${perRegionBlocks}
@@ -8949,17 +8976,31 @@ function WeeklyBriefTab() {
   // the CCO defaults (band 100k+, current quarter) remain the fallback.
   const { state } = useApp();
   const sf = state && state.filters || {};
+  // The brief's account scope is driven ENTIRELY by the app's global Filters
+  // bar (state.filters); the brief no longer has its own scope dropdowns. Each
+  // dimension is DERIVED from the shared filter state (not local component
+  // state) so editing the top Filters bar re-scopes and re-fetches the brief.
   const firstOf = (arr) => Array.isArray(arr) && arr.length === 1 ? arr[0] : "__ALL__";
   const BAND_DEFAULT = "100k+";
+  // Band: the endpoint matches the stored CSV band column via a substring
+  // LIKE, so the app's computed band tokens (e.g. "gt12k") don't map to it.
+  // Keep the brief on its defining "100k+" band for the 100K+ family and when
+  // unset/"all"; forward any other explicit global band verbatim.
+  const BAND_100K_FAMILY = ["100k_official", "gt100k"];
+  const deriveBand = (b) => (!b || b === "all" || BAND_100K_FAMILY.indexOf(b) >= 0) ? BAND_DEFAULT : b;
+  // A dimension scopes the brief only when EXACTLY ONE value is selected in the
+  // global bar; 0 or 2+ selections => "All" for that dimension (the endpoint
+  // takes one value per dimension and the brief is a single-cut summary).
+  const region = firstOf(sf.regions);
+  const segment = firstOf(sf.segments);
+  const owner = firstOf(sf.owners);
+  // Quarter: exactly one globally-selected quarter scopes the brief; empty, the
+  // default seed, or a multi-select all fall back to the current fiscal quarter
+  // (empty string => endpoint auto-picks it).
+  const quarter = Array.isArray(sf.quarters) && sf.quarters.length === 1 ? sf.quarters[0] : "";
+  const band = deriveBand(sf.band);
   const [currentId, setCurrentId] = useState("");
   const [priorId, setPriorId] = useState("");
-  const [region, setRegion] = useState(() => firstOf(sf.regions));
-  const [subRegion, setSubRegion] = useState("__ALL__");
-  const [csManager, setCsManager] = useState("__ALL__");
-  const [segment, setSegment] = useState(() => firstOf(sf.segments));
-  const [owner, setOwner] = useState(() => firstOf(sf.owners));
-  const [quarter, setQuarter] = useState(() => Array.isArray(sf.quarters) && sf.quarters.length === 1 ? sf.quarters[0] : "");
-  const [band, setBand] = useState(BAND_DEFAULT);
   const [threshold, setThreshold] = useState(50000);
   const [brief, setBrief] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -8976,9 +9017,9 @@ function WeeklyBriefTab() {
     // trend series — are scoped consistently. Each active dimension MUST be
     // in the fetch params AND the effect deps below, or the trend would
     // ignore the selection.
+    // sub_region and cs_manager are intentionally omitted: the global Filters
+    // bar has no equivalent dimensions, so the brief no longer scopes on them.
     if (region && region !== "__ALL__") qs.set("region", region);
-    if (subRegion && subRegion !== "__ALL__") qs.set("sub_region", subRegion);
-    if (csManager && csManager !== "__ALL__") qs.set("cs_manager", csManager);
     if (segment && segment !== "__ALL__") qs.set("segment", segment);
     if (owner && owner !== "__ALL__") qs.set("owner", owner);
     if (quarter) qs.set("quarter", quarter);
@@ -8998,81 +9039,75 @@ function WeeklyBriefTab() {
       if (!cancelled) setLoading(false);
     });
     return () => { cancelled = true; };
-  }, [currentId, priorId, threshold, region, subRegion, csManager, segment, owner, quarter, band]);
+  }, [currentId, priorId, threshold, region, segment, owner, quarter, band]);
   const sec = brief && brief.sections;
   const bu = sec && sec.bu_movement || { regions: [], rollup: {}, trend: [] };
   const rollup = bu.rollup || {};
-  const upside = sec && sec.upside || {};
+  const bestCase = sec && sec.best_case || {};
+  const worstCase = sec && sec.worst_case || {};
   // Data is already region-scoped by the server; render it directly.
   const worsened = sec && sec.worsened || [];
   const newFc = sec && sec.new_forecast || [];
   const regionRows = bu.regions || [];
-  // Options come from the UNfiltered available_* lists so every selector stays
-  // fully populated even while a value is active.
-  const regionOptions = brief && brief.available_regions || (bu.regions || []).map((r) => r.region);
-  const subRegionOptions = brief && brief.available_sub_regions || [];
-  const csManagerOptions = brief && brief.available_cs_managers || [];
-  const segmentOptions = brief && brief.available_segments || [];
-  const ownerOptions = brief && brief.available_owners || [];
   const snapshots = brief && brief.snapshots || [];
   const buDeltaColor = (n) => n > 0 ? "#ef4444" : n < 0 ? "#22c55e" : "#64748b";
   const upDeltaColor = (n) => n > 0 ? "#22c55e" : n < 0 ? "#ef4444" : "#64748b";
   const snapLabel = (s) => `${(s.effective_date || "").slice(0, 10)} \u00b7 ${s.filename || ("#" + s.id)}`;
   const cell = (txt, cls) => /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 " + (cls || "") }, txt);
   const th = (txt, cls) => /* @__PURE__ */ React.createElement("th", { key: txt, className: "px-2 py-1.5 text-left font-semibold uppercase tracking-wider " + (cls || "") }, txt);
-  // Shared payload for both the download button and the applied-filter chips.
-  const dlOpts = { region, subRegion, csManager, segment, owner, quarter, band, threshold };
-  // A labelled <select> control that mirrors the app's filter styling. "All"
-  // maps to the sentinel "__ALL__".
-  const filterSelect = (label, value, setter, opts, allLabel) => /* @__PURE__ */ React.createElement(
-    "div",
-    { key: label },
-    /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, label),
-    /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value, onChange: (e) => setter(e.target.value) },
-      /* @__PURE__ */ React.createElement("option", { value: "__ALL__" }, allLabel || "All"),
-      (opts || []).map((o) => /* @__PURE__ */ React.createElement("option", { key: o, value: o }, o)))
-  );
+  // Shared payload for the download button (scope values are echoed by the
+  // server too, but the threshold comes from the brief-local control).
+  const dlOpts = { region, segment, owner, quarter, band, threshold };
   // ---- controls -----------------------------------------------------------
-  const quarterOptions = brief && brief.quarter_labels || [];
+  // Only brief-specific controls live here: the snapshot pair to diff and the
+  // large-mover threshold. All account scope comes from the global Filters bar.
   const controls = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3 flex flex-wrap gap-3 items-end" },
     /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Current snapshot"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: currentId, onChange: (e) => setCurrentId(e.target.value) }, snapshots.map((s) => /* @__PURE__ */ React.createElement("option", { key: s.id, value: String(s.id) }, snapLabel(s))))),
     /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Compare to (prior)"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: priorId, onChange: (e) => setPriorId(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Auto (previous)"), snapshots.map((s) => /* @__PURE__ */ React.createElement("option", { key: s.id, value: String(s.id) }, snapLabel(s))))),
-    filterSelect("Region", region, setRegion, regionOptions, "All regions"),
-    filterSelect("Sub-region", subRegion, setSubRegion, subRegionOptions, "All sub-regions"),
-    filterSelect("CS manager", csManager, setCsManager, csManagerOptions, "All CS managers"),
-    filterSelect("Segment", segment, setSegment, segmentOptions, "All segments"),
-    filterSelect("Owner", owner, setOwner, ownerOptions, "All owners"),
-    /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Quarter"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: quarter, onChange: (e) => setQuarter(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Auto (current)"), quarterOptions.map((q) => /* @__PURE__ */ React.createElement("option", { key: q, value: q }, q)), quarter && !quarterOptions.includes(quarter) ? /* @__PURE__ */ React.createElement("option", { value: quarter }, quarter) : null)),
-    /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Band"), /* @__PURE__ */ React.createElement("input", { className: "filter-input text-xs w-24", type: "text", value: band, onChange: (e) => setBand(e.target.value), placeholder: "100k+" })),
     /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Large threshold ($)"), /* @__PURE__ */ React.createElement("input", { className: "filter-input text-xs w-28", type: "number", step: "5000", value: threshold, onChange: (e) => setThreshold(Number(e.target.value) || 0) })),
     /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-indigo ml-auto", disabled: !brief || !brief.sections, onClick: () => brief && generateWeeklyBriefHtml(brief, dlOpts) }, "Download brief"));
-  // ---- applied-filters chip strip (mirrors the Region tab's removable chips)
-  const mkChip = (key, label, onRemove, extra) => /* @__PURE__ */ React.createElement("span", { key, className: "region-filter-chip region-filter-chip-removable" + (extra ? " " + extra : "") }, /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip-label" }, label), /* @__PURE__ */ React.createElement("button", { type: "button", className: "region-filter-chip-x", "aria-label": "Clear " + label, onClick: () => onRemove() }, "\u00D7"));
+  // ---- applied-filters chip strip -----------------------------------------
+  // Read-only summary of what's scoping the brief, in three labelled groups.
+  // Scope now mirrors the GLOBAL Filters bar (users change it up top), so these
+  // chips are informational rather than removable.
   const mutedChip = (key, label) => /* @__PURE__ */ React.createElement("span", { key, className: "region-filter-chip region-filter-chip-muted" }, label);
-  const chips = [];
-  chips.push(mutedChip("band", "Band: " + (brief && brief.band || band)));
-  chips.push(brief && brief.quarter ? mutedChip("q", "Quarter: " + brief.quarter + (brief.quarter_auto_selected ? " (auto)" : "")) : null);
-  if (region !== "__ALL__") chips.push(mkChip("region", "Region: " + region, () => setRegion("__ALL__"), "region-filter-chip-emerald"));
-  if (subRegion !== "__ALL__") chips.push(mkChip("sub", "Sub-region: " + subRegion, () => setSubRegion("__ALL__")));
-  if (csManager !== "__ALL__") chips.push(mkChip("csm", "CS mgr: " + csManager, () => setCsManager("__ALL__")));
-  if (segment !== "__ALL__") chips.push(mkChip("seg", "Segment: " + segment, () => setSegment("__ALL__")));
-  if (owner !== "__ALL__") chips.push(mkChip("own", "Owner: " + owner, () => setOwner("__ALL__")));
-  chips.push(mutedChip("thr", "Large \u2265 " + fmtMoney(threshold)));
-  if (brief && brief.current) chips.push(mutedChip("pair", "Weeks: " + (brief.prior ? (brief.prior.effective_date || "").slice(0, 10) + " \u2192 " : "") + (brief.current.effective_date || "").slice(0, 10)));
-  const anyRemovable = region !== "__ALL__" || subRegion !== "__ALL__" || csManager !== "__ALL__" || segment !== "__ALL__" || owner !== "__ALL__";
-  if (anyRemovable) chips.push(/* @__PURE__ */ React.createElement("button", { key: "reset", type: "button", className: "region-filter-reset", onClick: () => { setRegion("__ALL__"); setSubRegion("__ALL__"); setCsManager("__ALL__"); setSegment("__ALL__"); setOwner("__ALL__"); } }, "Reset filters"));
-  const chipStrip = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface px-3 py-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 flex-wrap" }, /* @__PURE__ */ React.createElement("span", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mr-1" }, "Applied filters"), /* @__PURE__ */ React.createElement("div", { className: "region-filter-summary" }, chips)));
+  const groupLabel = (txt) => /* @__PURE__ */ React.createElement("span", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold shrink-0" }, txt);
+  // Group 1 \u2014 Comparing: the snapshot pair being diffed (driven by the
+  // Current/Prior snapshot dropdowns). Informational.
+  const comparingVal = brief && brief.current ? (brief.prior ? (brief.prior.effective_date || "").slice(0, 10) : "\u2014") + " \u2192 " + (brief.current.effective_date || "").slice(0, 10) : "\u2014";
+  const comparingGroup = /* @__PURE__ */ React.createElement("div", { className: "wb-filter-group" }, groupLabel("Comparing"), mutedChip("pair", comparingVal));
+  // Group 2 \u2014 Scope: account-inclusion filters sourced from the global bar.
+  // Band + Quarter always define the brief; Region/Segment/Owner appear when
+  // active. A multi-select in the global bar collapses to "All" for the brief,
+  // which the chip states plainly so it's never ambiguous.
+  const dimChip = (key, label, arr) => {
+    const a = Array.isArray(arr) ? arr : [];
+    if (a.length === 1) return mutedChip(key, label + ": " + a[0]);
+    if (a.length > 1) return mutedChip(key, label + ": " + a.length + " selected \u00b7 brief shows All");
+    return null;
+  };
+  const scopeChips = [];
+  scopeChips.push(mutedChip("band", "Band " + (brief && brief.band || band)));
+  if (brief && brief.quarter) scopeChips.push(mutedChip("q", "Quarter " + brief.quarter + (brief.quarter_auto_selected ? " (auto)" : "")));
+  [dimChip("region", "Region", sf.regions), dimChip("seg", "Segment", sf.segments), dimChip("own", "Owner", sf.owners)].forEach((c) => { if (c) scopeChips.push(c); });
+  const scopeGroup = /* @__PURE__ */ React.createElement("div", { className: "wb-filter-group" }, groupLabel("Scope"), /* @__PURE__ */ React.createElement("div", { className: "region-filter-summary" }, scopeChips));
+  // Group 3 \u2014 Large-mover cutoff: the threshold for flagging large movers.
+  // Informational (adjusted via the Large threshold input); does NOT filter rows.
+  const cutoffGroup = /* @__PURE__ */ React.createElement("div", { className: "wb-filter-group" }, groupLabel("Large-mover cutoff"), mutedChip("thr", "\u2265 " + fmtMoney(threshold)));
+  const scopeHint = /* @__PURE__ */ React.createElement("div", { className: "wb-filter-hint text-[10px] text-gray-500 mt-1" }, "Scope is controlled by the Filters bar at the top of the page.");
+  const chipStrip = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface px-3 py-2" }, /* @__PURE__ */ React.createElement("div", { className: "wb-filter-strip" }, comparingGroup, scopeGroup, cutoffGroup), scopeHint);
   if (loading && !brief) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500" }, "Loading weekly brief\u2026"));
   if (err) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-red-500" }, err));
   if (!sec) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500" }, brief && brief.warning || "Upload at least two active CSV snapshots to compare week over week."));
   // ---- KPI tiles ----------------------------------------------------------
   const kpis = [
     { label: "BU Forecast (C/C)", value: fmtC(rollup.current), delta: rollup.delta, deltaColor: buDeltaColor(rollup.delta || 0), accent: "#0ea5e9" },
-    { label: "Upside", value: fmtC(upside.current_total), delta: upside.delta, deltaColor: upDeltaColor(upside.delta || 0), accent: "#8b5cf6" },
+    { label: "Best Case", value: fmtC(bestCase.current_total), delta: bestCase.delta, deltaColor: buDeltaColor(bestCase.delta || 0), accent: "#8b5cf6" },
+    { label: "Worst Case", value: fmtC(worstCase.current_total), delta: worstCase.delta, deltaColor: buDeltaColor(worstCase.delta || 0), accent: "#0d9488" },
     { label: "Worsened accounts", value: String((sec.worsened || []).length), sub: `${(sec.worsened || []).filter((r) => r.is_large).length} \u2265 threshold`, accent: "#ef4444" },
     { label: "New $0\u2192FC", value: String((sec.new_forecast || []).length), sub: `${(sec.new_forecast || []).filter((r) => r.is_large).length} large`, accent: "#f59e0b" }
   ];
-  const kpiRow = /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2" }, kpis.map((c, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: "glass-kpi" }, /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-label" }, c.label), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-value", style: { color: c.accent } }, c.value), c.delta != null ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub", style: { color: c.deltaColor } }, signed(c.delta), " WoW") : c.sub ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub" }, c.sub) : null)));
+  const kpiRow = /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-5 gap-2" }, kpis.map((c, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: "glass-kpi" }, /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-label" }, c.label), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-value", style: { color: c.accent } }, c.value), c.delta != null ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub", style: { color: c.deltaColor } }, signed(c.delta), " WoW") : c.sub ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub" }, c.sub) : null)));
   // ---- Section 1: BU movement by region ----------------------------------
   const buRegionCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
     /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold" }, "1 \u00b7 BU forecast movement by region"),
@@ -9201,28 +9236,50 @@ function WeeklyBriefTab() {
         /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500" }, "Higher = more forecasted churn/contraction \u00b7 gap = Adj \u2212 BU")),
       legend, headline, svg, tableEl);
   }
+  // ---- "What happened" cell: two clearly-labeled source blocks -----------
+  // Renders Forecast Summary and Last Renewals Studio Note as separate labeled
+  // lines; each block appears ONLY when its source has content. If both are
+  // empty, shows "\u2014"; below-threshold rows show a muted placeholder.
+  const explainCell = (d) => {
+    if (!d.is_large) return /* @__PURE__ */ React.createElement("span", { className: "text-gray-400" }, "below threshold");
+    const fs = d.forecast_summary;
+    const note = d.renewals_studio_note;
+    if (!fs && !note) return "\u2014";
+    const lbl = "font-semibold text-gray-600 dark:text-gray-300";
+    const blocks = [];
+    if (fs) blocks.push(/* @__PURE__ */ React.createElement("div", { key: "fs" }, /* @__PURE__ */ React.createElement("span", { className: lbl }, "Forecast Summary: "), fs));
+    if (note) blocks.push(/* @__PURE__ */ React.createElement("div", { key: "note", className: fs ? "mt-1" : "" }, /* @__PURE__ */ React.createElement("span", { className: lbl }, "Last Renewals Studio Note: "), note));
+    return blocks;
+  };
+  const explainTitle = (d) => [d.forecast_summary ? "Forecast Summary: " + d.forecast_summary : "", d.renewals_studio_note ? "Last Renewals Studio Note: " + d.renewals_studio_note : ""].filter(Boolean).join("\n");
   // ---- Section 2: worsened ------------------------------------------------
   const worsenedCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
     /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold" }, "2 \u00b7 Accounts that worsened WoW (", worsened.length, ")"),
     /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
       /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", "Prior BU FC", "Current BU FC", "Adverse swing", "What happened"].map((h, i) => th(h, i >= 2 && i <= 4 ? "text-right" : "")))),
-      /* @__PURE__ */ React.createElement("tbody", null, worsened.length ? worsened.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), cell(fmtC(d.prior_bu_fc), "text-right tabular-nums"), cell(fmtC(d.current_bu_fc), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#ef4444" } }, signed(d.swing)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: d.explanation || "" }, d.is_large ? (d.explanation || "\u2014") + (d.explanation_source ? " (" + d.explanation_source + ")" : "") : /* @__PURE__ */ React.createElement("span", { className: "text-gray-400" }, "below threshold")))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 6 }, "No worsened accounts in this scope."))))));
+      /* @__PURE__ */ React.createElement("tbody", null, worsened.length ? worsened.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), cell(fmtC(d.prior_bu_fc), "text-right tabular-nums"), cell(fmtC(d.current_bu_fc), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#ef4444" } }, signed(d.swing)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: explainTitle(d) }, explainCell(d)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 6 }, "No worsened accounts in this scope."))))));
   // ---- Section 3: new $0->FC ----------------------------------------------
   const newFcCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
     /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold" }, "3 \u00b7 New in-quarter forecast \u2014 $0 \u2192 FC (", newFc.length, ")"),
     /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
       /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", "New BU FC", "What happened"].map((h, i) => th(h, i === 2 ? "text-right" : "")))),
-      /* @__PURE__ */ React.createElement("tbody", null, newFc.length ? newFc.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#d97706" } }, fmtC(d.current_bu_fc)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: d.explanation || "" }, d.is_large ? (d.explanation || "\u2014") + (d.explanation_source ? " (" + d.explanation_source + ")" : "") : /* @__PURE__ */ React.createElement("span", { className: "text-gray-400" }, "below threshold")))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 4 }, "No new in-quarter forecasts in this scope."))))));
-  // ---- Section 4: upside movement ----------------------------------------
-  const driverTable = (rows, color, emptyTxt) => /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", "\u0394 Upside"].map((h, i) => th(h, i === 2 ? "text-right" : "")))), /* @__PURE__ */ React.createElement("tbody", null, rows.length ? rows.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color } }, signed(d.delta)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 3 }, emptyTxt))));
-  const upInc = upside.top_increase || [];
-  const upDec = upside.top_decrease || [];
-  const upsideCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
-    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold flex items-center justify-between" }, /* @__PURE__ */ React.createElement("span", null, "4 \u00b7 Upside movement"), /* @__PURE__ */ React.createElement("span", { className: "text-[10px] font-normal text-gray-500" }, "Total ", fmtC(upside.current_total), " \u00b7 ", /* @__PURE__ */ React.createElement("span", { style: { color: upDeltaColor(upside.delta || 0) } }, signed(upside.delta || 0), " WoW"))),
-    /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-3 p-3" },
-      /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-emerald-600 mb-1" }, "Top 5 driving increase"), driverTable(upInc, "#22c55e", "None.")),
-      /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-red-500 mb-1" }, "Top 5 driving decrease"), driverTable(upDec, "#ef4444", "None."))));
-  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, chipStrip, brief.warning && /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300" }, brief.warning), kpiRow, buRegionCard, trendCard, worsenedCard, newFcCard, upsideCard);
+      /* @__PURE__ */ React.createElement("tbody", null, newFc.length ? newFc.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#d97706" } }, fmtC(d.current_bu_fc)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: explainTitle(d) }, explainCell(d)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 4 }, "No new in-quarter forecasts in this scope."))))));
+  // ---- Best/Worst Case movement ------------------------------------------
+  // C/C convention: an INCREASE in forecasted churn/contraction = worse = red;
+  // a decrease = better = green (same as BU/worsened coloring).
+  const driverTable = (rows, color, emptyTxt, deltaLabel) => /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", deltaLabel || "\u0394"].map((h, i) => th(h, i === 2 ? "text-right" : "")))), /* @__PURE__ */ React.createElement("tbody", null, rows.length ? rows.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color } }, signed(d.delta)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 3 }, emptyTxt))));
+  const caseCard = (num, title, sectionData, deltaLabel) => {
+    const inc = sectionData.top_increase || [];
+    const dec = sectionData.top_decrease || [];
+    return /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
+      /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold flex items-center justify-between" }, /* @__PURE__ */ React.createElement("span", null, num + " \u00b7 " + title), /* @__PURE__ */ React.createElement("span", { className: "text-[10px] font-normal text-gray-500" }, "Total ", fmtC(sectionData.current_total), " \u00b7 ", /* @__PURE__ */ React.createElement("span", { style: { color: buDeltaColor(sectionData.delta || 0) } }, signed(sectionData.delta || 0), " WoW"))),
+      /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-3 p-3" },
+        /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-red-500 mb-1" }, "Top 5 driving increase (more C/C)"), driverTable(inc, "#ef4444", "None.", deltaLabel)),
+        /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-emerald-600 mb-1" }, "Top 5 driving decrease (less C/C)"), driverTable(dec, "#22c55e", "None.", deltaLabel))));
+  };
+  const bestCaseCard = caseCard("4", "Best Case movement", bestCase, "\u0394 Best Case");
+  const worstCaseCard = caseCard("5", "Worst Case movement", worstCase, "\u0394 Worst Case");
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, chipStrip, brief.warning && /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300" }, brief.warning), kpiRow, buRegionCard, trendCard, worsenedCard, newFcCard, bestCaseCard, worstCaseCard);
 }
 function App() {
   const { state, actions, idbReady, serverInfo, csvAutoLoadStatus } = useApp();

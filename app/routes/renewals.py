@@ -2297,13 +2297,14 @@ async def _wb_load_accounts(conn, upload_id: int, band: str,
                             filters: Optional[dict] = None) -> dict:
     """One aggregated record per account for a snapshot, scoped to band +
     quarter (+ the shared filters). Uses the structured bu_fc/forecast_summary
-    columns and extracts only the single UPSIDE key from raw_row (bounded, no
-    blob transfer). An empty ``filters`` means all rows (the rollup)."""
+    columns and extracts only the UPSIDE / DOWNSIDE keys from raw_row (bounded,
+    no blob transfer). An empty ``filters`` means all rows (the rollup)."""
     filter_sql, filter_params = _wb_filter_sql(filters or {}, 4)
     sql = _wb_band_query(
         """
         SELECT s.account_id, s.account_name, s.region, s.bu_fc,
-               s.forecast_summary, s.raw_row->>'UPSIDE' AS upside_raw
+               s.forecast_summary, s.raw_row->>'UPSIDE' AS upside_raw,
+               s.raw_row->>'DOWNSIDE' AS downside_raw
         FROM account_snapshots s
         WHERE s.csv_upload_id = $1
           AND s.year_quarter = ANY($2::text[])
@@ -2328,11 +2329,13 @@ async def _wb_load_accounts(conn, upload_id: int, band: str,
                 "region": (r["region"] or "").strip() or "Unknown",
                 "bu_fc": 0.0,
                 "upside": 0.0,
+                "downside": 0.0,
                 "forecast_summary": None,
             }
             out[key] = entry
         entry["bu_fc"] += float(r["bu_fc"] or 0)
         entry["upside"] += _wb_to_number(r["upside_raw"])
+        entry["downside"] += _wb_to_number(r["downside_raw"])
         fs = (r["forecast_summary"] or "").strip()
         if fs and not entry["forecast_summary"]:
             entry["forecast_summary"] = fs[:_EXPLANATION_MAX_CHARS]
@@ -2606,6 +2609,8 @@ async def weekly_brief(
 
     # ---- build the four sections (in-memory, bounded sets) ----------------
     def _explain(entry: dict):
+        # Legacy single-source fallback, kept for back-compat on the
+        # explanation/explanation_source fields (UI now uses the pair below).
         fs = entry.get("forecast_summary")
         if fs:
             return fs, "forecast_summary"
@@ -2613,6 +2618,16 @@ async def weekly_brief(
         if note:
             return note[:_EXPLANATION_MAX_CHARS], "note"
         return None, None
+
+    def _explain_fields(entry: dict):
+        # Two separate, clearly-labeled sources for the "what happened" area.
+        # Each is nullable (present only when it has content) and truncated to
+        # _EXPLANATION_MAX_CHARS. forecast_summary is already truncated on the
+        # entry when it was loaded; the note is truncated here.
+        fs = entry.get("forecast_summary") or None
+        note = note_map.get(entry["account_id"]) if entry.get("account_id") else None
+        note = note[:_EXPLANATION_MAX_CHARS] if note else None
+        return fs, note
 
     all_keys = set(current_map) | set(prior_map)
 
@@ -2692,6 +2707,9 @@ async def weekly_brief(
                 exp, src = _explain(base)
                 rec["explanation"] = exp
                 rec["explanation_source"] = src
+                fs, note = _explain_fields(base)
+                rec["forecast_summary"] = fs
+                rec["renewals_studio_note"] = note
             worsened.append(rec)
     worsened.sort(key=lambda r: r["swing"], reverse=True)
     worsened = worsened[:WEEKLY_BRIEF_LIST_CAP]
@@ -2716,39 +2734,64 @@ async def weekly_brief(
                 exp, src = _explain(cur)
                 rec["explanation"] = exp
                 rec["explanation_source"] = src
+                fs, note = _explain_fields(cur)
+                rec["forecast_summary"] = fs
+                rec["renewals_studio_note"] = note
             new_forecast.append(rec)
     new_forecast.sort(key=lambda r: r["current_bu_fc"], reverse=True)
     new_forecast = new_forecast[:WEEKLY_BRIEF_LIST_CAP]
 
-    # Section 4 — upside movement + top-5 up/down drivers
-    up_cur_total = sum(e["upside"] for e in current_map.values())
-    up_pri_total = sum(e["upside"] for e in prior_map.values())
-    upside_movers = []
-    for key in all_keys:
-        cur = current_map.get(key)
-        pri = prior_map.get(key)
-        base = cur or pri
-        c_up = cur["upside"] if cur else 0.0
-        p_up = pri["upside"] if pri else 0.0
-        d = c_up - p_up
-        if d == 0:
-            continue
-        upside_movers.append({
-            "account_id": base["account_id"],
-            "account_name": base["account_name"],
-            "region": base["region"],
-            "current_upside": round(c_up, 2),
-            "prior_upside": round(p_up, 2),
-            "delta": round(d, 2),
-        })
-    top_increase = sorted(
-        [m for m in upside_movers if m["delta"] > 0],
-        key=lambda m: m["delta"], reverse=True,
-    )[:5]
-    top_decrease = sorted(
-        [m for m in upside_movers if m["delta"] < 0],
-        key=lambda m: m["delta"],
-    )[:5]
+    # Section 4 — Best Case / Worst Case movement + top-5 up/down drivers.
+    # These are absolute forecasted-C/C totals matching the app's existing
+    # Best/Worst Case columns:
+    #   best_case  = bu_fc + UPSIDE   (UPSIDE arrives negative -> least churn)
+    #   worst_case = bu_fc + DOWNSIDE (DOWNSIDE arrives positive -> most churn)
+    # so best_case <= bu <= worst_case. value_fn maps an account entry to its
+    # per-account value; movers rank by per-account WoW change in that value.
+    def _movement_section(value_fn) -> dict:
+        cur_total = sum(value_fn(e) for e in current_map.values())
+        pri_total = sum(value_fn(e) for e in prior_map.values())
+        movers = []
+        for key in all_keys:
+            cur = current_map.get(key)
+            pri = prior_map.get(key)
+            base = cur or pri
+            c_v = value_fn(cur) if cur else 0.0
+            p_v = value_fn(pri) if pri else 0.0
+            d = c_v - p_v
+            if d == 0:
+                continue
+            movers.append({
+                "account_id": base["account_id"],
+                "account_name": base["account_name"],
+                "region": base["region"],
+                "current_value": round(c_v, 2),
+                "prior_value": round(p_v, 2),
+                "delta": round(d, 2),
+            })
+        top_increase = sorted(
+            [m for m in movers if m["delta"] > 0],
+            key=lambda m: m["delta"], reverse=True,
+        )[:5]
+        top_decrease = sorted(
+            [m for m in movers if m["delta"] < 0],
+            key=lambda m: m["delta"],
+        )[:5]
+        return {
+            "current_total": round(cur_total, 2),
+            "prior_total": round(pri_total, 2),
+            "delta": round(cur_total - pri_total, 2),
+            "delta_pct": _wb_delta_pct(cur_total, pri_total),
+            "top_increase": top_increase,
+            "top_decrease": top_decrease,
+        }
+
+    best_case_section = _movement_section(
+        lambda e: (e["bu_fc"] or 0.0) + (e["upside"] or 0.0)
+    )
+    worst_case_section = _movement_section(
+        lambda e: (e["bu_fc"] or 0.0) + (e["downside"] or 0.0)
+    )
 
     return {
         "ok": True,
@@ -2786,14 +2829,8 @@ async def weekly_brief(
             },
             "worsened": worsened,
             "new_forecast": new_forecast,
-            "upside": {
-                "current_total": round(up_cur_total, 2),
-                "prior_total": round(up_pri_total, 2),
-                "delta": round(up_cur_total - up_pri_total, 2),
-                "delta_pct": _wb_delta_pct(up_cur_total, up_pri_total),
-                "top_increase": top_increase,
-                "top_decrease": top_decrease,
-            },
+            "best_case": best_case_section,
+            "worst_case": worst_case_section,
         },
     }
 

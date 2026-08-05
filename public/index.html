@@ -2465,6 +2465,20 @@
         border-radius: 0;
         background: none !important;
       }
+      /* Weekly Brief: grouped "applied settings" strip (Comparing / Scope /
+         Large-mover cutoff). Groups sit inline and wrap gracefully. */
+      .wb-filter-strip {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px 22px;
+      }
+      .wb-filter-group {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+      }
     </style>
   </head>
   <body class="theme-transition">
@@ -2484,7 +2498,7 @@
     <script src="vendor/vibe-session-lock.js"></script>
 
     <!-- App (compiled from app.jsx by ./build.sh) -->
-    <script src="vendor/app.js?v=20260804b"></script>
+    <script src="vendor/app.js?v=20260805c"></script>
 
     <!--
       Container-mode toolbar tweaks. Mounted after the React app so we can
