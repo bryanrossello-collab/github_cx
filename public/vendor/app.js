@@ -481,13 +481,24 @@ function mapFiscal(dt) {
 function normalizeAccountName(name) {
   return safeString(name).toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
 }
+function normalizeQuarterLabel(raw) {
+  const s = safeString(raw);
+  if (!s) return "";
+  const derived = deriveFiscalFromQuarterLabel(s);
+  return derived && derived.fq ? derived.fq : s;
+}
 function buildNoteKey(row, hm) {
   if (!row || !hm) return null;
   const acctId = safeString(row[hm.ACCOUNT_ID]);
   const acctName = safeString(row[hm.ACCOUNT_NAME] || row.CRM_ACCOUNT_NAME || row.ACCOUNT_NAME);
   const acctBase = acctId || normalizeAccountName(acctName);
   if (!acctBase) return null;
-  const fq = safeString(row.FISCAL_QUARTER || row[hm.FISCAL_QUARTER] || row[hm.YEAR_QUARTER]);
+  // Normalize the quarter to the canonical FYxxQx spelling so a note keyed
+  // with a different spelling of the same quarter (e.g. "Q3`27") still lines
+  // up with the row it belongs to (rows may carry the raw "Q3`27" YEAR_QUARTER
+  // when enrichment has not run). Both sides go through this normalizer.
+  const fqRaw = safeString(row.FISCAL_QUARTER || row[hm.FISCAL_QUARTER] || row[hm.YEAR_QUARTER]);
+  const fq = normalizeQuarterLabel(fqRaw);
   const dateRaw = safeString(row[hm.NEXT_RENEWAL_DATE] || row.NEXT_RENEWAL_DATE);
   const dateBucket = (() => {
     const dt = parseDate(dateRaw);
@@ -495,6 +506,16 @@ function buildNoteKey(row, hm) {
   })();
   const period = fq || dateBucket || "na";
   return `${acctBase}::${period}`;
+}
+function canonicalNoteKey(key) {
+  const s = safeString(key);
+  if (!s) return s;
+  const idx = s.indexOf("::");
+  if (idx < 0) return s;
+  const base = s.slice(0, idx);
+  const rest = s.slice(idx + 2);
+  const norm = normalizeQuarterLabel(rest);
+  return `${base}::${norm || rest}`;
 }
 function migrateNoteKey(key) {
   if (!key) return key;
@@ -819,6 +840,13 @@ class ErrorBoundary extends React.Component {
 }
 const AppContext = createContext();
 const useApp = () => useContext(AppContext);
+// Volatile sync/autoload status lives in its OWN context so that its frequent
+// churn (idle -> pending -> synced on every note save, and the CSV auto-load
+// status transitions on reload) does NOT re-render the many components that
+// consume the main AppContext (notably the Notes import/export panel, whose
+// Import button previously flickered on every sync tick).
+const AppStatusContext = createContext();
+const useAppStatus = () => useContext(AppStatusContext);
 function parseFiscalLabel(label) {
   const m = /FY(\d{2})Q(\d)/i.exec(label || "");
   if (!m) return { fy: 0, fq: 0 };
@@ -1270,11 +1298,19 @@ function AppProvider({ children }) {
           const localNotes = { ...prev.notes || {} };
           const localDeletes = { ...prev.noteDeletes || {} };
           for (const [k, incoming] of Object.entries(remoteNotes)) {
+            // The server STILL holds this note (it is present in the server's
+            // notes map, not its tombstone map). A committed delete would have
+            // removed it from the server's notes map, so any LOCAL tombstone
+            // for this key is stale/spurious (e.g. an unmatched-cleanup
+            // misclassification, or a delete whose PUT never reached the
+            // server). Prefer the server-present note and drop that stale
+            // tombstone so a client-side misclassification can never wipe a
+            // note that still exists on the server. In-session deletes are
+            // unaffected — this merge only runs once, at initial load.
+            if (localDeletes[k]) delete localDeletes[k];
             const existing = localNotes[k];
             const incomingTs = Number(incoming?.updatedAt) || 0;
             const existingTs = Number(existing?.updatedAt) || 0;
-            const tomb = Number(localDeletes[k]) || 0;
-            if (tomb && tomb >= incomingTs) continue;
             if (!existing || incomingTs >= existingTs) localNotes[k] = incoming;
           }
           for (const [k, ts] of Object.entries(remoteDeletes)) {
@@ -1909,8 +1945,9 @@ function AppProvider({ children }) {
     return { rollupRows, accountRollups, touchByAccount };
   }, [state.data, state.headerMap, state.settings]);
   const dismissRefreshState = useCallback(() => setRefreshState(null), []);
-  const value = useMemo(() => ({ theme, bgTheme, state, actions, idbReady, serverInfo, serverSyncStatus, csvAutoLoadStatus, refreshState, dismissRefreshState, accountMeta }), [theme, bgTheme, state, actions, idbReady, serverInfo, serverSyncStatus, csvAutoLoadStatus, refreshState, dismissRefreshState, accountMeta]);
-  return /* @__PURE__ */ React.createElement(AppContext.Provider, { value }, children);
+  const value = useMemo(() => ({ theme, bgTheme, state, actions, idbReady, serverInfo, refreshState, dismissRefreshState, accountMeta }), [theme, bgTheme, state, actions, idbReady, serverInfo, refreshState, dismissRefreshState, accountMeta]);
+  const statusValue = useMemo(() => ({ serverSyncStatus, csvAutoLoadStatus }), [serverSyncStatus, csvAutoLoadStatus]);
+  return /* @__PURE__ */ React.createElement(AppContext.Provider, { value }, /* @__PURE__ */ React.createElement(AppStatusContext.Provider, { value: statusValue }, children));
 }
 function CSVImporter() {
   const { actions } = useApp();
@@ -1954,10 +1991,16 @@ function NotesIO({ headless = false }) {
   const rowsByNoteKey = useMemo(() => {
     const m = /* @__PURE__ */ new Map();
     rowsSource.forEach((r) => {
-      if (r.__noteKey) m.set(r.__noteKey, r);
+      if (!r.__noteKey) return;
+      m.set(r.__noteKey, r);
+      // Also index by the canonical (quarter-normalized) key so a note whose
+      // key uses a different quarter spelling still resolves to its row.
+      const canon = canonicalNoteKey(r.__noteKey);
+      if (canon !== r.__noteKey && !m.has(canon)) m.set(canon, r);
     });
     return m;
   }, [rowsSource]);
+  const matchRowForKey = (k) => rowsByNoteKey.get(k) || rowsByNoteKey.get(canonicalNoteKey(k));
   const [noteReportState, setNoteReportState] = useState(null);
   const [showArchived, setShowArchived] = useState(false);
   const [autoMatchState, setAutoMatchState] = useState(null);
@@ -2055,7 +2098,7 @@ function NotesIO({ headless = false }) {
     return { byNormalizedName, byAccountId, pickBest };
   }, [accountOptions]);
   const buildEntry = (key, payload) => {
-    const row = rowsByNoteKey.get(key);
+    const row = matchRowForKey(key);
     const safePayload = payload || {};
     const accountLabel = safeString(safePayload.accountLabel);
     const accountName = safeString(safePayload.accountName);
@@ -2316,10 +2359,13 @@ ${sourceText}`;
     const unmatchedAll = summarizeNotes(notes, "import", { includeArchived: true }).unmatched;
     unmatchedAll.forEach((entry) => updateNoteMeta(entry.key, { archived: true }));
   };
-  const handleDeleteAllUnmatched = () => {
-    const unmatchedAll = summarizeNotes(notes, "import", { includeArchived: true }).unmatched;
-    unmatchedAll.forEach((entry) => actions.setNote(entry.key, null));
-  };
+  // NOTE: A bulk "delete all unmatched" action was intentionally removed.
+  // "Unmatched" only means a note does not line up with the CURRENTLY loaded
+  // CSV slice (e.g. a different quarter/dataset) — the note is still valid and
+  // must be KEPT. Mass-tombstoning unmatched notes previously wiped real data
+  // and could sync those deletes to the server. Unmatched notes can still be
+  // archived in bulk (non-destructive) or deleted one-by-one with a per-note
+  // confirmation (an explicit, deliberate user action).
   const onImportClick = () => inputRef.current?.click();
   const restoreCallsFromImport = (notesObj) => {
     const entries = Object.entries(notesObj || {}).filter(([, v]) => v && (v.csCall != null || v.renewalsCall != null));
@@ -2380,16 +2426,74 @@ ${sourceText}`;
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
+      let parsed;
       try {
-        const parsed = JSON.parse(reader.result || "{}");
+        parsed = JSON.parse(reader.result || "{}");
         if (parsed.version !== 1 && parsed.version !== 2) throw new Error("Unsupported version (expected 1 or 2)");
         if (!parsed.notes || typeof parsed.notes !== "object") throw new Error("Missing notes object");
-        actions.importNotes(parsed.notes);
-        setNoteReportState({ type: "import", notesSource: parsed.notes });
-        restoreCallsFromImport(parsed.notes);
       } catch (err) {
         alert("Failed to import notes JSON: " + (err?.message || err));
+        e.target.value = "";
+        return;
       }
+      // Update local state immediately so the UI reflects the import.
+      actions.importNotes(parsed.notes);
+      setNoteReportState({ type: "import", notesSource: parsed.notes });
+      restoreCallsFromImport(parsed.notes);
+      // Then persist to the server EXPLICITLY and report the outcome. The old
+      // path relied only on the debounced background sync PUT, whose 401 /
+      // network errors could pass unnoticed — the notes lived in the browser
+      // until a refresh dropped them behind older server tombstones (silent
+      // data loss). This awaited PUT surfaces failures (alert + session lock)
+      // and stamps each note's updatedAt to STRICTLY BEAT any server tombstone
+      // so a re-import always wins server-side and survives the load-merge.
+      (async () => {
+        const keys = Object.keys(parsed.notes || {});
+        if (!keys.length) return;
+        try {
+          let serverDeletes = {};
+          try {
+            const gres = await fetch("/api/renewals/notes", { cache: "no-store" });
+            if (gres.ok) {
+              const gj = await gres.json();
+              serverDeletes = gj && gj.noteDeletes || {};
+            }
+          } catch (_) {
+          }
+          const now = Date.now();
+          const outNotes = {};
+          keys.forEach((k, i) => {
+            const v = parsed.notes[k];
+            if (!v || typeof v !== "object") return;
+            const fileTs = Number(v.updatedAt) || 0;
+            const tomb = Number(serverDeletes[k]) || 0;
+            // max(file ts, tombstone+1, now) + i  => unique and always newer
+            // than the key's tombstone, so the server note-write wins and the
+            // client load-merge keeps it.
+            outNotes[k] = { ...v, updatedAt: Math.max(fileTs, tomb ? tomb + 1 : 0, now) + i };
+          });
+          const res = await fetch("/api/renewals/notes", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ notes: outNotes, noteDeletes: {} })
+          });
+          if (!res.ok) {
+            if (res.status === 401 && typeof window !== "undefined" && window.RenewalsSessionLock && typeof window.RenewalsSessionLock.showLock === "function") {
+              window.RenewalsSessionLock.showLock("Your secure sign-in session expired, so your imported notes were NOT saved to the server. Refresh the page to sign in again, then re-import.");
+            }
+            alert("Imported into this browser, but the server rejected the save (HTTP " + res.status + "). Your notes are NOT on the server yet.\n\n" + (res.status === 401 ? "Your secure session expired \u2014 refresh the page to sign in again, then re-import." : "Please try the import again."));
+            return;
+          }
+          let body = null;
+          try {
+            body = await res.json();
+          } catch (_) {
+          }
+          alert("Imported and saved " + keys.length + " note" + (keys.length === 1 ? "" : "s") + " to the server" + (body && body.noteCount != null ? " \u2014 the server now holds " + body.noteCount + " note" + (body.noteCount === 1 ? "" : "s") + "." : "."));
+        } catch (err) {
+          alert("Imported into this browser, but could not reach the server: " + (err?.message || err) + "\n\nYour notes are NOT saved to the server yet \u2014 check your connection and re-import.");
+        }
+      })();
     };
     reader.readAsText(file);
     e.target.value = "";
@@ -2406,7 +2510,7 @@ ${sourceText}`;
     if (exportMode === "matched_active") {
       const next = {};
       Object.entries(notes).forEach(([k, v]) => {
-        if (!rowsByNoteKey.has(k)) return;
+        if (!matchRowForKey(k)) return;
         if (v?.archived) return;
         next[k] = v;
       });
@@ -2562,7 +2666,7 @@ ${sourceText}`;
         if (e.target === e.currentTarget) closeAutoMatchModal();
       }
     },
-    /* @__PURE__ */ React.createElement("div", { className: "modal-card max-w-2xl", style: { maxHeight: "78vh", overflow: "auto" }, onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { className: "modal-header" }, /* @__PURE__ */ React.createElement("div", { className: "space-y-1" }, /* @__PURE__ */ React.createElement("div", { className: "text-[11px] font-semibold uppercase text-gray-500 dark:text-gray-400" }, "Auto-match tools"), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-700 dark:text-gray-200" }, "Run account-based matching and clean up unmatched notes.")), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-slate", onClick: closeAutoMatchModal }, "Close")), /* @__PURE__ */ React.createElement("div", { className: "p-3 space-y-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 text-[10px]" }, /* @__PURE__ */ React.createElement("span", { className: `pill-chip ${autoMatchState?.running ? "pill-chip-soft" : autoMatchState ? "pill-health-green" : "pill-chip-muted"}` }, autoMatchState?.running ? "Running" : autoMatchState ? "Completed" : "Ready"), /* @__PURE__ */ React.createElement("span", { className: "pill-chip pill-health-green" }, autoMatchPreview.candidates.toLocaleString(), " ready"), /* @__PURE__ */ React.createElement("span", { className: "pill-chip pill-health-amber" }, autoMatchPreview.ambiguous.toLocaleString(), " ambiguous"), /* @__PURE__ */ React.createElement("span", { className: "pill-chip pill-chip-muted" }, autoMatchPreview.noMatch.toLocaleString(), " no match")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-emerald", onClick: runAutoMatch, disabled: !!autoMatchState?.running || autoMatchPreview.total === 0 }, autoMatchState?.running ? "Auto-matching..." : `Auto-match unmatched (${autoMatchPreview.total.toLocaleString()})`), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-amber", onClick: handleArchiveAllUnmatched, disabled: noteReport.unmatchedCount === 0 || !!autoMatchState?.running }, "Archive all unmatched"), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-rose", onClick: handleDeleteAllUnmatched, disabled: noteReport.unmatchedCount === 0 || !!autoMatchState?.running }, "Delete all unmatched")), autoMatchState && /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, /* @__PURE__ */ React.createElement("div", { className: "h-2 rounded-full glass-track overflow-hidden" }, /* @__PURE__ */ React.createElement(
+    /* @__PURE__ */ React.createElement("div", { className: "modal-card max-w-2xl", style: { maxHeight: "78vh", overflow: "auto" }, onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { className: "modal-header" }, /* @__PURE__ */ React.createElement("div", { className: "space-y-1" }, /* @__PURE__ */ React.createElement("div", { className: "text-[11px] font-semibold uppercase text-gray-500 dark:text-gray-400" }, "Auto-match tools"), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-700 dark:text-gray-200" }, "Run account-based matching and clean up unmatched notes.")), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-slate", onClick: closeAutoMatchModal }, "Close")), /* @__PURE__ */ React.createElement("div", { className: "p-3 space-y-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 text-[10px]" }, /* @__PURE__ */ React.createElement("span", { className: `pill-chip ${autoMatchState?.running ? "pill-chip-soft" : autoMatchState ? "pill-health-green" : "pill-chip-muted"}` }, autoMatchState?.running ? "Running" : autoMatchState ? "Completed" : "Ready"), /* @__PURE__ */ React.createElement("span", { className: "pill-chip pill-health-green" }, autoMatchPreview.candidates.toLocaleString(), " ready"), /* @__PURE__ */ React.createElement("span", { className: "pill-chip pill-health-amber" }, autoMatchPreview.ambiguous.toLocaleString(), " ambiguous"), /* @__PURE__ */ React.createElement("span", { className: "pill-chip pill-chip-muted" }, autoMatchPreview.noMatch.toLocaleString(), " no match")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-emerald", onClick: runAutoMatch, disabled: !!autoMatchState?.running || autoMatchPreview.total === 0 }, autoMatchState?.running ? "Auto-matching..." : `Auto-match unmatched (${autoMatchPreview.total.toLocaleString()})`), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-amber", onClick: handleArchiveAllUnmatched, disabled: noteReport.unmatchedCount === 0 || !!autoMatchState?.running }, "Archive all unmatched")), autoMatchState && /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, /* @__PURE__ */ React.createElement("div", { className: "h-2 rounded-full glass-track overflow-hidden" }, /* @__PURE__ */ React.createElement(
       "div",
       {
         className: `h-full transition-all ${autoMatchState?.running ? "bg-indigo-500" : "bg-emerald-500"}`,
@@ -4172,7 +4276,15 @@ function ServerStatusPill({ serverInfo, status }) {
   ) : /* @__PURE__ */ React.createElement("span", { className: "pill text-[10px]", title: cfg.title, style: { display: "inline-flex", alignItems: "center", gap: "0.35rem" } }, /* @__PURE__ */ React.createElement("span", { style: { width: 6, height: 6, borderRadius: "50%", background: cfg.dot, display: "inline-block" } }), cfg.text), modal);
 }
 function Header() {
-  const { theme, bgTheme, actions, state, serverInfo, serverSyncStatus } = useApp();
+  const { theme, bgTheme, actions, state, serverInfo } = useApp();
+  const { serverSyncStatus } = useAppStatus();
+  // Stable element references for the Notes import/export panel and its
+  // headless portal host: because these are memoized once, a Header re-render
+  // (e.g. when the sync-status pill updates) will NOT re-render or remount the
+  // Import/Export buttons. The panel still updates on note changes via its own
+  // AppContext subscription. This is the fix for the "Import button flash".
+  const notesPanelEl = React.useMemo(() => /* @__PURE__ */ React.createElement(NotesIO, null), []);
+  const notesHeadlessEl = React.useMemo(() => /* @__PURE__ */ React.createElement(NotesIO, { headless: true }), []);
   const hasData = state?.data?.length > 0;
   const filters = state.filters;
   const activeFilters = (() => {
@@ -4195,7 +4307,7 @@ function Header() {
           if (e.target === e.currentTarget) setShowActions(false);
         }
       },
-      /* @__PURE__ */ React.createElement("div", { className: "modal-card max-w-md", onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { className: "modal-header" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("svg", { className: "w-4 h-4", style: { color: "var(--ink-muted)" }, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 1.8 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.573-1.066z" }), /* @__PURE__ */ React.createElement("circle", { cx: "12", cy: "12", r: "3" })), /* @__PURE__ */ React.createElement("span", { className: "text-xs font-semibold", style: { color: "var(--ink)" } }, "Settings")), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowActions(false), className: "smallbtn smallbtn-slate smallbtn-xs" }, "Close")), /* @__PURE__ */ React.createElement("div", { style: { padding: "0.85rem 1rem" }, className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Data"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1.5" }, /* @__PURE__ */ React.createElement(CSVImporter, null))), /* @__PURE__ */ React.createElement("div", { className: "h-px", style: { background: "var(--border)" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Notes"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1.5" }, /* @__PURE__ */ React.createElement(NotesIO, null))), /* @__PURE__ */ React.createElement("div", { className: "h-px", style: { background: "var(--border)" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Preferences"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1.5 mb-3" }, /* @__PURE__ */ React.createElement("button", { onClick: () => actions.reset(), className: "smallbtn smallbtn-slate", title: "Reset all filters and settings" }, "Reset view"), /* @__PURE__ */ React.createElement("button", { onClick: toggleTheme, className: "smallbtn smallbtn-slate", title: "Toggle theme" }, theme === "dark" ? "Light mode" : "Dark mode")), /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Background"), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-7 gap-2" }, BG_THEMES.map((t) => /* @__PURE__ */ React.createElement(
+      /* @__PURE__ */ React.createElement("div", { className: "modal-card max-w-md", onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { className: "modal-header" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("svg", { className: "w-4 h-4", style: { color: "var(--ink-muted)" }, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 1.8 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.573-1.066z" }), /* @__PURE__ */ React.createElement("circle", { cx: "12", cy: "12", r: "3" })), /* @__PURE__ */ React.createElement("span", { className: "text-xs font-semibold", style: { color: "var(--ink)" } }, "Settings")), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowActions(false), className: "smallbtn smallbtn-slate smallbtn-xs" }, "Close")), /* @__PURE__ */ React.createElement("div", { style: { padding: "0.85rem 1rem" }, className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Data"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1.5" }, /* @__PURE__ */ React.createElement(CSVImporter, null))), /* @__PURE__ */ React.createElement("div", { className: "h-px", style: { background: "var(--border)" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Notes"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1.5" }, notesPanelEl)), /* @__PURE__ */ React.createElement("div", { className: "h-px", style: { background: "var(--border)" } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Preferences"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1.5 mb-3" }, /* @__PURE__ */ React.createElement("button", { onClick: () => actions.reset(), className: "smallbtn smallbtn-slate", title: "Reset all filters and settings" }, "Reset view"), /* @__PURE__ */ React.createElement("button", { onClick: toggleTheme, className: "smallbtn smallbtn-slate", title: "Toggle theme" }, theme === "dark" ? "Light mode" : "Dark mode")), /* @__PURE__ */ React.createElement("div", { className: "text-[9px] font-semibold uppercase tracking-wider mb-2", style: { color: "var(--ink-muted)" } }, "Background"), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-7 gap-2" }, BG_THEMES.map((t) => /* @__PURE__ */ React.createElement(
         "button",
         {
           key: t.id,
@@ -4228,7 +4340,7 @@ function Header() {
       title: "Export Notes"
     },
     /* @__PURE__ */ React.createElement("svg", { className: "w-3.5 h-3.5", style: { color: "var(--ink-muted)" }, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 1.8 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" }))
-  ), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowActions(true), className: "iconbtn", title: "Settings & actions" }, /* @__PURE__ */ React.createElement("svg", { className: "w-3.5 h-3.5", style: { color: "var(--ink-muted)" }, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 1.8 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.573-1.066z" }), /* @__PURE__ */ React.createElement("circle", { cx: "12", cy: "12", r: "3" })))))), hasData && /* @__PURE__ */ React.createElement("div", { className: "border-t border-gray-200/40 dark:border-slate-700/40 glass-card-surface" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-7xl mx-auto" }, /* @__PURE__ */ React.createElement(Filters, null))), actionsModal, /* @__PURE__ */ React.createElement(NotesIO, { headless: true }));
+  ), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowActions(true), className: "iconbtn", title: "Settings & actions" }, /* @__PURE__ */ React.createElement("svg", { className: "w-3.5 h-3.5", style: { color: "var(--ink-muted)" }, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 1.8 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.573-1.066z" }), /* @__PURE__ */ React.createElement("circle", { cx: "12", cy: "12", r: "3" })))))), hasData && /* @__PURE__ */ React.createElement("div", { className: "border-t border-gray-200/40 dark:border-slate-700/40 glass-card-surface" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-7xl mx-auto" }, /* @__PURE__ */ React.createElement(Filters, null))), actionsModal, notesHeadlessEl);
 }
 function Tabs() {
   const { state, actions } = useApp();
@@ -5149,12 +5261,14 @@ function NotesHub() {
     const datasetKeys = /* @__PURE__ */ new Set();
     const allData = Array.isArray(state.data) ? state.data : [];
     for (const r of allData) {
-      if (r.__noteKey) datasetKeys.add(r.__noteKey);
+      if (!r.__noteKey) continue;
+      datasetKeys.add(r.__noteKey);
+      datasetKeys.add(canonicalNoteKey(r.__noteKey));
     }
     const deletes = noteDeletes || {};
     for (const [nk, note] of Object.entries(notes || {})) {
       if (!note) continue;
-      if (datasetKeys.has(nk)) continue;
+      if (datasetKeys.has(nk) || datasetKeys.has(canonicalNoteKey(nk))) continue;
       if (deletes[nk]) continue;
       const hasNoteText = safeString(note.note) !== "";
       const hasForecast = note.djForecast != null && isFinite(toNumber(note.djForecast));
@@ -9088,7 +9202,8 @@ function WeeklyBriefTab() {
   return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, chipStrip, brief.warning && /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300" }, brief.warning), kpiRow, buRegionCard, trendCard, worsenedCard, newFcCard, bestCaseCard, worstCaseCard);
 }
 function App() {
-  const { state, actions, idbReady, serverInfo, csvAutoLoadStatus } = useApp();
+  const { state, actions, idbReady, serverInfo } = useApp();
+  const { csvAutoLoadStatus } = useAppStatus();
   const hasData = state?.data?.length > 0;
   const [gateStep, setGateStep] = useState(() => hasData ? "done" : "loading");
   const didAutoApplyRegionRef = useRef(false);
