@@ -1530,11 +1530,18 @@ function AppProvider({ children }) {
                       for (let i = 0; i < rows.length; i++) {
                         const r = rows[i];
                         const d = qNum(r[qdKey]);
-                        if (d != null && d < 0) {
+                        // The CURRENT quarter (quarter_diff === 0) belongs to
+                        // BOTH stores, exactly like the old two-file split:
+                        //   active     -> its BU_FC (remaining forecast)
+                        //   historical -> its QTD_CC (booked-so-far churn)
+                        // so the Region "Booked C/C"/"Expected C/C" KPIs and the
+                        // Full-Year blended rows are unchanged. Future (>0) is
+                        // active-only; closed (<0) is historical-only; a missing
+                        // quarter_diff falls back to active.
+                        if (d == null || d >= 0) activeRows.push(r);
+                        if (d != null && d <= 0) {
                           const ccVal = r.CC != null && r.CC !== "" ? r.CC : (r.QTD_CC != null ? r.QTD_CC : r.qtd_cc);
                           histRows.push({ ...r, CC: ccVal });
-                        } else {
-                          activeRows.push(r);
                         }
                       }
                       acts.importCSV(activeRows, headers, info.mtimeMs || Date.now(), info.sig || null);
