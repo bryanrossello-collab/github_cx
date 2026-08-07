@@ -27,10 +27,12 @@ Wire shapes are FROZEN. The dashboard expects:
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import io
 import json
+import logging
 import math
 import re
 import zipfile
@@ -44,6 +46,8 @@ from app.auth import require_admin, require_owner, require_signed_in, get_curren
 from app.call_keys import build_call_key, parse_call_key
 from app.database import DatabaseUnavailable
 from app.ingest import resolve_effective_date
+
+logger = logging.getLogger("renewals_studio.renewals")
 
 router = APIRouter(prefix="/api/renewals", tags=["renewals"])
 
@@ -853,17 +857,51 @@ async def upload_csv(
         )
 
     eff = resolve_effective_date(filename, row["uploaded_at"])
-    parsed_rows = 0
+    # The CSV bytes are already committed above, so the file is safe. Run the
+    # row-level ingest in the BACKGROUND so a large file (tens of thousands of
+    # rows) can't blow the platform's ~30s request window (which previously
+    # left a stored file with a 0-row snapshot + a 503). We wait briefly inline:
+    # small files finish and report their row count; a large file returns
+    # "pending" while the SHIELDED task keeps ingesting after the response. The
+    # admin page polls the uploads list, which surfaces the row count as it
+    # lands and keeps the instance warm so the background task makes progress.
+    parsed_rows: Optional[int] = None
     parse_error: Optional[str] = None
-    try:
-        parsed_rows = await db.ingest_snapshot(
+    ingest_state = "pending"
+    ingest_task = asyncio.create_task(
+        db.ingest_snapshot(
             csv_upload_id=row["id"],
             slot=resolved_slot,
             effective_date=eff,
             raw_bytes=content,
         )
+    )
+
+    def _on_ingest_done(t: "asyncio.Task") -> None:
+        try:
+            n = t.result()
+            logger.info(
+                "upload ingest complete id=%s slot=%s rows=%s",
+                row["id"], resolved_slot, n,
+            )
+        except Exception:
+            logger.exception(
+                "upload ingest failed id=%s slot=%s", row["id"], resolved_slot
+            )
+
+    ingest_task.add_done_callback(_on_ingest_done)
+    try:
+        # shield() so the timeout doesn't CANCEL the ingest — it keeps running.
+        # 12s inline: small/medium files finish here (and report their row
+        # count); it leaves ample headroom under the platform's ~30s request
+        # cap even after a large multi-MB body upload, so we never 503.
+        parsed_rows = await asyncio.wait_for(asyncio.shield(ingest_task), timeout=12)
+        ingest_state = "done"
+    except asyncio.TimeoutError:
+        ingest_state = "pending"
     except Exception as exc:
         parse_error = f"{type(exc).__name__}: {exc}"
+        ingest_state = "error"
 
     return {
         "ok": True,
@@ -875,6 +913,7 @@ async def upload_csv(
         "uploaded_at": row["uploaded_at"].isoformat(),
         "effective_date": eff.isoformat(),
         "parsed_rows": parsed_rows,
+        "ingest": ingest_state,
         "parse_error": parse_error,
     }
 

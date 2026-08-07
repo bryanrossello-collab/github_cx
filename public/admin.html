@@ -1198,8 +1198,30 @@
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || `${res.status} ${res.statusText}`);
-        const rows = data.parsed_rows != null ? ` · ${Number(data.parsed_rows).toLocaleString()} rows parsed` : '';
-        showToast(`Uploaded ${data.filename} (${slotLabel(data.slot)}, ${fmtBytes(data.size)})${rows}`, 'ok');
+        if (data.ingest === 'pending') {
+          // Large file: the CSV bytes are saved; the server ingests the rows in
+          // the background (so we never hit the ~30s request limit). Poll the
+          // snapshot row count until it lands — the polling also keeps the
+          // instance warm so the background ingest makes progress.
+          setUploadLoading(true, `Saved ${data.filename} (${fmtBytes(data.size)}). Ingesting rows in the background — this can take up to a minute…`);
+          const uploadId = data.id;
+          let rowsDone = 0;
+          for (let i = 0; i < 36 && rowsDone === 0; i++) {   // ~3 min max, 5s cadence
+            await new Promise((r) => setTimeout(r, 5000));
+            try {
+              const snap = await api('/api/renewals/snapshots?limit=100');
+              const list = snap.items || snap.snapshots || [];
+              const mine = list.find((s) => String(s.id) === String(uploadId));
+              rowsDone = mine ? Number(mine.row_count || 0) : 0;
+            } catch (_) {}
+            if (rowsDone === 0) setUploadLoading(true, `Ingesting ${data.filename} in the background… (${(i + 1) * 5}s elapsed — keep this tab open)`);
+          }
+          if (rowsDone > 0) showToast(`Uploaded ${data.filename} (${slotLabel(data.slot)}) · ${rowsDone.toLocaleString()} rows ingested`, 'ok');
+          else showToast(`Uploaded ${data.filename} — the file is saved and still ingesting; click Refresh shortly to see the row count.`, 'ok');
+        } else {
+          const rows = data.parsed_rows != null ? ` · ${Number(data.parsed_rows).toLocaleString()} rows parsed` : '';
+          showToast(`Uploaded ${data.filename} (${slotLabel(data.slot)}, ${fmtBytes(data.size)})${rows}`, 'ok');
+        }
         $('upload-form').reset();
         refreshList();
         refreshStatus();
