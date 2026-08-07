@@ -5,11 +5,15 @@ place CSV uploads land (``csv_uploads`` + ``account_snapshots``), so the
 dashboard read path, versioning, and the frozen endpoint contract are all
 unchanged. The manual CSV upload path is left fully intact as the fallback.
 
-Two slots mirror the two CSV upload slots:
-  * ``active``     -> sql/active_dynamic.sql
-  * ``historical`` -> sql/historical_dynamic.sql
+ONE unified query drives everything:
+  * ``active`` -> sql/unified_dynamic.sql
 
-Each "Run now" executes BOTH queries with their self-dynamic DEFAULT bind
+The single pull carries every quarter plus a QUARTER_DIFF column; it lands in
+the "active" slot (the app's single source) and the frontend splits it by
+QUARTER_DIFF into its active (>=0) and historical (<0) views. The legacy
+two-file split (active_dynamic.sql + historical_dynamic.sql) is retired.
+
+Each "Run now" executes the unified query with its self-dynamic DEFAULT bind
 params (so output tracks the current quarter automatically), serialises the
 result to CSV bytes whose header names match what ingest already expects, and
 feeds those bytes through the existing ingest pipeline via
@@ -51,29 +55,22 @@ _ROOT = Path(__file__).resolve().parent.parent
 SQL_DIR = _ROOT / "sql"
 SEEDS_DIR = _ROOT / "seeds"
 
-# Per-slot spec. Default binds are confirmed against each SQL file's top
-# `params` CTE (qmark '?' order):
-#   active     = [as_of_date=None, quarters_back=1, quarters_forward=4,
-#                 min_arr=75000, band_cutoff=100000]
-#   historical = [as_of_date=None, quarters_back=0, band_cutoff=100000]
-# Filenames carry the slot markers ("2026 data" / "Historical FY27") so slot
-# inference and data-source matching behave exactly like a manual upload.
+# Single unified slot. The unified query lands in the "active" slot (the app's
+# one source); the frontend splits it by QUARTER_DIFF into active/historical
+# views. Default binds match unified_dynamic.sql's `params` CTE (qmark '?'):
+#   [n_past=8, n_future=4, min_arr=10000, band_cutoff=100000]
+# The "2026 data" filename marker keeps slot inference + data-source matching
+# identical to a manual upload.
 SLOT_SPECS: dict[str, dict[str, Any]] = {
     "active": {
-        "sql": "active_dynamic.sql",
-        "seed": "active.csv",
-        "params": [None, 1, 4, 75000, 100000],
+        "sql": "unified_dynamic.sql",
+        "seed": "unified.csv",
+        "params": [8, 4, 10000, 100000],
         "filename": "Snowflake Run-now - 2026 data.csv",
-    },
-    "historical": {
-        "sql": "historical_dynamic.sql",
-        "seed": "historical.csv",
-        "params": [None, 0, 100000],
-        "filename": "Snowflake Run-now - Historical FY27.csv",
     },
 }
 
-SLOTS = ("active", "historical")
+SLOTS = ("active",)
 
 
 def effective_simulated(token: Optional[str], settings: Settings) -> bool:

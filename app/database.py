@@ -264,8 +264,12 @@ SEEDS_DIR = Path(__file__).resolve().parent.parent / "seeds"
 
 # (seed-filename, slot, display-filename-for-the-row).
 SEED_FILES = [
-    ("active.csv",     "active",     "Jesse and Dave F1 Sheet - 2026 data.csv"),
-    ("historical.csv", "historical", "Jesse and Dave F1 Sheet - Historical FY27.csv"),
+    # Single unified bundled seed -> the "active" slot (the app's one source).
+    # It carries a QUARTER_DIFF column; the frontend splits it into the current
+    # (>=0) and historical (<0) views, so no separate historical seed is needed.
+    # The "2026 data" marker in the display name keeps slot/data-source matching
+    # identical to a manual upload.
+    ("unified.csv", "active", "Bundled seed - 2026 data.csv"),
 ]
 
 

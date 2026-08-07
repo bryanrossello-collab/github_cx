@@ -209,8 +209,8 @@
         <h2>Snowflake source — Run now</h2>
         <p class="muted">
           Pull the dashboard's source data directly from Snowflake and load it into the
-          same versioned snapshots a CSV upload creates — for both the
-          <strong>Active</strong> and <strong>Historical</strong> slots in one job.
+          same versioned snapshot a CSV upload creates — one <strong>unified</strong>
+          dataset (all quarters, split by the app into current &amp; historical) in one job.
           The run happens in the background (~2&nbsp;min in real mode); keep this tab
           open — polling keeps the instance warm until it finishes.
           <br />
@@ -225,31 +225,26 @@
       </section>
 
       <section class="card" data-section="owner">
-        <h2>Upload a new CSV</h2>
+        <h2>Upload data file</h2>
         <p class="muted">
-          Every upload becomes a versioned snapshot. The dashboard uses the snapshot
-          with the latest <strong>effective date</strong> (parsed from the filename when
-          possible). Duplicate account/quarter rows within a snapshot are deduplicated.
+          Upload the <strong>single unified data file</strong> (all quarters in one CSV).
+          It becomes a versioned snapshot; the dashboard uses the snapshot with the latest
+          <strong>effective date</strong> (parsed from the filename when possible) and the
+          app splits it by <code>QUARTER_DIFF</code> into the current &amp; historical views.
+          Duplicate account/quarter rows within a snapshot are deduplicated.
           <br />
           <strong>Large file?</strong> If a CSV is over ~30&nbsp;MB it may be rejected
           (413). Zip it first and upload the <code>.zip</code> — the server unzips it
           automatically.
         </p>
         <form id="upload-form" style="margin-top: 12px;">
-          <div class="field-row">
-            <div>
-              <label for="upload-file">File (.csv or .zip)</label>
-              <input type="file" id="upload-file" accept=".csv,.zip,text/csv,text/plain,application/zip,application/x-zip-compressed" required />
-            </div>
-            <div>
-              <label for="upload-slot">Slot</label>
-              <select id="upload-slot" required>
-                <option value="">— auto-detect from filename —</option>
-                <option value="active">Active</option>
-                <option value="historical">Historical</option>
-              </select>
-            </div>
+          <div class="field">
+            <label for="upload-file">File (.csv or .zip)</label>
+            <input type="file" id="upload-file" accept=".csv,.zip,text/csv,text/plain,application/zip,application/x-zip-compressed" required />
           </div>
+          <!-- Single unified dataset: always lands in the "active" slot; the app
+               splits it by QUARTER_DIFF into current (>=0) and historical (<0). -->
+          <input type="hidden" id="upload-slot" value="active" />
           <div class="field">
             <label for="upload-name">Filename (optional override)</label>
             <input type="text" id="upload-name" placeholder="Leave blank to use the file's own name" />
