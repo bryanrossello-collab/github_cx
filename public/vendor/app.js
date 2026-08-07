@@ -1376,6 +1376,10 @@ function AppProvider({ children }) {
     if (_autoLoadClaimed.current) return;
     _autoLoadClaimed.current = true;
     let cancelled = false;
+    // Set when a unified single-file source (carrying a QUARTER_DIFF column)
+    // is fanned into BOTH stores from the ACTIVE slot, so the separate
+    // historical-slot fetch below is skipped and can't clobber it.
+    let unifiedHistFromActive = false;
     setCsvAutoLoadStatus("pending");
     const processSlot = (config) => new Promise((resolve) => {
       const { slot, label, matchSubstring, fallbackToCsvList, getCachedMs, getCachedSig, hasData, importFnName, suppressActiveError } = config;
@@ -1501,7 +1505,54 @@ function AppProvider({ children }) {
                 }
                 setTimeout(() => {
                   try {
-                    const fn = window.__renewalsActions?.[importFnName];
+                    const acts = window.__renewalsActions || {};
+                    // Unified single-file source: one CSV carries EVERY quarter
+                    // plus a QUARTER_DIFF column (<0 = closed/historical, >=0 =
+                    // current + future). When we see it on the ACTIVE slot, fan
+                    // it into BOTH in-memory stores so the whole app — including
+                    // the Historical/Report tabs — runs off one pull:
+                    //   active     <- quarter_diff >= 0
+                    //   historical <- quarter_diff <  0, with realized churn
+                    //                 exposed under CC (:= QTD_CC), the key the
+                    //                 historical views read.
+                    // Falls back to the classic single-slot import when the
+                    // file has no QUARTER_DIFF column (legacy two-file source).
+                    const qdKey = Array.isArray(headers)
+                      ? headers.find((h) => String(h || "").trim().toUpperCase() === "QUARTER_DIFF")
+                      : null;
+                    if (slot === "active" && qdKey && typeof acts.importCSV === "function") {
+                      const qNum = (v) => {
+                        const n = Number(String(v == null ? "" : v).replace(/[^\d.\-]/g, ""));
+                        return isFinite(n) ? n : null;
+                      };
+                      const activeRows = [];
+                      const histRows = [];
+                      for (let i = 0; i < rows.length; i++) {
+                        const r = rows[i];
+                        const d = qNum(r[qdKey]);
+                        if (d != null && d < 0) {
+                          const ccVal = r.CC != null && r.CC !== "" ? r.CC : (r.QTD_CC != null ? r.QTD_CC : r.qtd_cc);
+                          histRows.push({ ...r, CC: ccVal });
+                        } else {
+                          activeRows.push(r);
+                        }
+                      }
+                      acts.importCSV(activeRows, headers, info.mtimeMs || Date.now(), info.sig || null);
+                      if (typeof acts.importHistoricalCSV === "function") {
+                        const histHeaders = headers.indexOf("CC") >= 0 ? headers : [...headers, "CC"];
+                        acts.importHistoricalCSV(histRows, histHeaders, info.mtimeMs || Date.now(), info.sig || null);
+                        unifiedHistFromActive = true;
+                      }
+                      setCsvAutoLoadStatus("loaded");
+                      if (isRefresh) {
+                        setRefreshState((prev) => prev ? { ...prev, phase: "done", rowCount: rows.length } : prev);
+                        setTimeout(() => {
+                          setRefreshState((prev) => prev && prev.phase === "done" && prev.startedAt === startedAt ? null : prev);
+                        }, 2500);
+                      }
+                      return;
+                    }
+                    const fn = acts[importFnName];
                     if (fn) {
                       fn(rows, headers, info.mtimeMs || Date.now(), info.sig || null);
                       if (slot === "active") setCsvAutoLoadStatus("loaded");
@@ -1576,6 +1627,10 @@ function AppProvider({ children }) {
         await new Promise((r) => setTimeout(r, activeRetryBackoffsMs[attempt]));
       }
       if (cancelled) return;
+      // Skip the dedicated historical-slot fetch when a unified active file
+      // already produced the historical store (otherwise an old historical
+      // upload would clobber the split-derived closed quarters).
+      if (unifiedHistFromActive) return;
       await processSlot({
         slot: "historical",
         label: "Historical",
