@@ -156,8 +156,13 @@ class Settings(BaseSettings):
         default="CUSTOMER",
         validation_alias=AliasChoices("SNOWFLAKE_SCHEMA"),
     )
+    # Empty by default: the External OAuth integration runs with
+    # ANY_ROLE_MODE=ENABLE, so we let Snowflake use the token user's DEFAULT
+    # role (matching the platform's reference sample) rather than forcing one.
+    # Forcing 'PUBLIC' was rejected ("role not listed in the Access Token / was
+    # filtered"). Set SNOWFLAKE_ROLE only if you must pin a specific granted role.
     snowflake_role: str = Field(
-        default="PUBLIC",
+        default="",
         validation_alias=AliasChoices("SNOWFLAKE_ROLE"),
     )
     # Bounded connector timeouts (seconds). The active query legitimately

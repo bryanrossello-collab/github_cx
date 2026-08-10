@@ -133,13 +133,21 @@ def run_query_file(
         warehouse=settings.snowflake_warehouse,
         database=settings.snowflake_database,
         schema=settings.snowflake_schema,
-        role=settings.snowflake_role,
         authenticator="oauth",
         token=token,
         login_timeout=int(settings.snowflake_login_timeout_s),
         network_timeout=int(settings.snowflake_network_timeout_s),
         client_session_keep_alive=False,
     )
+    # Only pin a role when one is EXPLICITLY configured. The External OAuth
+    # integration runs with ANY_ROLE_MODE=ENABLE, so omitting `role` lets
+    # Snowflake use the token user's DEFAULT role — exactly like the platform's
+    # reference sample (which passes no role). Forcing 'PUBLIC' here was
+    # rejected as "role requested ('PUBLIC') is not listed in the Access Token
+    # or was filtered". Set SNOWFLAKE_ROLE only to pin a specific granted role.
+    _role = (settings.snowflake_role or "").strip()
+    if _role:
+        conn_kwargs["role"] = _role
     # Pass the token's mapped user (email/sub) like the ZDP reference does; the
     # OAuth External integration maps it to the Snowflake user's EMAIL_ADDRESS.
     _mapped_user = _user_from_token(token)
