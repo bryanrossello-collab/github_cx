@@ -213,3 +213,54 @@ async def refresh_status(request: Request):
         "simulated": settings.snowflake_simulated,
         "settings": settings.snowflake_public_dict(),
     }
+
+
+def _safe_token_claims(token: Optional[str]) -> dict:
+    """Decode a JWT's NON-SECRET claims for diagnosis. Never returns the raw
+    token; `sub` is truncated. Used only by the owner-gated /oauth-debug."""
+    if not token:
+        return {"present": False}
+    try:
+        import base64
+        import json
+
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {"present": True, "opaque": True, "len": len(token)}
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        c = json.loads(base64.urlsafe_b64decode(payload.encode()))
+        sub = c.get("sub")
+        return {
+            "present": True,
+            "len": len(token),
+            "aud": c.get("aud"),
+            "iss": c.get("iss"),
+            "scope": c.get("scp") or c.get("scope"),
+            "email": c.get("email"),
+            "sub_prefix": (str(sub)[:8] + "\u2026") if sub else None,
+            "exp": c.get("exp"),
+            # Any claim mentioning role — this is what drives Snowflake's role auth.
+            "role_claims": {k: v for k, v in c.items() if "role" in str(k).lower()},
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"present": True, "decode_error": type(e).__name__}
+
+
+@router.get("/oauth-debug")
+async def oauth_debug(
+    request: Request,
+    _owner: ResolvedUser = Depends(require_owner),
+):
+    """Owner-only. Shows the NON-SECRET claims of the OAuth token(s) this app
+    actually receives from Pomerium on a normal request, so we can compare to a
+    known-working app (e.g. the ZDP reference). Never logs or returns the raw
+    token. Use to diagnose why Snowflake filters a role: check `aud`, `scope`,
+    and `role_claims` on the access token."""
+    settings = get_settings()
+    return {
+        "access_token": _safe_token_claims(request.headers.get(_TOKEN_HEADER)),
+        "id_token": _safe_token_claims(request.headers.get("x-pomerium-idp-id-token")),
+        "has_jwt_assertion": bool(request.headers.get("x-pomerium-jwt-assertion")),
+        "configured_role": settings.snowflake_role or "(empty \u2192 Snowflake default role)",
+        "configured_account": settings.snowflake_account,
+    }
