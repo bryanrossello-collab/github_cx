@@ -57,20 +57,63 @@ SEEDS_DIR = _ROOT / "seeds"
 
 # Single unified slot. The unified query lands in the "active" slot (the app's
 # one source); the frontend splits it by QUARTER_DIFF into active/historical
-# views. Default binds match unified_dynamic.sql's `params` CTE (qmark '?'):
-#   [n_past=8, n_future=4, min_arr=10000, band_cutoff=100000]
+# views. The query binds live in DEFAULT_QUERY_PARAMS (below) and are
+# admin-overridable at runtime (persisted in renewals_meta 'snowflake_config').
 # The "2026 data" filename marker keeps slot inference + data-source matching
 # identical to a manual upload.
 SLOT_SPECS: dict[str, dict[str, Any]] = {
     "active": {
         "sql": "unified_dynamic.sql",
         "seed": "unified.csv",
-        "params": [8, 4, 10000, 100000],
         "filename": "Snowflake Run-now - 2026 data.csv",
     },
 }
 
 SLOTS = ("active",)
+
+# Default query binds for unified_dynamic.sql's `params` CTE (qmark '?'), in
+# order: [n_past, n_future, min_arr, band_cutoff]. Each is admin-overridable via
+# the /admin UI (GET/PUT /api/renewals/snowflake-config). `min_arr` is the
+# row-inclusion floor on NET_ARR_USD_PRIOR_QUARTER_END; the 10000 floor pulls
+# the broad book (>200K rows), which is why ingest's MAX_ROWS is sized to 500K.
+DEFAULT_QUERY_PARAMS: dict[str, Any] = {
+    "n_past": 8,
+    "n_future": 4,
+    "min_arr": 10000,
+    "band_cutoff": 100000,
+}
+QUERY_PARAM_ORDER = ("n_past", "n_future", "min_arr", "band_cutoff")
+_QUERY_INT_FIELDS = {"n_past", "n_future"}
+
+
+def coerce_query_value(key: str, value: Any):
+    """Coerce one query param to its numeric type, or None if blank/invalid.
+    n_past/n_future are ints; min_arr/band_cutoff are numbers (int when whole)."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        if key in _QUERY_INT_FIELDS:
+            return int(float(value))
+        f = float(value)
+        return int(f) if f.is_integer() else f
+    except (TypeError, ValueError):
+        return None
+
+
+def effective_params_dict(overrides: Optional[dict]) -> dict:
+    """Merge admin overrides over DEFAULT_QUERY_PARAMS -> {name: number}."""
+    o = overrides or {}
+    out: dict[str, Any] = {}
+    for k in QUERY_PARAM_ORDER:
+        v = coerce_query_value(k, o.get(k))
+        out[k] = DEFAULT_QUERY_PARAMS[k] if v is None else v
+    return out
+
+
+def effective_params(overrides: Optional[dict]) -> list:
+    """Ordered bind list for run_query_file: [n_past, n_future, min_arr, band_cutoff]."""
+    d = effective_params_dict(overrides)
+    return [d[k] for k in QUERY_PARAM_ORDER]
 
 
 def effective_simulated(token: Optional[str], settings: Settings) -> bool:
@@ -112,11 +155,32 @@ def _user_from_token(token: str) -> Optional[str]:
         return None
 
 
+def effective_conn(settings: Settings, overrides: Optional[dict]) -> dict:
+    """Merge admin-UI/DB overrides over the env/config defaults for the
+    Snowflake connection. A non-empty override string wins; for `role`, a
+    present-but-empty override means "omit the role" (use the user's default)."""
+    o = overrides or {}
+
+    def pick(key: str, default: str) -> str:
+        v = o.get(key)
+        return v.strip() if isinstance(v, str) and v.strip() else default
+
+    role = o["role"].strip() if isinstance(o.get("role"), str) else (settings.snowflake_role or "")
+    return {
+        "account": pick("account", settings.snowflake_account),
+        "warehouse": pick("warehouse", settings.snowflake_warehouse),
+        "database": pick("database", settings.snowflake_database),
+        "schema": pick("schema", settings.snowflake_schema),
+        "role": role,
+    }
+
+
 def run_query_file(
     path: Path,
     params: list[Any],
     token: str,
     settings: Settings,
+    overrides: Optional[dict] = None,
 ) -> tuple[list[str], list[tuple]]:
     """Execute a Snowflake SQL file with qmark binds; return (columns, rows).
 
@@ -128,26 +192,24 @@ def run_query_file(
     snowflake.connector.paramstyle = "qmark"
     sql = Path(path).read_text()
 
+    eff = effective_conn(settings, overrides)
     conn_kwargs: dict[str, Any] = dict(
-        account=settings.snowflake_account,
-        warehouse=settings.snowflake_warehouse,
-        database=settings.snowflake_database,
-        schema=settings.snowflake_schema,
+        account=eff["account"],
+        warehouse=eff["warehouse"],
+        database=eff["database"],
+        schema=eff["schema"],
         authenticator="oauth",
         token=token,
         login_timeout=int(settings.snowflake_login_timeout_s),
         network_timeout=int(settings.snowflake_network_timeout_s),
         client_session_keep_alive=False,
     )
-    # Only pin a role when one is EXPLICITLY configured. The External OAuth
-    # integration runs with ANY_ROLE_MODE=ENABLE, so omitting `role` lets
-    # Snowflake use the token user's DEFAULT role — exactly like the platform's
-    # reference sample (which passes no role). Forcing 'PUBLIC' here was
-    # rejected as "role requested ('PUBLIC') is not listed in the Access Token
-    # or was filtered". Set SNOWFLAKE_ROLE only to pin a specific granted role.
-    _role = (settings.snowflake_role or "").strip()
-    if _role:
-        conn_kwargs["role"] = _role
+    # Pin a role only when one is set (via the admin UI override or
+    # SNOWFLAKE_ROLE). The External OAuth integration allows any granted role
+    # (token scope `session:role-any`), so a non-empty role like PUBLIC is
+    # honored; an empty role omits it and lets Snowflake use the user's default.
+    if eff["role"]:
+        conn_kwargs["role"] = eff["role"]
     # Pass the token's mapped user (email/sub) like the ZDP reference does; the
     # OAuth External integration maps it to the Snowflake user's EMAIL_ADDRESS.
     _mapped_user = _user_from_token(token)
@@ -178,13 +240,16 @@ def fetch_slot(
     settings: Settings,
     *,
     simulated: bool,
+    overrides: Optional[dict] = None,
 ) -> tuple[list[str], list[tuple]]:
     """Return (columns, rows) for a slot — from seeds (simulated) or
     Snowflake (real). SYNCHRONOUS; call via ``run_in_threadpool``."""
     if simulated:
         return _load_seed(slot)
     spec = SLOT_SPECS[slot]
-    return run_query_file(SQL_DIR / spec["sql"], spec["params"], token or "", settings)
+    return run_query_file(
+        SQL_DIR / spec["sql"], effective_params(overrides), token or "", settings, overrides
+    )
 
 
 def rows_to_csv_bytes(columns: list[str], rows: list[tuple]) -> bytes:
@@ -204,6 +269,7 @@ async def refresh_all(
     settings: Settings,
     *,
     uploaded_by: str = "snowflake:run-now",
+    overrides: Optional[dict] = None,
 ) -> dict:
     """Run BOTH slots: fetch -> serialise to CSV bytes -> persist through the
     existing ingest/upsert path. Records success/failure per slot.
@@ -224,7 +290,7 @@ async def refresh_all(
         try:
             # Connector (or seed read) is blocking -> run off the event loop.
             columns, rows = await run_in_threadpool(
-                fetch_slot, slot, token, settings, simulated=simulated
+                fetch_slot, slot, token, settings, simulated=simulated, overrides=overrides
             )
             content = rows_to_csv_bytes(columns, rows)
             note = (

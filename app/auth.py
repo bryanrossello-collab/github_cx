@@ -391,7 +391,15 @@ def require_admin_or_legacy_token(
         presented = x_signal_password.strip()
     elif authorization and authorization.strip().lower().startswith("bearer "):
         presented = authorization.strip().split(None, 1)[1].strip()
-    if settings.admin_token and secrets.compare_digest(presented, settings.admin_token):
+    # Security hardening (QA H4): honor the legacy shared-password admin path
+    # only when the token is a real (non-default) value, or we're in dev/local.
+    # `legacy_admin_token_active` rejects the shipped default "signal" in
+    # production/staging so a non-admin can't self-escalate with a known secret.
+    if (
+        settings.legacy_admin_token_active
+        and presented
+        and secrets.compare_digest(presented, settings.admin_token)
+    ):
         return ResolvedUser(
             email=user.email or "token-admin@local",
             display_name="Token Admin",

@@ -246,6 +246,11 @@ function streamParseCSV(input, { onComplete, onError, onProgress } = {}) {
       if (!headers && res.meta?.fields) headers = res.meta.fields;
       const row = res.data;
       if (row && typeof row === "object") {
+        // Preserve realized churn under CC BEFORE trimRow drops QTD_CC.
+        // The unified/historical source carries churn in QTD_CC (a DROPPED
+        // column); the historical split + views read it as CC, so promote it
+        // here or historical C/C would always be undefined -> 0.
+        if ((row.CC == null || row.CC === "") && row.QTD_CC != null) row.CC = row.QTD_CC;
         trimRow(row);
         rows.push(row);
         count++;
@@ -255,6 +260,12 @@ function streamParseCSV(input, { onComplete, onError, onProgress } = {}) {
     complete: () => {
       if (!headers) headers = Object.keys(rows[0] || {});
       else headers = trimHeaders(headers);
+      // QTD_CC is trimmed from headers, but we promoted its value onto CC per
+      // row above — make sure CC is a real header so header-based consumers
+      // (importHistoricalCSV hm.CC, HistoricalTab ccKey) can resolve it.
+      if (!headers.some((h) => String(h || "").trim().toUpperCase() === "CC") && rows.some((r) => r && r.CC != null && r.CC !== "")) {
+        headers.push("CC");
+      }
       if (onProgress) onProgress(count);
       onComplete && onComplete(rows, headers);
     },
@@ -814,6 +825,129 @@ function valueCounts(arr, keyFn) {
   }
   return Array.from(map.values()).sort((a, b) => a.label.localeCompare(b.label));
 }
+// Shared row-matching predicate used by BOTH the main filtered-rows hook and
+// the Filters dropdown facet counts. Returns a closure (r, skipKey) => bool.
+// `skipKey` (a filter key like "owners") temporarily ignores that one
+// dimension so a dropdown can preview how many accounts WOULD match each of
+// its own options while still honoring every OTHER active filter.
+function makeRowMatcher(headerMap, filters, settings, notes, opts) {
+  opts = opts || {};
+  const ignoreQuarters = !!opts.ignoreQuarters;
+  const ignoreBand = !!opts.ignoreBand;
+  const get = (k) => headerMap[k] || "";
+  const regionKey = get("REGION");
+  const countryKey = get("BILLING_COUNTRY") || get("COUNTRY");
+  const segmentKey = get("SEGMENT");
+  const industryKey = get("INDUSTRY_TERRITORY") || get("INDUSTRY");
+  const healthKey = get("HEALTH");
+  const quarterKey = get("FISCAL_QUARTER") || get("YEAR_QUARTER");
+  const accountKey = get("ACCOUNT_NAME");
+  const ownerKey = headerMap.OWNER || "CRM_SUCCESS_OWNER_NAME";
+  const partnerKey = get("PARTNER");
+  const partnerTypeKey = get("PARTNER_TYPE");
+  const dateKey = get("NEXT_RENEWAL_DATE");
+  const flagTopKey = headerMap.FLAG_TOP3K || "FLAG_3K";
+  const atrStartingKey = headerMap.ATR_STARTING || "ATR_ARR_USD_STARTING";
+  const search = (filters.search || "").toLowerCase().trim();
+  const from = filters.dateFrom ? new Date(filters.dateFrom) : null;
+  const to = filters.dateTo ? new Date(filters.dateTo) : null;
+  return (r, skipKey) => {
+    if (settings?.useRemainingArr && toNumber(r?.[atrStartingKey]) <= 0) return false;
+    const region = safeString(r[regionKey]);
+    const country = safeString(r[countryKey]);
+    const segment = safeString(r[segmentKey]);
+    const industry = safeString(r[industryKey]);
+    const health = safeString(r[healthKey]);
+    const quarter = safeString(r[quarterKey]);
+    const owner = safeString(r[ownerKey]);
+    const partner = safeString(r[partnerKey]);
+    const partnerType = safeString(r[partnerTypeKey]);
+    const dt = parseDate(r[dateKey]);
+    if (skipKey !== "regions" && filters.regions.length && !filters.regions.includes(region)) return false;
+    if (skipKey !== "countries" && filters.countries.length && !filters.countries.includes(country)) return false;
+    if (skipKey !== "segments" && filters.segments.length && !filters.segments.includes(segment)) return false;
+    if (skipKey !== "industries" && filters.industries && filters.industries.length && !filters.industries.includes(industry)) return false;
+    if (skipKey !== "healths" && filters.healths.length && !filters.healths.includes(health)) return false;
+    if (skipKey !== "quarters" && !ignoreQuarters && filters.quarters.length && !filters.quarters.includes(quarter)) return false;
+    if (skipKey !== "owners" && filters.owners.length && !filters.owners.includes(owner)) return false;
+    if (skipKey !== "partners" && filters.partners.length && !filters.partners.includes(partner)) return false;
+    if (skipKey !== "partnerTypes" && filters.partnerTypes.length && !filters.partnerTypes.includes(partnerType)) return false;
+    if (from && (!dt || dt < from)) return false;
+    if (to && (!dt || dt > to)) return false;
+    const atrVal = getAtrValue(r, headerMap, settings);
+    const band = ignoreBand ? "all" : filters.band || "all";
+    if (band === "100k_official") {
+      const bandCol = safeString(r[headerMap.BAND || "BAND"]).toUpperCase().replace(/[\s$,]/g, "");
+      if (!(bandCol.includes("100K+") || bandCol.includes(">100K") || bandCol.includes("100KANDABOVE") || bandCol === "100K+")) return false;
+    }
+    if (band === "gt100k" && !(atrVal > 1e5)) return false;
+    if (band === "gt75k" && !(atrVal > 75e3)) return false;
+    if (band === "gt12k" && !(atrVal > 12e3)) return false;
+    if (band === "range0_12k" && !(atrVal > 0 && atrVal <= 12e3)) return false;
+    if (band === "range12_75k" && !(atrVal > 12e3 && atrVal <= 75e3)) return false;
+    if (band === "range75_100k" && !(atrVal > 75e3 && atrVal <= 1e5)) return false;
+    if (band === "lt100k" && !(atrVal > 0 && atrVal < 1e5)) return false;
+    const segLower = segment.toLowerCase();
+    if (band === "top3k" && !["1", "true", "yes", "y"].includes(String(r[flagTopKey] || "").toLowerCase())) return false;
+    if (band === "smb" && !segLower.includes("smb")) return false;
+    if (band === "digital" && !segLower.includes("digital")) return false;
+    if (band === "commercial" && !segLower.includes("commercial")) return false;
+    if (band === "enterprise" && !segLower.includes("enterprise")) return false;
+    if (band === "comm_ent" && !(segLower.includes("commercial") || segLower.includes("enterprise"))) return false;
+    const arrRanges = Array.isArray(filters.arrRanges) ? filters.arrRanges : [];
+    if (arrRanges.length > 0) {
+      const inAny = arrRanges.some((rg) => {
+        const lo = rg.min != null && rg.min !== "" ? Number(rg.min) : null;
+        const hi = rg.max != null && rg.max !== "" ? Number(rg.max) : null;
+        if (lo != null && isFinite(lo) && !(atrVal >= lo)) return false;
+        if (hi != null && isFinite(hi) && !(atrVal <= hi)) return false;
+        return true;
+      });
+      if (!inAny) return false;
+    } else {
+      const arrMin = filters.arrMin != null && filters.arrMin !== "" ? Number(filters.arrMin) : null;
+      const arrMax = filters.arrMax != null && filters.arrMax !== "" ? Number(filters.arrMax) : null;
+      if (arrMin != null && isFinite(arrMin) && !(atrVal >= arrMin)) return false;
+      if (arrMax != null && isFinite(arrMax) && !(atrVal <= arrMax)) return false;
+    }
+    if (search) {
+      const nk = r.__noteKey;
+      const nt = nk && notes?.[nk] ? safeString(notes[nk].note) : "";
+      const hay = [accountKey && r[accountKey], owner, partner, partnerType, region, country, segment, health, quarter, nt].map(safeString).join(" ").toLowerCase();
+      if (!hay.includes(search)) return false;
+    }
+    if (filters.hasNotes) {
+      const noteKey = r.__noteKey;
+      const noteObj = noteKey ? notes?.[noteKey] : null;
+      const hasNote = noteObj && (safeString(noteObj.note) || noteObj.djForecast != null && isFinite(toNumber(noteObj.djForecast)));
+      if (!hasNote) return false;
+    }
+    return true;
+  };
+}
+// Faceted DISTINCT-ACCOUNT counts for a filter dimension. For each option
+// value of `valueKey` it counts the unique accounts that would match if that
+// dimension were selected, honoring every other active filter (skipKey).
+function facetAccountCounts(rows, headerMap, match, valueKey, skipKey) {
+  const idKey = headerMap.ACCOUNT_ID || "CRM_ACCOUNT_ID";
+  const nameKey = headerMap.ACCOUNT_NAME || "CRM_ACCOUNT_NAME";
+  const map = /* @__PURE__ */ new Map();
+  for (const r of rows) {
+    const value = safeString(r[valueKey]);
+    let entry = map.get(value);
+    if (!entry) {
+      entry = { value, label: value || "(Blank)", set: /* @__PURE__ */ new Set() };
+      map.set(value, entry);
+    }
+    if (match(r, skipKey)) {
+      const acct = safeString(r[idKey]) || safeString(r[nameKey]);
+      if (acct) entry.set.add(acct);
+    }
+  }
+  return Array.from(map.values())
+    .map((o) => ({ value: o.value, label: o.label, count: o.set.size }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
 class ErrorBoundary extends React.Component {
   constructor(props) {
     super(props);
@@ -900,7 +1034,7 @@ const BAND_OPTIONS = [
   { value: "smb", label: "SMB accounts only" },
   { value: "digital", label: "Digital accounts only" }
 ];
-const VALID_TABS = ["region", "trending", "partner", "accounts", "notes", "historical", "targets", "weekly"];
+const VALID_TABS = ["region", "partner", "accounts", "notes", "historical", "targets", "weekly"];
 const DEFAULT_QUARTERS = ["FY25Q4", "FY26Q1", "FY27Q1", "FY27Q2", "FY27Q3", "FY27Q4"];
 const initialState = {
   data: [],
@@ -4416,7 +4550,6 @@ function Tabs() {
   const allowed = typeof window !== "undefined" && typeof window.__renewalsAllowedTabs === "function" ? new Set(window.__renewalsAllowedTabs()) : null;
   const items = [
     { id: "region", label: "Region" },
-    { id: "trending", label: "Trending" },
     { id: "partner", label: "Partner" },
     { id: "accounts", label: "Accounts" },
     { id: "notes", label: "Notes" },
@@ -4438,7 +4571,7 @@ function Tabs() {
 }
 function Filters() {
   const { state, actions } = useApp();
-  const { data, headerMap, filters, settings } = state;
+  const { data, headerMap, filters, settings, notes } = state;
   const [filterOpen, setFilterOpen] = useState(false);
   const get = (k) => headerMap[k] || "";
   const regionKey = get("REGION");
@@ -4452,15 +4585,31 @@ function Filters() {
   const partnerTypeKey = get("PARTNER_TYPE");
   const bandOptions = BAND_OPTIONS;
   const buildOptions = (key) => key ? valueCounts(data, (row) => row[key]) : [];
-  const regionOptions = useMemo(() => buildOptions(regionKey), [data, regionKey]);
-  const countryOptions = useMemo(() => buildOptions(countryKey), [data, countryKey]);
-  const segmentOptions = useMemo(() => buildOptions(segmentKey), [data, segmentKey]);
-  const industryOptions = useMemo(() => buildOptions(industryKey), [data, industryKey]);
-  const healthOptions = useMemo(() => buildOptions(healthKey), [data, healthKey]);
-  const quarterOptions = useMemo(() => buildOptions(quarterKey).filter((o) => o.value && parseFiscalLabel(o.value).fy > 0), [data, quarterKey]);
-  const ownerOptions = useMemo(() => buildOptions(ownerKey), [data, ownerKey]);
-  const partnerOptions = useMemo(() => buildOptions(partnerKey), [data, partnerKey]);
-  const partnerTypeOptions = useMemo(() => buildOptions(partnerTypeKey), [data, partnerTypeKey]);
+  // Rows the counts are drawn from (dedupe to latest renewal when the app is
+  // in "remaining ATR" mode, mirroring useFilteredRows).
+  const sourceRows = useMemo(
+    () => settings?.useRemainingArr ? dedupeLatestRows(data, headerMap) : data,
+    [data, headerMap, settings?.useRemainingArr]
+  );
+  // Shared predicate so dropdown facet counts stay in lock-step with the
+  // actual filtered result set.
+  const match = useMemo(
+    () => makeRowMatcher(headerMap, filters, settings, notes, {}),
+    [headerMap, filters, settings, notes]
+  );
+  // Each dropdown shows a DISTINCT-ACCOUNT count per option, honoring every
+  // OTHER active filter (skip its own dimension). Only computed while the
+  // panel is open so rapid quick-filter toggles don't pay the faceting cost.
+  const facet = (valueKey, skipKey) => !valueKey ? [] : filterOpen ? facetAccountCounts(sourceRows, headerMap, match, valueKey, skipKey) : buildOptions(valueKey);
+  const regionOptions = useMemo(() => facet(regionKey, "regions"), [filterOpen, sourceRows, headerMap, match, regionKey, data]);
+  const countryOptions = useMemo(() => facet(countryKey, "countries"), [filterOpen, sourceRows, headerMap, match, countryKey, data]);
+  const segmentOptions = useMemo(() => facet(segmentKey, "segments"), [filterOpen, sourceRows, headerMap, match, segmentKey, data]);
+  const industryOptions = useMemo(() => facet(industryKey, "industries"), [filterOpen, sourceRows, headerMap, match, industryKey, data]);
+  const healthOptions = useMemo(() => facet(healthKey, "healths"), [filterOpen, sourceRows, headerMap, match, healthKey, data]);
+  const quarterOptions = useMemo(() => facet(quarterKey, "quarters").filter((o) => o.value && parseFiscalLabel(o.value).fy > 0), [filterOpen, sourceRows, headerMap, match, quarterKey, data]);
+  const ownerOptions = useMemo(() => facet(ownerKey, "owners"), [filterOpen, sourceRows, headerMap, match, ownerKey, data]);
+  const partnerOptions = useMemo(() => facet(partnerKey, "partners"), [filterOpen, sourceRows, headerMap, match, partnerKey, data]);
+  const partnerTypeOptions = useMemo(() => facet(partnerTypeKey, "partnerTypes"), [filterOpen, sourceRows, headerMap, match, partnerTypeKey, data]);
   const activeCount = useMemo(() => {
     const keys = ["regions", "countries", "segments", "industries", "healths", "quarters", "owners", "partners", "partnerTypes"];
     let total = keys.reduce((acc, k) => acc + (filters[k]?.length || 0), 0);
@@ -4673,83 +4822,9 @@ function useFilteredRows(opts) {
   const flagTopKey = headerMap.FLAG_TOP3K || "FLAG_3K";
   const atrStartingKey = headerMap.ATR_STARTING || "ATR_ARR_USD_STARTING";
   const filtered = useMemo(() => {
-    const search = (filters.search || "").toLowerCase().trim();
-    const from = filters.dateFrom ? new Date(filters.dateFrom) : null;
-    const to = filters.dateTo ? new Date(filters.dateTo) : null;
+    const match = makeRowMatcher(headerMap, filters, settings, notes, { ignoreQuarters, ignoreBand });
     const sourceRows = settings?.useRemainingArr ? dedupeLatestRows(data, headerMap) : data;
-    return sourceRows.filter((r) => {
-      if (settings?.useRemainingArr && toNumber(r?.[atrStartingKey]) <= 0) return false;
-      const region = safeString(r[regionKey]);
-      const country = safeString(r[countryKey]);
-      const segment = safeString(r[segmentKey]);
-      const industry = safeString(r[industryKey]);
-      const health = safeString(r[healthKey]);
-      const quarter = safeString(r[quarterKey]);
-      const owner = safeString(r[ownerKey]);
-      const partner = safeString(r[partnerKey]);
-      const partnerType = safeString(r[partnerTypeKey]);
-      const dt = parseDate(r[dateKey]);
-      if (filters.regions.length && !filters.regions.includes(region)) return false;
-      if (filters.countries.length && !filters.countries.includes(country)) return false;
-      if (filters.segments.length && !filters.segments.includes(segment)) return false;
-      if (filters.industries && filters.industries.length && !filters.industries.includes(industry)) return false;
-      if (filters.healths.length && !filters.healths.includes(health)) return false;
-      if (!ignoreQuarters && filters.quarters.length && !filters.quarters.includes(quarter)) return false;
-      if (filters.owners.length && !filters.owners.includes(owner)) return false;
-      if (filters.partners.length && !filters.partners.includes(partner)) return false;
-      if (filters.partnerTypes.length && !filters.partnerTypes.includes(partnerType)) return false;
-      if (from && (!dt || dt < from)) return false;
-      if (to && (!dt || dt > to)) return false;
-      const atrVal = getAtrValue(r, headerMap, settings);
-      const band = ignoreBand ? "all" : filters.band || "all";
-      if (band === "100k_official") {
-        const bandCol = safeString(r[headerMap.BAND || "BAND"]).toUpperCase().replace(/[\s$,]/g, "");
-        if (!(bandCol.includes("100K+") || bandCol.includes(">100K") || bandCol.includes("100KANDABOVE") || bandCol === "100K+")) return false;
-      }
-      if (band === "gt100k" && !(atrVal > 1e5)) return false;
-      if (band === "gt75k" && !(atrVal > 75e3)) return false;
-      if (band === "gt12k" && !(atrVal > 12e3)) return false;
-      if (band === "range0_12k" && !(atrVal > 0 && atrVal <= 12e3)) return false;
-      if (band === "range12_75k" && !(atrVal > 12e3 && atrVal <= 75e3)) return false;
-      if (band === "range75_100k" && !(atrVal > 75e3 && atrVal <= 1e5)) return false;
-      if (band === "lt100k" && !(atrVal > 0 && atrVal < 1e5)) return false;
-      const segLower = segment.toLowerCase();
-      if (band === "top3k" && !["1", "true", "yes", "y"].includes(String(r[flagTopKey] || "").toLowerCase())) return false;
-      if (band === "smb" && !segLower.includes("smb")) return false;
-      if (band === "digital" && !segLower.includes("digital")) return false;
-      if (band === "commercial" && !segLower.includes("commercial")) return false;
-      if (band === "enterprise" && !segLower.includes("enterprise")) return false;
-      if (band === "comm_ent" && !(segLower.includes("commercial") || segLower.includes("enterprise"))) return false;
-      const arrRanges = Array.isArray(filters.arrRanges) ? filters.arrRanges : [];
-      if (arrRanges.length > 0) {
-        const inAny = arrRanges.some((r) => {
-          const lo = r.min != null && r.min !== "" ? Number(r.min) : null;
-          const hi = r.max != null && r.max !== "" ? Number(r.max) : null;
-          if (lo != null && isFinite(lo) && !(atrVal >= lo)) return false;
-          if (hi != null && isFinite(hi) && !(atrVal <= hi)) return false;
-          return true;
-        });
-        if (!inAny) return false;
-      } else {
-        const arrMin = filters.arrMin != null && filters.arrMin !== "" ? Number(filters.arrMin) : null;
-        const arrMax = filters.arrMax != null && filters.arrMax !== "" ? Number(filters.arrMax) : null;
-        if (arrMin != null && isFinite(arrMin) && !(atrVal >= arrMin)) return false;
-        if (arrMax != null && isFinite(arrMax) && !(atrVal <= arrMax)) return false;
-      }
-      if (search) {
-        const nk = r.__noteKey;
-        const nt = nk && notes?.[nk] ? safeString(notes[nk].note) : "";
-        const hay = [accountKey && r[accountKey], owner, partner, partnerType, region, country, segment, health, quarter, nt].map(safeString).join(" ").toLowerCase();
-        if (!hay.includes(search)) return false;
-      }
-      if (filters.hasNotes) {
-        const noteKey = r.__noteKey;
-        const noteObj = noteKey ? notes?.[noteKey] : null;
-        const hasNote = noteObj && (safeString(noteObj.note) || noteObj.djForecast != null && isFinite(toNumber(noteObj.djForecast)));
-        if (!hasNote) return false;
-      }
-      return true;
-    });
+    return sourceRows.filter((r) => match(r, null));
   }, [data, headerMap, filters, notes, settings?.useRemainingArr, ignoreQuarters, ignoreBand]);
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -8778,8 +8853,19 @@ function generateWeeklyBriefHtml(brief, opts) {
   const worstCase = sec.worst_case || {};
   const worsened = sec.worsened || [];
   const newFc = sec.new_forecast || [];
-  const curEff = (brief.current && brief.current.effective_date || "").slice(0, 10);
-  const priEff = (brief.prior && brief.prior.effective_date || "").slice(0, 10) || "\u2014";
+  // True totals (pre-cap) so the exported KPIs/headers match the on-screen tiles.
+  const worsenedTotal = sec.worsened_total != null ? sec.worsened_total : worsened.length;
+  const worsenedLargeTotal = sec.worsened_large_total != null ? sec.worsened_large_total : worsened.filter((r) => r.is_large).length;
+  const newFcTotal = sec.new_forecast_total != null ? sec.new_forecast_total : newFc.length;
+  const newFcLargeTotal = sec.new_forecast_large_total != null ? sec.new_forecast_large_total : newFc.filter((r) => r.is_large).length;
+  const fmtDT = (iso) => {
+    if (!iso) return "\u2014";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso).slice(0, 10);
+    return d.toLocaleString("en-GB", { day: "numeric", month: "short", year: "numeric", hour: "numeric", minute: "2-digit" });
+  };
+  const curEff = fmtDT(brief.current && brief.current.effective_date);
+  const priEff = brief.prior && brief.prior.effective_date ? fmtDT(brief.prior.effective_date) : "\u2014";
   // Applied filters (echoed by the server) so the exported brief states
   // exactly what is scoping the numbers.
   const f = brief.filters || {};
@@ -8793,7 +8879,8 @@ function generateWeeklyBriefHtml(brief, opts) {
   if (f.arr_max != null) filterBits.push("ARR \u2264 " + fmtD(f.arr_max));
   const thr = opts && opts.threshold != null ? opts.threshold : brief.threshold;
   if (thr != null) filterBits.push("Large \u2265 " + fmtD(thr));
-  const scopeLine = `${esc(brief.quarter || "\u2014")} \u00b7 Band ${esc(brief.band || "100k+")} \u00b7 ${curEff} vs ${priEff}${filterBits.length ? " \u00b7 " + esc(filterBits.join(" \u00b7 ")) : ""}`;
+  const bandTxt = brief.band && brief.band !== "all" ? " \u00b7 Band " + esc(brief.band) : "";
+  const scopeLine = `${esc(brief.quarter || "\u2014")}${bandTxt} \u00b7 ${curEff} vs ${priEff}${filterBits.length ? " \u00b7 " + esc(filterBits.join(" \u00b7 ")) : ""}`;
   const regionFilter = f.region && f.region !== "__ALL__" ? f.region : (opts && opts.region && opts.region !== "__ALL__" ? opts.region : null);
   const inRegion = (row) => !regionFilter || row.region === regionFilter;
   // Deltas: for BU FC, a positive swing == more churn/contraction == worse (red).
@@ -8801,8 +8888,8 @@ function generateWeeklyBriefHtml(brief, opts) {
   const upDeltaColor = (n) => n > 0 ? "#22c55e" : n < 0 ? "#ef4444" : "#64748b";
   const kpiCards = [
     { label: "BU Forecast (C/C)", val: fmtD(rollup.current || 0), detail: `${signed(rollup.delta || 0)} WoW`, detailColor: buDeltaColor(rollup.delta || 0), color: "#0ea5e9" },
-    { label: "New $0\u2192FC accounts", val: String(newFc.length), detail: `${newFc.filter((r) => r.is_large).length} large`, color: "#f59e0b" },
-    { label: "Worsened accounts", val: String(worsened.length), detail: `${worsened.filter((r) => r.is_large).length} \u2265 threshold`, color: "#ef4444" },
+    { label: "New $0\u2192FC accounts", val: String(newFcTotal), detail: `${newFcLargeTotal} large`, color: "#f59e0b" },
+    { label: "Worsened accounts", val: String(worsenedTotal), detail: `${worsenedLargeTotal} \u2265 threshold`, color: "#ef4444" },
     { label: "Best Case", val: fmtD(bestCase.current_total || 0), detail: `${signed(bestCase.delta || 0)} WoW`, detailColor: buDeltaColor(bestCase.delta || 0), color: "#8b5cf6" },
     { label: "Worst Case", val: fmtD(worstCase.current_total || 0), detail: `${signed(worstCase.delta || 0)} WoW`, detailColor: buDeltaColor(worstCase.delta || 0), color: "#0d9488" }
   ];
@@ -8871,9 +8958,9 @@ ${rows.map((d) => `<tr><td style="font-weight:500">${esc(d.account_name)}</td><t
 <h2>Overall Rollup</h2>
 ${buTable}
 ${trendHtml}
-<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">Accounts that worsened WoW (${worsened.length})</h3>
+<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">Accounts that worsened WoW (${worsenedTotal > worsened.length ? "top " + worsened.length + " of " + worsenedTotal : worsenedTotal})</h3>
 ${worsenedTable(worsened)}
-<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">New in-quarter forecast \u2014 $0 \u2192 FC (${newFc.length})</h3>
+<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">New in-quarter forecast \u2014 $0 \u2192 FC (${newFcTotal > newFc.length ? "top " + newFc.length + " of " + newFcTotal : newFcTotal})</h3>
 ${newFcTable(newFc)}
 <h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">Best Case movement (${fmtDash(bestCase.current_total)}, <span style="color:${buDeltaColor(bestCase.delta || 0)}">${signed(bestCase.delta || 0)} WoW</span>)</h3>
 ${bestCaseTable(bestCase.top_increase || [], bestCase.top_decrease || [])}
@@ -8952,6 +9039,19 @@ function WeeklyBriefTab() {
   const fmtMoney = fmtCompact;
   const signed = (n) => (n >= 0 ? "+" : "\u2212") + fmtMoney(Math.abs(n));
   const pctS = (v) => v == null || !isFinite(v) ? "\u2014" : (v >= 0 ? "+" : "") + v.toFixed(1) + "%";
+  // Friendly snapshot timestamps (drop the raw filename): "Jul 27, 2026, 4:24 PM".
+  const fmtDateTime = (iso) => {
+    if (!iso) return "\u2014";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso).slice(0, 10);
+    return d.toLocaleString(void 0, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
+  };
+  const fmtDateShort = (iso) => {
+    if (!iso) return "\u2014";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso).slice(0, 10);
+    return d.toLocaleDateString(void 0, { month: "short", day: "numeric", year: "numeric" });
+  };
   // Consume the app's shared filter state so the brief opens pre-scoped to
   // whatever the rest of the dashboard is narrowed to (same mechanism, not a
   // parallel one). Single-valued app selections seed the brief's dimensions;
@@ -8963,13 +9063,6 @@ function WeeklyBriefTab() {
   // dimension is DERIVED from the shared filter state (not local component
   // state) so editing the top Filters bar re-scopes and re-fetches the brief.
   const firstOf = (arr) => Array.isArray(arr) && arr.length === 1 ? arr[0] : "__ALL__";
-  const BAND_DEFAULT = "100k+";
-  // Band: the endpoint matches the stored CSV band column via a substring
-  // LIKE, so the app's computed band tokens (e.g. "gt12k") don't map to it.
-  // Keep the brief on its defining "100k+" band for the 100K+ family and when
-  // unset/"all"; forward any other explicit global band verbatim.
-  const BAND_100K_FAMILY = ["100k_official", "gt100k"];
-  const deriveBand = (b) => (!b || b === "all" || BAND_100K_FAMILY.indexOf(b) >= 0) ? BAND_DEFAULT : b;
   // A dimension scopes the brief only when EXACTLY ONE value is selected in the
   // global bar; 0 or 2+ selections => "All" for that dimension (the endpoint
   // takes one value per dimension and the brief is a single-cut summary).
@@ -8980,10 +9073,37 @@ function WeeklyBriefTab() {
   // default seed, or a multi-select all fall back to the current fiscal quarter
   // (empty string => endpoint auto-picks it).
   const quarter = Array.isArray(sf.quarters) && sf.quarters.length === 1 ? sf.quarters[0] : "";
-  const band = deriveBand(sf.band);
+  // Account inclusion is driven by the app's ARR range filter (on ATR), NOT a
+  // fixed 100k+ band. Derive arr_min/arr_max from the global Filters bar and
+  // disable the band bucket (band=all) server-side. With no ARR filter set,
+  // the brief keeps its CCO default floor of $100K so it still opens as a
+  // 100K+ brief until the user narrows ARR from the top bar.
+  const DEFAULT_ARR_FLOOR = 1e5;
+  const _n = (v) => (v != null && v !== "" && isFinite(Number(v))) ? Number(v) : null;
+  const _ranges = Array.isArray(sf.arrRanges) ? sf.arrRanges : [];
+  let gArrMin = null, gArrMax = null;
+  if (_ranges.length >= 1) {
+    const mins = _ranges.map((r) => _n(r.min)).filter((v) => v != null);
+    const maxs = _ranges.map((r) => _n(r.max)).filter((v) => v != null && v > 0 && isFinite(v));
+    gArrMin = mins.length ? Math.min.apply(null, mins) : null;
+    // Only bound the top when EVERY selected range has a finite max (an
+    // open-ended top range means "no ceiling").
+    gArrMax = (maxs.length && maxs.length === _ranges.length) ? Math.max.apply(null, maxs) : null;
+  } else {
+    gArrMin = _n(sf.arrMin);
+    gArrMax = _n(sf.arrMax);
+  }
+  const arrFilterActive = gArrMin != null || gArrMax != null;
+  const arrMin = arrFilterActive ? gArrMin : DEFAULT_ARR_FLOOR;
+  const arrMax = arrFilterActive ? gArrMax : null;
   const [currentId, setCurrentId] = useState("");
   const [priorId, setPriorId] = useState("");
   const [threshold, setThreshold] = useState(50000);
+  // Client-side noise filters (no refetch). Worsened: min adverse swing.
+  // New $0->FC: min new BU FC (there's no prior swing since prior was $0, so
+  // the meaningful magnitude is the size of the new forecast). 0 = show all.
+  const [minSwing, setMinSwing] = useState(0);
+  const [minNewFc, setMinNewFc] = useState(0);
   const [brief, setBrief] = useState(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
@@ -9005,7 +9125,10 @@ function WeeklyBriefTab() {
     if (segment && segment !== "__ALL__") qs.set("segment", segment);
     if (owner && owner !== "__ALL__") qs.set("owner", owner);
     if (quarter) qs.set("quarter", quarter);
-    if (band && band !== BAND_DEFAULT) qs.set("band", band);
+    // Disable the coarse band bucket; the ARR range governs inclusion.
+    qs.set("band", "all");
+    if (arrMin != null) qs.set("arr_min", String(arrMin));
+    if (arrMax != null) qs.set("arr_max", String(arrMax));
     fetch("/api/renewals/weekly-brief?" + qs.toString(), { cache: "no-store" }).then((r) => r.json()).then((data) => {
       if (cancelled) return;
       if (!data.ok) throw new Error(data.detail || "Weekly brief load failed");
@@ -9021,7 +9144,7 @@ function WeeklyBriefTab() {
       if (!cancelled) setLoading(false);
     });
     return () => { cancelled = true; };
-  }, [currentId, priorId, threshold, region, segment, owner, quarter, band]);
+  }, [currentId, priorId, threshold, region, segment, owner, quarter, arrMin, arrMax]);
   const sec = brief && brief.sections;
   const bu = sec && sec.bu_movement || { regions: [], rollup: {}, trend: [] };
   const rollup = bu.rollup || {};
@@ -9034,20 +9157,21 @@ function WeeklyBriefTab() {
   const snapshots = brief && brief.snapshots || [];
   const buDeltaColor = (n) => n > 0 ? "#ef4444" : n < 0 ? "#22c55e" : "#64748b";
   const upDeltaColor = (n) => n > 0 ? "#22c55e" : n < 0 ? "#ef4444" : "#64748b";
-  const snapLabel = (s) => `${(s.effective_date || "").slice(0, 10)} \u00b7 ${s.filename || ("#" + s.id)}`;
+  const snapLabel = (s) => fmtDateTime(s.effective_date) + (s.row_count ? " \u00b7 " + Number(s.row_count).toLocaleString() + " rows" : "");
   const cell = (txt, cls) => /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 " + (cls || "") }, txt);
   const th = (txt, cls) => /* @__PURE__ */ React.createElement("th", { key: txt, className: "px-2 py-1.5 text-left font-semibold uppercase tracking-wider " + (cls || "") }, txt);
   // Shared payload for the download button (scope values are echoed by the
   // server too, but the threshold comes from the brief-local control).
-  const dlOpts = { region, segment, owner, quarter, band, threshold };
+  const dlOpts = { region, segment, owner, quarter, band: "all", arr_min: arrMin, arr_max: arrMax, threshold };
   // ---- controls -----------------------------------------------------------
   // Only brief-specific controls live here: the snapshot pair to diff and the
   // large-mover threshold. All account scope comes from the global Filters bar.
-  const controls = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3 flex flex-wrap gap-3 items-end" },
-    /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Current snapshot"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: currentId, onChange: (e) => setCurrentId(e.target.value) }, snapshots.map((s) => /* @__PURE__ */ React.createElement("option", { key: s.id, value: String(s.id) }, snapLabel(s))))),
-    /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Compare to (prior)"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: priorId, onChange: (e) => setPriorId(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Auto (previous)"), snapshots.map((s) => /* @__PURE__ */ React.createElement("option", { key: s.id, value: String(s.id) }, snapLabel(s))))),
-    /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Large threshold ($)"), /* @__PURE__ */ React.createElement("input", { className: "filter-input text-xs w-28", type: "number", step: "5000", value: threshold, onChange: (e) => setThreshold(Number(e.target.value) || 0) })),
-    /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-indigo ml-auto", disabled: !brief || !brief.sections, onClick: () => brief && generateWeeklyBriefHtml(brief, dlOpts) }, "Download brief"));
+  const ctrlLabel = (txt) => /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, txt);
+  const curSel = /* @__PURE__ */ React.createElement("div", null, ctrlLabel("Current snapshot"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: currentId, onChange: (e) => setCurrentId(e.target.value) }, snapshots.map((s) => /* @__PURE__ */ React.createElement("option", { key: s.id, value: String(s.id) }, snapLabel(s)))));
+  const priorSel = /* @__PURE__ */ React.createElement("div", null, ctrlLabel("Compare to (prior)"), /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: priorId, onChange: (e) => setPriorId(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "" }, "Auto (previous week)"), snapshots.map((s) => /* @__PURE__ */ React.createElement("option", { key: s.id, value: String(s.id) }, snapLabel(s)))));
+  const thrInput = /* @__PURE__ */ React.createElement("div", null, ctrlLabel("Large-mover threshold ($)"), /* @__PURE__ */ React.createElement("input", { className: "filter-input text-xs w-28", type: "number", step: "5000", value: threshold, onChange: (e) => setThreshold(Number(e.target.value) || 0) }));
+  const dlBtn = /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-indigo", disabled: !brief || !brief.sections, onClick: () => brief && generateWeeklyBriefHtml(brief, dlOpts) }, "Download brief");
+  const controls = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3 flex flex-wrap gap-3 items-end" }, curSel, priorSel, thrInput, /* @__PURE__ */ React.createElement("div", { className: "ml-auto" }, dlBtn));
   // ---- applied-filters chip strip -----------------------------------------
   // Read-only summary of what's scoping the brief, in three labelled groups.
   // Scope now mirrors the GLOBAL Filters bar (users change it up top), so these
@@ -9056,7 +9180,7 @@ function WeeklyBriefTab() {
   const groupLabel = (txt) => /* @__PURE__ */ React.createElement("span", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold shrink-0" }, txt);
   // Group 1 \u2014 Comparing: the snapshot pair being diffed (driven by the
   // Current/Prior snapshot dropdowns). Informational.
-  const comparingVal = brief && brief.current ? (brief.prior ? (brief.prior.effective_date || "").slice(0, 10) : "\u2014") + " \u2192 " + (brief.current.effective_date || "").slice(0, 10) : "\u2014";
+  const comparingVal = brief && brief.current ? (brief.prior ? fmtDateShort(brief.prior.effective_date) : "\u2014") + " \u2192 " + fmtDateShort(brief.current.effective_date) : "\u2014";
   const comparingGroup = /* @__PURE__ */ React.createElement("div", { className: "wb-filter-group" }, groupLabel("Comparing"), mutedChip("pair", comparingVal));
   // Group 2 \u2014 Scope: account-inclusion filters sourced from the global bar.
   // Band + Quarter always define the brief; Region/Segment/Owner appear when
@@ -9069,7 +9193,10 @@ function WeeklyBriefTab() {
     return null;
   };
   const scopeChips = [];
-  scopeChips.push(mutedChip("band", "Band " + (brief && brief.band || band)));
+  const arrChipLabel = arrFilterActive
+    ? ("ARR " + (arrMin != null ? "\u2265 " + fmtMoney(arrMin) : "") + (arrMin != null && arrMax != null ? " \u00b7 " : "") + (arrMax != null ? "\u2264 " + fmtMoney(arrMax) : ""))
+    : "ARR \u2265 " + fmtMoney(DEFAULT_ARR_FLOOR) + " (default)";
+  scopeChips.push(mutedChip("arr", arrChipLabel));
   if (brief && brief.quarter) scopeChips.push(mutedChip("q", "Quarter " + brief.quarter + (brief.quarter_auto_selected ? " (auto)" : "")));
   [dimChip("region", "Region", sf.regions), dimChip("seg", "Segment", sf.segments), dimChip("own", "Owner", sf.owners)].forEach((c) => { if (c) scopeChips.push(c); });
   const scopeGroup = /* @__PURE__ */ React.createElement("div", { className: "wb-filter-group" }, groupLabel("Scope"), /* @__PURE__ */ React.createElement("div", { className: "region-filter-summary" }, scopeChips));
@@ -9078,6 +9205,34 @@ function WeeklyBriefTab() {
   const cutoffGroup = /* @__PURE__ */ React.createElement("div", { className: "wb-filter-group" }, groupLabel("Large-mover cutoff"), mutedChip("thr", "\u2265 " + fmtMoney(threshold)));
   const scopeHint = /* @__PURE__ */ React.createElement("div", { className: "wb-filter-hint text-[10px] text-gray-500 mt-1" }, "Scope is controlled by the Filters bar at the top of the page.");
   const chipStrip = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface px-3 py-2" }, /* @__PURE__ */ React.createElement("div", { className: "wb-filter-strip" }, comparingGroup, scopeGroup, cutoffGroup), scopeHint);
+  // ---- Plain-English takeaway (the single most important line) ------------
+  // States the headline WoW movement for the current scope in one sentence,
+  // color-coded to the C/C convention (increase = worse = red).
+  const scopeLabel = region === "__ALL__" ? "all regions" : region;
+  const tkDelta = rollup.delta || 0;
+  const tkVerb = tkDelta > 0 ? "worsened by" : tkDelta < 0 ? "improved by" : "held roughly flat";
+  const takeaway = /* @__PURE__ */ React.createElement("div", { className: "wb-takeaway", style: { borderLeft: "3px solid " + buDeltaColor(tkDelta), background: "rgba(148,163,184,0.10)", borderRadius: 8, padding: "8px 12px", fontSize: "12px", lineHeight: 1.5 } },
+    "This week, the BU forecast (C/C) for ",
+    /* @__PURE__ */ React.createElement("b", null, scopeLabel),
+    " ",
+    /* @__PURE__ */ React.createElement("b", { style: { color: buDeltaColor(tkDelta) } }, tkVerb, tkDelta === 0 ? "" : " " + fmtMoney(Math.abs(tkDelta)) + (rollup.delta_pct == null || !isFinite(rollup.delta_pct) ? "" : " (" + Math.abs(rollup.delta_pct).toFixed(1) + "%)")),
+    ", to ",
+    /* @__PURE__ */ React.createElement("b", null, fmtC(rollup.current)),
+    ". ",
+    /* @__PURE__ */ React.createElement("b", { style: { color: "#ef4444" } }, worsened.length),
+    (worsened.length === 1 ? " account worsened" : " accounts worsened"),
+    " \u00b7 ",
+    /* @__PURE__ */ React.createElement("b", { style: { color: "#d97706" } }, newFc.length),
+    " new $0\u2192FC.");
+  // ---- Merged header: title + takeaway + controls + scope chips (one card) -
+  const briefHeader = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3 space-y-2" },
+    /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2 flex-wrap" },
+      /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, "Weekly 100K+ Regional Brief"),
+      dlBtn),
+    takeaway,
+    /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-3 items-end" }, curSel, priorSel, thrInput),
+    /* @__PURE__ */ React.createElement("div", { className: "wb-filter-strip" }, comparingGroup, scopeGroup, cutoffGroup),
+    scopeHint);
   if (loading && !brief) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500" }, "Loading weekly brief\u2026"));
   if (err) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-red-500" }, err));
   if (!sec) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500" }, brief && brief.warning || "Upload at least two active CSV snapshots to compare week over week."));
@@ -9086,8 +9241,8 @@ function WeeklyBriefTab() {
     { label: "BU Forecast (C/C)", value: fmtC(rollup.current), delta: rollup.delta, deltaColor: buDeltaColor(rollup.delta || 0), accent: "#0ea5e9" },
     { label: "Best Case", value: fmtC(bestCase.current_total), delta: bestCase.delta, deltaColor: buDeltaColor(bestCase.delta || 0), accent: "#8b5cf6" },
     { label: "Worst Case", value: fmtC(worstCase.current_total), delta: worstCase.delta, deltaColor: buDeltaColor(worstCase.delta || 0), accent: "#0d9488" },
-    { label: "Worsened accounts", value: String((sec.worsened || []).length), sub: `${(sec.worsened || []).filter((r) => r.is_large).length} \u2265 threshold`, accent: "#ef4444" },
-    { label: "New $0\u2192FC", value: String((sec.new_forecast || []).length), sub: `${(sec.new_forecast || []).filter((r) => r.is_large).length} large`, accent: "#f59e0b" }
+    { label: "Worsened accounts", value: String(sec.worsened_total != null ? sec.worsened_total : (sec.worsened || []).length), sub: `${sec.worsened_large_total != null ? sec.worsened_large_total : (sec.worsened || []).filter((r) => r.is_large).length} \u2265 threshold`, accent: "#ef4444" },
+    { label: "New $0\u2192FC", value: String(sec.new_forecast_total != null ? sec.new_forecast_total : (sec.new_forecast || []).length), sub: `${sec.new_forecast_large_total != null ? sec.new_forecast_large_total : (sec.new_forecast || []).filter((r) => r.is_large).length} large`, accent: "#f59e0b" }
   ];
   const kpiRow = /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-5 gap-2" }, kpis.map((c, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: "glass-kpi" }, /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-label" }, c.label), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-value", style: { color: c.accent } }, c.value), c.delta != null ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub", style: { color: c.deltaColor } }, signed(c.delta), " WoW") : c.sub ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub" }, c.sub) : null)));
   // ---- Section 1: BU movement by region ----------------------------------
@@ -9234,18 +9389,30 @@ function WeeklyBriefTab() {
     return blocks;
   };
   const explainTitle = (d) => [d.forecast_summary ? "Forecast Summary: " + d.forecast_summary : "", d.renewals_studio_note ? "Last Renewals Studio Note: " + d.renewals_studio_note : ""].filter(Boolean).join("\n");
-  // ---- Section 2: worsened ------------------------------------------------
+  // ---- Section 2: worsened (with a client-side min-swing noise filter) ----
+  const worsenedShown = worsened.filter((d) => (d.swing || 0) >= (minSwing || 0));
+  const worsenedTotal = sec.worsened_total != null ? sec.worsened_total : worsened.length;
+  const worsenedCount = worsenedShown.length === worsenedTotal ? "(" + worsenedTotal + ")" : "(showing " + worsenedShown.length + " of " + worsenedTotal + ")";
   const worsenedCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
-    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold" }, "2 \u00b7 Accounts that worsened WoW (", worsened.length, ")"),
+    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b flex items-center justify-between gap-2 flex-wrap" },
+      /* @__PURE__ */ React.createElement("span", { className: "text-xs font-semibold" }, "2 \u00b7 Accounts that worsened WoW ", worsenedCount),
+      /* @__PURE__ */ React.createElement("label", { className: "flex items-center gap-1 text-[10px] text-gray-500 font-normal" }, "Min adverse swing $",
+        /* @__PURE__ */ React.createElement("input", { className: "filter-input text-xs w-24", type: "number", step: "5000", min: "0", value: minSwing, onChange: (e) => setMinSwing(Number(e.target.value) || 0) }))),
     /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
       /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", "Prior BU FC", "Current BU FC", "Adverse swing", "What happened"].map((h, i) => th(h, i >= 2 && i <= 4 ? "text-right" : "")))),
-      /* @__PURE__ */ React.createElement("tbody", null, worsened.length ? worsened.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), cell(fmtC(d.prior_bu_fc), "text-right tabular-nums"), cell(fmtC(d.current_bu_fc), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#ef4444" } }, signed(d.swing)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: explainTitle(d) }, explainCell(d)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 6 }, "No worsened accounts in this scope."))))));
-  // ---- Section 3: new $0->FC ----------------------------------------------
+      /* @__PURE__ */ React.createElement("tbody", null, worsenedShown.length ? worsenedShown.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), cell(fmtC(d.prior_bu_fc), "text-right tabular-nums"), cell(fmtC(d.current_bu_fc), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#ef4444" } }, signed(d.swing)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: explainTitle(d) }, explainCell(d)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 6 }, minSwing > 0 && worsened.length ? "No accounts with adverse swing \u2265 " + fmtMoney(minSwing) + " in this scope." : "No worsened accounts in this scope."))))));
+  // ---- Section 3: new $0->FC (with a client-side min-new-FC noise filter) --
+  const newFcShown = newFc.filter((d) => (d.current_bu_fc || 0) >= (minNewFc || 0));
+  const newFcTotal = sec.new_forecast_total != null ? sec.new_forecast_total : newFc.length;
+  const newFcCount = newFcShown.length === newFcTotal ? "(" + newFcTotal + ")" : "(showing " + newFcShown.length + " of " + newFcTotal + ")";
   const newFcCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
-    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold" }, "3 \u00b7 New in-quarter forecast \u2014 $0 \u2192 FC (", newFc.length, ")"),
+    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b flex items-center justify-between gap-2 flex-wrap" },
+      /* @__PURE__ */ React.createElement("span", { className: "text-xs font-semibold" }, "3 \u00b7 New in-quarter forecast \u2014 $0 \u2192 FC ", newFcCount),
+      /* @__PURE__ */ React.createElement("label", { className: "flex items-center gap-1 text-[10px] text-gray-500 font-normal" }, "Min new FC $",
+        /* @__PURE__ */ React.createElement("input", { className: "filter-input text-xs w-24", type: "number", step: "5000", min: "0", value: minNewFc, onChange: (e) => setMinNewFc(Number(e.target.value) || 0) }))),
     /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
       /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", "New BU FC", "What happened"].map((h, i) => th(h, i === 2 ? "text-right" : "")))),
-      /* @__PURE__ */ React.createElement("tbody", null, newFc.length ? newFc.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#d97706" } }, fmtC(d.current_bu_fc)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: explainTitle(d) }, explainCell(d)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 4 }, "No new in-quarter forecasts in this scope."))))));
+      /* @__PURE__ */ React.createElement("tbody", null, newFcShown.length ? newFcShown.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#d97706" } }, fmtC(d.current_bu_fc)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: explainTitle(d) }, explainCell(d)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 4 }, minNewFc > 0 && newFc.length ? "No new forecasts \u2265 " + fmtMoney(minNewFc) + " in this scope." : "No new in-quarter forecasts in this scope."))))));
   // ---- Best/Worst Case movement ------------------------------------------
   // C/C convention: an INCREASE in forecasted churn/contraction = worse = red;
   // a decrease = better = green (same as BU/worsened coloring).
@@ -9261,7 +9428,8 @@ function WeeklyBriefTab() {
   };
   const bestCaseCard = caseCard("4", "Best Case movement", bestCase, "\u0394 Best Case");
   const worstCaseCard = caseCard("5", "Worst Case movement", worstCase, "\u0394 Worst Case");
-  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, chipStrip, brief.warning && /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300" }, brief.warning), kpiRow, buRegionCard, trendCard, worsenedCard, newFcCard, bestCaseCard, worstCaseCard);
+  const casesRow = /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 lg:grid-cols-2 gap-3" }, bestCaseCard, worstCaseCard);
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, briefHeader, brief.warning && /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300" }, brief.warning), kpiRow, buRegionCard, trendCard, worsenedCard, newFcCard, casesRow);
 }
 function App() {
   const { state, actions, idbReady, serverInfo } = useApp();
@@ -9309,7 +9477,7 @@ function App() {
       hasNotes: false
     }));
   }, [hasData, gateStep, actions]);
-  return /* @__PURE__ */ React.createElement("div", { className: "min-h-full region-font" }, gateStep === "loading" && /* @__PURE__ */ React.createElement("div", { className: "splash-shell", style: { display: "flex", alignItems: "center", justifyContent: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", color: "var(--muted)" } }, /* @__PURE__ */ React.createElement("svg", { className: "mx-auto mb-3 animate-spin", width: "32", height: "32", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2" }, /* @__PURE__ */ React.createElement("path", { d: "M21 12a9 9 0 11-6.219-8.56" })), /* @__PURE__ */ React.createElement("div", { style: { fontSize: "0.9rem", fontWeight: 600 } }, "Restoring your session..."))), /* @__PURE__ */ React.createElement("div", { className: `app-shell ${gateStep !== "done" ? "is-hidden" : ""}` }, /* @__PURE__ */ React.createElement(Header, null), /* @__PURE__ */ React.createElement("main", { className: "max-w-7xl mx-auto px-4 pt-4 pb-6 space-y-4" }, !hasData && /* @__PURE__ */ React.createElement(NoDataBanner, null), /* @__PURE__ */ React.createElement(React.Fragment, null, state.ui.activeTab === "partner" && /* @__PURE__ */ React.createElement(Partner, null), state.ui.activeTab === "accounts" && /* @__PURE__ */ React.createElement(Accounts, null), state.ui.activeTab === "region" && /* @__PURE__ */ React.createElement(RegionQuarterTable, null), state.ui.activeTab === "trending" && /* @__PURE__ */ React.createElement(TrendingTab, null), state.ui.activeTab === "notes" && /* @__PURE__ */ React.createElement(NotesHub, null), state.ui.activeTab === "historical" && /* @__PURE__ */ React.createElement(HistoricalTab, null), state.ui.activeTab === "targets" && /* @__PURE__ */ React.createElement(TargetsTab, null), state.ui.activeTab === "weekly" && /* @__PURE__ */ React.createElement(WeeklyBriefTab, null)), /* @__PURE__ */ React.createElement("footer", { className: "text-xs text-gray-500 dark:text-gray-400 text-center pt-6" }, "Data, notes, targets, and settings persist in your browser. Use Reset to clear everything.")), /* @__PURE__ */ React.createElement(ColumnsDrawer, null)), /* @__PURE__ */ React.createElement(RefreshOverlay, null));
+  return /* @__PURE__ */ React.createElement("div", { className: "min-h-full region-font" }, gateStep === "loading" && /* @__PURE__ */ React.createElement("div", { className: "splash-shell", style: { display: "flex", alignItems: "center", justifyContent: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", color: "var(--muted)" } }, /* @__PURE__ */ React.createElement("svg", { className: "mx-auto mb-3 animate-spin", width: "32", height: "32", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2" }, /* @__PURE__ */ React.createElement("path", { d: "M21 12a9 9 0 11-6.219-8.56" })), /* @__PURE__ */ React.createElement("div", { style: { fontSize: "0.9rem", fontWeight: 600 } }, "Restoring your session..."))), /* @__PURE__ */ React.createElement("div", { className: `app-shell ${gateStep !== "done" ? "is-hidden" : ""}` }, /* @__PURE__ */ React.createElement(Header, null), /* @__PURE__ */ React.createElement("main", { className: "max-w-7xl mx-auto px-4 pt-4 pb-6 space-y-4" }, !hasData && /* @__PURE__ */ React.createElement(NoDataBanner, null), /* @__PURE__ */ React.createElement(React.Fragment, null, state.ui.activeTab === "partner" && /* @__PURE__ */ React.createElement(Partner, null), state.ui.activeTab === "accounts" && /* @__PURE__ */ React.createElement(Accounts, null), state.ui.activeTab === "region" && /* @__PURE__ */ React.createElement(RegionQuarterTable, null), state.ui.activeTab === "notes" && /* @__PURE__ */ React.createElement(NotesHub, null), state.ui.activeTab === "historical" && /* @__PURE__ */ React.createElement(HistoricalTab, null), state.ui.activeTab === "targets" && /* @__PURE__ */ React.createElement(TargetsTab, null), state.ui.activeTab === "weekly" && /* @__PURE__ */ React.createElement(WeeklyBriefTab, null)), /* @__PURE__ */ React.createElement("footer", { className: "text-xs text-gray-500 dark:text-gray-400 text-center pt-6" }, "Data, notes, targets, and settings persist in your browser. Use Reset to clear everything.")), /* @__PURE__ */ React.createElement(ColumnsDrawer, null)), /* @__PURE__ */ React.createElement(RefreshOverlay, null));
 }
 function NoDataBanner() {
   return /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-4 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 text-[13px] text-amber-800 dark:text-amber-200" }, /* @__PURE__ */ React.createElement("svg", { width: "18", height: "18", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round", style: { flexShrink: 0 } }, /* @__PURE__ */ React.createElement("path", { d: "M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" }), /* @__PURE__ */ React.createElement("line", { x1: "12", y1: "9", x2: "12", y2: "13" }), /* @__PURE__ */ React.createElement("line", { x1: "12", y1: "17", x2: "12.01", y2: "17" })), /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "No data loaded yet"), " \u2014 load it from Admin (CSV upload or Snowflake \u2018Run now\u2019).")), /* @__PURE__ */ React.createElement("a", { href: "/admin", className: "smallbtn smallbtn-indigo whitespace-nowrap", style: { textDecoration: "none" } }, "Go to Admin"));

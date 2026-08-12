@@ -166,12 +166,17 @@ class Settings(BaseSettings):
         default="PUBLIC",
         validation_alias=AliasChoices("SNOWFLAKE_ROLE"),
     )
-    # Bounded connector timeouts (seconds). The active query legitimately
-    # runs ~2 min; login/network are kept short so a stuck warehouse fails
-    # cleanly rather than hanging a worker thread.
+    # Bounded connector timeouts (seconds). The unified query legitimately runs
+    # ~2 min (heavier now that it spans FUNCTIONAL / FOUNDATIONAL / CLEANSED), so
+    # the CLIENT network timeout MUST exceed the SERVER statement timeout —
+    # otherwise the connector cancels the still-running query and Snowflake
+    # returns "000604 (57014): SQL execution canceled". Ordering invariant:
+    #   network_timeout > statement_timeout  (server governs the clean cancel).
+    # login stays short so a dead warehouse/auth fails fast without hanging a
+    # worker thread. All three are env-overridable if a query needs more room.
     snowflake_login_timeout_s: int = Field(default=30, alias="SNOWFLAKE_LOGIN_TIMEOUT_S")
-    snowflake_network_timeout_s: int = Field(default=45, alias="SNOWFLAKE_NETWORK_TIMEOUT_S")
-    snowflake_statement_timeout_s: int = Field(default=600, alias="SNOWFLAKE_STATEMENT_TIMEOUT_S")
+    snowflake_network_timeout_s: int = Field(default=1200, alias="SNOWFLAKE_NETWORK_TIMEOUT_S")
+    snowflake_statement_timeout_s: int = Field(default=900, alias="SNOWFLAKE_STATEMENT_TIMEOUT_S")
 
     @computed_field  # type: ignore[misc]
     @property
@@ -277,6 +282,21 @@ class Settings(BaseSettings):
             "strict_auth": self.effective_strict_auth,
             "auto_provision_users": self.auto_provision_users,
         }
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def legacy_admin_token_active(self) -> bool:
+        """Security hardening (QA H4): the legacy X-Signal-Password / bearer
+        admin path is usable ONLY when ADMIN_TOKEN is set to a non-default
+        value, OR we are in a dev/local environment. The shipped default
+        "signal" is publicly documented, so accepting it in production/staging
+        would let any caller self-escalate to admin. In prod, a real
+        (non-default) ADMIN_TOKEN re-enables the path."""
+        is_dev = self.environment.strip().lower() in ("development", "dev", "local")
+        is_default_token = (self.admin_token or "") == "signal"
+        if not self.admin_token:
+            return False
+        return not (is_default_token and not is_dev)
 
     @computed_field  # type: ignore[misc]
     @property

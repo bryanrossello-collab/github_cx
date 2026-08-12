@@ -2431,7 +2431,15 @@ async def weekly_brief(
     if normalised_slot not in ("active", "historical"):
         raise HTTPException(status_code=400, detail="slot must be active or historical")
 
-    band_param = (band or WEEKLY_BRIEF_BAND_DEFAULT).strip() or WEEKLY_BRIEF_BAND_DEFAULT
+    # Band bucket vs ARR range: an explicit band='all'/'__ALL__' disables the
+    # coarse band bucket (band_param='' => the LIKE predicate matches every
+    # row), so the ARR range (arr_min/arr_max on s.atr) governs inclusion
+    # instead. Any other value keeps the precomputed band bucket ('100k+').
+    _raw_band = (band or "").strip()
+    if _raw_band.lower() in ("all", "__all__"):
+        band_param = ""
+    else:
+        band_param = _raw_band or WEEKLY_BRIEF_BAND_DEFAULT
 
     def _clean(v: str) -> str:
         v = (v or "").strip()
@@ -2740,7 +2748,10 @@ async def weekly_brief(
         c_bu = cur["bu_fc"] if cur else 0.0
         p_bu = pri["bu_fc"] if pri else 0.0
         swing = c_bu - p_bu
-        if swing > 0:
+        # Require a real PRIOR forecast (p_bu > 0). Brand-new forecasts
+        # ($0 prior -> FC now) are reported only in the "New $0->FC" section,
+        # so the two lists are mutually exclusive (no double-listing).
+        if p_bu > 0 and swing > 0:
             rec = {
                 "account_id": base["account_id"],
                 "account_name": base["account_name"],
@@ -2759,6 +2770,10 @@ async def weekly_brief(
                 rec["renewals_studio_note"] = note
             worsened.append(rec)
     worsened.sort(key=lambda r: r["swing"], reverse=True)
+    # True totals BEFORE truncation, so the KPI tiles show the real count
+    # (not the 100-row list cap). The table still returns only the top N.
+    worsened_total = len(worsened)
+    worsened_large_total = sum(1 for r in worsened if r["is_large"])
     worsened = worsened[:WEEKLY_BRIEF_LIST_CAP]
 
     # Section 3 — new in-quarter forecast ($0 prior -> forecast now)
@@ -2786,6 +2801,8 @@ async def weekly_brief(
                 rec["renewals_studio_note"] = note
             new_forecast.append(rec)
     new_forecast.sort(key=lambda r: r["current_bu_fc"], reverse=True)
+    new_forecast_total = len(new_forecast)
+    new_forecast_large_total = sum(1 for r in new_forecast if r["is_large"])
     new_forecast = new_forecast[:WEEKLY_BRIEF_LIST_CAP]
 
     # Section 4 — Best Case / Worst Case movement + top-5 up/down drivers.
@@ -2875,7 +2892,11 @@ async def weekly_brief(
                 "trend": trend_series,
             },
             "worsened": worsened,
+            "worsened_total": worsened_total,
+            "worsened_large_total": worsened_large_total,
             "new_forecast": new_forecast,
+            "new_forecast_total": new_forecast_total,
+            "new_forecast_large_total": new_forecast_large_total,
             "best_case": best_case_section,
             "worst_case": worst_case_section,
         },

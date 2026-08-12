@@ -505,6 +505,36 @@ Session 10 — 2026-08-05 (cache-buster v=20260805j)
   tombstone-excluding `totalNotes` in practice.
 ```
 
+```
+Session 11 — 2026-08-11
+- User asked for: stop having to edit code every time a Snowflake connection
+  value changes — set role back to PUBLIC AND make Account/Warehouse/Database/
+  Schema/Role adjustable from the admin UI (persisted, no redeploy).
+- Delivered: admin-editable Snowflake connection overrides persisted in
+  `renewals_meta` under key `snowflake_config`.
+  * warehouse.py: new `effective_conn(settings, overrides)` merges overrides
+    over env/config defaults; `run_query_file`/`fetch_slot`/`refresh_all` take
+    an `overrides` dict and connect with the effective account/warehouse/
+    database/schema, pinning `role` only when non-empty (blank role => omit =>
+    use the token user's default; ANY_ROLE_MODE=ENABLE).
+  * routes/refresh.py: `_run_job` loads overrides via `_read_sf_overrides(db)`
+    and passes them to `refresh_all`; `refresh-status.settings` now reflects
+    the EFFECTIVE (merged) values; new owner-gated `GET/PUT
+    /api/renewals/snowflake-config` (GET returns effective config + raw
+    overrides + defaults; PUT stores a cleaned subset, role="" allowed to mean
+    "omit").
+  * admin.html: collapsible "Connection settings (editable — no redeploy)"
+    form (5 inputs + Save) in the Run-now card; `loadSnowflakeConfig()` (GET,
+    owner-init) populates it, `saveSnowflakeConfig()` PUTs then refreshes
+    status. Code default `SNOWFLAKE_ROLE` stays `PUBLIC` (config.py).
+- Verified: py_compile clean (warehouse/refresh/config); both new routes
+  register (GET + PUT /api/renewals/snowflake-config). Python changed ⇒ SERVER
+  RESTART REQUIRED (new endpoints + overrides plumbing).
+- Open question / TODO: none. Residual note — App Foundry "Default role"
+  preference still injects env `SNOWFLAKE_ROLE`; the DB override (admin UI)
+  wins over it via `effective_conn`, so the UI is now the source of truth.
+```
+
 ---
 
 ## 3. Communication protocol

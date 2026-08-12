@@ -27,9 +27,12 @@ from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
-# Safety cap. The current bundled CSV is ~24K rows; this is well above
-# any realistic Zendesk renewals book.
-MAX_ROWS = 200_000
+# Safety cap against a runaway upload. Sized well above the realistic unified
+# pull (~86K rows at the 50000 ARR floor; ~200K+ at lower floors), so a normal
+# refresh is NEVER truncated. NOTE: hitting this only truncates the
+# account_snapshots load (Weekly Brief / historical SQL); the dashboard's main
+# view parses the FULL CSV bytes from csv_uploads client-side and is unaffected.
+MAX_ROWS = 500_000
 
 # Lower-case canonical column → list of accepted header aliases (also
 # lower-cased before lookup). Strings, not regexes — we expect exact match.
@@ -42,7 +45,7 @@ HEADER_ALIASES: dict[str, list[str]] = {
     "net_arr":          ["net_arr_usd", "net_arr"],
     "net_arr_prior":    ["net_arr_usd_prior_qtr_end"],
     "bu_fc":            ["bu_fc", "bufc"],
-    "cc":               ["cc"],
+    "cc":               ["cc", "qtd_cc"],
     "cc_offcycle":      ["cc_offcycle_arr"],
     "expansion":        ["expansion"],
     "region":           ["region"],
@@ -212,7 +215,13 @@ def parse_csv(
     for row in reader:
         row_count += 1
         if row_count > MAX_ROWS:
-            logger.warning("parse_csv: hit MAX_ROWS=%d; truncating ingest", MAX_ROWS)
+            logger.error(
+                "parse_csv: hit MAX_ROWS=%d — TRUNCATING account_snapshots ingest. "
+                "Source has more rows than the cap; raise MAX_ROWS or tighten the "
+                "query (e.g. min_arr floor). The full CSV is still stored in "
+                "csv_uploads and the dashboard view is unaffected.",
+                MAX_ROWS,
+            )
             break
 
         parsed: dict[str, Any] = {}

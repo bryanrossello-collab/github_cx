@@ -22,7 +22,7 @@ def _db(request: Request):
 
 
 class RoleUpdateBody(BaseModel):
-    role: Literal["standard", "admin"]
+    role: Literal["standard", "admin", "owner"]
 
 
 class ManualUserBody(BaseModel):
@@ -106,6 +106,16 @@ async def users_update_role(
     admin=Depends(require_admin),
 ) -> dict:
     target = email.strip().lower()
+    # Only an OWNER may grant the owner role (privilege-escalation guard).
+    # Admins can still promote/demote between standard and admin.
+    if body.role == "owner" and admin.role != "owner":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "owner_required",
+                "detail": "Only an owner can promote a user to owner.",
+            },
+        )
     db = _db(request)
     async with db.acquire() as conn:
         existing = await conn.fetchrow(
@@ -113,12 +123,15 @@ async def users_update_role(
         )
         if existing is None:
             raise HTTPException(status_code=404, detail={"error": "not_found"})
+        # An existing owner's role can't be changed via the UI (prevents
+        # accidentally removing the last owner). Promoting a NON-owner up to
+        # owner is allowed above for owner callers.
         if existing["role"] == "owner":
             raise HTTPException(
                 status_code=400,
                 detail={
                     "error": "cannot_change_owner",
-                    "detail": "Owner role is managed via BOOTSTRAP_OWNERS only.",
+                    "detail": "An existing owner's role can't be changed here.",
                 },
             )
         if admin.email.lower() == target:

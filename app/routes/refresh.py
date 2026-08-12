@@ -40,6 +40,14 @@ router = APIRouter(prefix="/api/renewals", tags=["refresh"])
 
 _TOKEN_HEADER = "x-pomerium-idp-access-token"
 _META_KEY = "snowflake_last_refresh"
+# Admin-editable Snowflake connection overrides (persisted so they survive
+# restarts and don't require a code/env change). Merged over the env/config
+# defaults by warehouse.effective_conn().
+_CONFIG_META_KEY = "snowflake_config"
+_CONFIG_FIELDS = ("account", "warehouse", "database", "schema", "role")
+# Admin-editable query binds for unified_dynamic.sql (numbers), stored in the
+# same `snowflake_config` meta dict alongside the connection fields.
+_QUERY_FIELDS = ("n_past", "n_future", "min_arr", "band_cutoff")
 
 # Per-instance job state. The event loop is single-threaded, so plain dict
 # mutation is safe without a lock. Cross-instance last-success lives in
@@ -106,9 +114,27 @@ async def _persist(db) -> None:
         logger.exception("failed to persist snowflake last-refresh record")
 
 
+async def _read_sf_overrides(db) -> dict:
+    """Load the admin-editable Snowflake connection overrides (or {})."""
+    if db is None:
+        return {}
+    try:
+        raw = await db.get_meta(_CONFIG_META_KEY)
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
 async def _run_job(db, token: Optional[str], settings, job_id: str) -> None:
     try:
-        result = await warehouse.refresh_all(db, token, settings)
+        overrides = await _read_sf_overrides(db)
+        result = await warehouse.refresh_all(db, token, settings, overrides=overrides)
         _job["mode"] = result.get("mode")
         _job["slots"] = result.get("slots", {})
         _job["finished_at"] = _now_iso()
@@ -200,6 +226,7 @@ async def refresh_status(request: Request):
     else:
         base = _pick_latest(_job, persisted)
 
+    _status_overrides = await _read_sf_overrides(db)
     return {
         "status": base.get("status", "idle"),
         "job_id": base.get("job_id"),
@@ -211,7 +238,84 @@ async def refresh_status(request: Request):
         "slots": base.get("slots") or {},
         "error": base.get("error"),
         "simulated": settings.snowflake_simulated,
-        "settings": settings.snowflake_public_dict(),
+        # Effective connection + query settings = env/config defaults with any
+        # admin-UI overrides applied, so the card shows what will actually run.
+        "settings": {
+            "mode": "simulated" if settings.snowflake_simulated else "real",
+            **warehouse.effective_conn(settings, _status_overrides),
+            **warehouse.effective_params_dict(_status_overrides),
+        },
+    }
+
+
+@router.get("/snowflake-config")
+async def get_snowflake_config(
+    request: Request,
+    _owner: ResolvedUser = Depends(require_owner),
+):
+    """Return the EFFECTIVE Snowflake connection settings (env/config defaults
+    with any admin overrides applied), the raw overrides, and the defaults."""
+    settings = get_settings()
+    db = getattr(request.app.state, "db", None)
+    overrides = await _read_sf_overrides(db)
+    return {
+        "ok": True,
+        "config": warehouse.effective_conn(settings, overrides),
+        "query": warehouse.effective_params_dict(overrides),
+        "overrides": overrides,
+        "defaults": {
+            "account": settings.snowflake_account,
+            "warehouse": settings.snowflake_warehouse,
+            "database": settings.snowflake_database,
+            "schema": settings.snowflake_schema,
+            "role": settings.snowflake_role,
+        },
+        "query_defaults": dict(warehouse.DEFAULT_QUERY_PARAMS),
+        "mode": "simulated" if settings.snowflake_simulated else "real",
+    }
+
+
+@router.put("/snowflake-config")
+async def put_snowflake_config(
+    request: Request,
+    _owner: ResolvedUser = Depends(require_owner),
+):
+    """Persist admin-editable Snowflake overrides. Connection fields (account/
+    warehouse/database/schema/role) are strings; query fields (n_past/n_future/
+    min_arr/band_cutoff) are numbers. Any field omitted (or null) keeps its
+    prior value; blank/invalid query numbers fall back to the code default.
+    Fields are MERGED over the existing overrides so the connection and query
+    forms can be saved independently without clobbering each other."""
+    db = _db(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "body must be an object"})
+    clean: dict[str, Any] = dict(await _read_sf_overrides(db))
+    for k in _CONFIG_FIELDS:
+        if k in body and body[k] is not None:
+            v = body[k]
+            if not isinstance(v, str):
+                return JSONResponse(
+                    status_code=400,
+                    content={"ok": False, "error": f"{k} must be a string"},
+                )
+            clean[k] = v.strip()
+    for k in _QUERY_FIELDS:
+        if k in body and body[k] is not None and not (isinstance(body[k], str) and not body[k].strip()):
+            num = warehouse.coerce_query_value(k, body[k])
+            if num is None:
+                return JSONResponse(
+                    status_code=400,
+                    content={"ok": False, "error": f"{k} must be a number"},
+                )
+            clean[k] = num
+    await db.set_meta(_CONFIG_META_KEY, json.dumps(clean))
+    settings = get_settings()
+    return {
+        "ok": True,
+        "overrides": clean,
+        "config": warehouse.effective_conn(settings, clean),
+        "query": warehouse.effective_params_dict(clean),
     }
 
 

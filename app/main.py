@@ -200,6 +200,17 @@ async def lifespan(app: FastAPI):
         settings.app_name, settings.environment, settings.banner(),
     )
 
+    # Security hardening (QA H4): warn once if the shipped default ADMIN_TOKEN
+    # is still in place outside dev — the legacy X-Signal-Password path is
+    # disabled in that case (see Settings.legacy_admin_token_active).
+    _is_dev = settings.environment.strip().lower() in ("development", "dev", "local")
+    if not _is_dev and (settings.admin_token or "") == "signal":
+        logger.warning(
+            "ADMIN_TOKEN is left at the insecure default 'signal'; the legacy "
+            "X-Signal-Password admin path is DISABLED in this environment. Set "
+            "a strong ADMIN_TOKEN to re-enable it."
+        )
+
     app.state.settings = settings
     app.state.db = None
     app.state.seeded = False

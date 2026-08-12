@@ -217,6 +217,29 @@
           <strong>Manual CSV upload below remains fully available</strong> as a fallback.
         </p>
         <div id="snowflake-settings" class="status-grid" style="margin:12px 0;"></div>
+        <details style="margin:8px 0 12px;">
+          <summary style="cursor:pointer;font-size:13px;font-weight:600;">Connection settings (editable — no redeploy needed)</summary>
+          <p class="muted" style="margin:8px 0;">These override the deployed defaults and are saved in the database, so you can change them anytime without touching code. Leave <strong>Role</strong> blank to use your Snowflake user's default role.</p>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:10px;">
+            <div><label for="sf-account">Account</label><input id="sf-account" placeholder="ZENDESK-GLOBAL" /></div>
+            <div><label for="sf-warehouse">Warehouse</label><input id="sf-warehouse" placeholder="PUBLIC_ZENDESK_L" /></div>
+            <div><label for="sf-database">Database</label><input id="sf-database" placeholder="FOUNDATIONAL" /></div>
+            <div><label for="sf-schema">Schema</label><input id="sf-schema" placeholder="CUSTOMER" /></div>
+            <div><label for="sf-role">Role</label><input id="sf-role" placeholder="PUBLIC (blank = user default)" /></div>
+          </div>
+          <p class="muted" style="margin:16px 0 4px;font-weight:600;color:#334155;">Query parameters</p>
+          <p class="muted" style="margin:0 0 8px;">Tune the rolling window and inclusion thresholds passed to the unified query. <strong>Min prior-qtr ARR floor</strong> is the <code>NET_ARR_USD_PRIOR_QUARTER_END</code> cutoff for including an account (lower = more rows).</p>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;">
+            <div><label for="sf-n-past">Quarters of history (n_past)</label><input id="sf-n-past" type="number" min="0" step="1" placeholder="8" /></div>
+            <div><label for="sf-n-future">Quarters forward (n_future)</label><input id="sf-n-future" type="number" min="0" step="1" placeholder="4" /></div>
+            <div><label for="sf-min-arr">Min prior-qtr ARR floor</label><input id="sf-min-arr" type="number" min="0" step="1000" placeholder="10000" /></div>
+            <div><label for="sf-band-cutoff">100k band cutoff</label><input id="sf-band-cutoff" type="number" min="0" step="1000" placeholder="100000" /></div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:10px;">
+            <button class="btn btn-sm" id="sf-save-btn" type="button">Save settings</button>
+            <span id="sf-save-state" class="muted"></span>
+          </div>
+        </details>
         <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
           <button class="btn btn-primary" id="snowflake-run-now">Run now</button>
           <span id="snowflake-run-state" class="muted"></span>
@@ -530,6 +553,7 @@
       if (currentUser && currentUser.role === 'owner') {
         refreshList();
         loadTabAccessConfig();
+        loadSnowflakeConfig();
         refreshSnowflakeStatus().then(function (d) {
           if (d && d.status === 'running') { setSnowflakeRunning(true); startSnowflakePolling(); }
         });
@@ -801,25 +825,38 @@
           const safeEmail = email.replace(/"/g, '&quot;');
           const role = u.role === 'owner' ? 'owner' : (u.role === 'admin' ? 'admin' : 'standard');
           const isSelf = currentUser && currentUser.email && currentUser.email.toLowerCase() === email.toLowerCase();
+          const isOwnerViewer = currentUser && currentUser.role === 'owner';
           const rolePill = role === 'owner' ? 'owner-badge' : (role === 'admin' ? 'pill-ok' : '');
+          // Build the action buttons. Only an owner sees "Make owner".
+          const actions = [];
+          if (role === 'owner') {
+            actions.push('<span class="muted">Owner</span>');
+          } else if (role === 'admin') {
+            if (isSelf) actions.push('<span class="muted">You</span>');
+            else actions.push('<button class="btn btn-sm" data-demote="' + safeEmail + '">Make standard</button>');
+            if (isOwnerViewer && !isSelf) actions.push('<button class="btn btn-sm" data-owner="' + safeEmail + '">Make owner</button>');
+          } else {
+            actions.push('<button class="btn btn-sm btn-primary" data-promote="' + safeEmail + '">Make admin</button>');
+            if (isOwnerViewer) actions.push('<button class="btn btn-sm" data-owner="' + safeEmail + '">Make owner</button>');
+          }
+          if (!isSelf && role !== 'owner') actions.push('<button class="btn btn-sm btn-danger" data-remove-user="' + safeEmail + '">Remove</button>');
           return '<tr data-user-email="' + safeEmail + '">' +
             '<td><code>' + email + '</code></td>' +
             '<td>' + (u.displayName || '—') + '</td>' +
             '<td><span class="pill ' + rolePill + '">' + role + '</span></td>' +
             '<td class="muted">' + (u.updatedAt ? fmtDate(u.updatedAt) : '—') + '</td>' +
-            '<td style="white-space:nowrap">' +
-              (role === 'owner'
-                ? '<span class="muted">Owner (env only)</span>'
-                : role === 'admin'
-                  ? (isSelf ? '<span class="muted">You</span>'
-                    : '<button class="btn btn-sm" data-demote="' + safeEmail + '">Make standard</button>')
-                  : '<button class="btn btn-sm btn-primary" data-promote="' + safeEmail + '">Make admin</button>') +
-              (isSelf || role === 'owner' ? '' : ' <button class="btn btn-sm btn-danger" data-remove-user="' + safeEmail + '">Remove</button>') +
-            '</td>' +
+            '<td style="white-space:nowrap">' + actions.join(' ') + '</td>' +
           '</tr>';
         }).join('');
         tbody.querySelectorAll('[data-promote]').forEach(function (btn) {
           btn.addEventListener('click', function () { changeUserRole(btn.dataset.promote, 'admin'); });
+        });
+        tbody.querySelectorAll('[data-owner]').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            if (confirm('Promote ' + btn.dataset.owner + ' to OWNER? Owners have full control, including managing other owners.')) {
+              changeUserRole(btn.dataset.owner, 'owner');
+            }
+          });
         });
         tbody.querySelectorAll('[data-demote]').forEach(function (btn) {
           btn.addEventListener('click', function () { changeUserRole(btn.dataset.demote, 'standard'); });
@@ -840,7 +877,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ role: role }),
         });
-        showToast((role === 'admin' ? 'Promoted ' : 'Updated ') + email, 'ok');
+        showToast((role === 'owner' ? 'Promoted to owner ' : role === 'admin' ? 'Promoted ' : 'Updated ') + email, 'ok');
         refreshUsers();
       } catch (err) {
         showToast('Role update failed: ' + err.message, 'error');
@@ -1057,6 +1094,7 @@
       const host = $('snowflake-settings');
       if (!host || !s) return;
       const modePill = s.mode === 'real' ? 'pill-ok' : 'pill-warn';
+      const num = function (v) { return (v === null || v === undefined || v === '') ? '—' : Number(v).toLocaleString(); };
       const items = [
         ['Mode', s.mode || '—', modePill],
         ['Account', s.account || '—'],
@@ -1064,12 +1102,71 @@
         ['Database', s.database || '—'],
         ['Schema', s.schema || '—'],
         ['Role', s.role || '—'],
+        ['History (qtrs)', (s.n_past === null || s.n_past === undefined) ? '—' : s.n_past],
+        ['Forward (qtrs)', (s.n_future === null || s.n_future === undefined) ? '—' : s.n_future],
+        ['Min ARR floor', num(s.min_arr)],
+        ['Band cutoff', num(s.band_cutoff)],
       ];
       host.innerHTML = items.map(function (row) {
         const label = row[0], value = row[1], pill = row[2];
         return '<div class="status-item"><div class="status-label">' + label + '</div>' +
           '<div class="status-value">' + (pill ? '<span class="pill ' + pill + '">' + value + '</span>' : value) + '</div></div>';
       }).join('');
+    }
+
+    async function loadSnowflakeConfig() {
+      try {
+        const data = await api('/api/renewals/snowflake-config');
+        const c = (data && data.config) || {};
+        const q = (data && data.query) || {};
+        const set = function (id, v) { const el = $(id); if (el) el.value = (v === null || v === undefined) ? '' : v; };
+        set('sf-account', c.account);
+        set('sf-warehouse', c.warehouse);
+        set('sf-database', c.database);
+        set('sf-schema', c.schema);
+        set('sf-role', c.role);
+        set('sf-n-past', q.n_past);
+        set('sf-n-future', q.n_future);
+        set('sf-min-arr', q.min_arr);
+        set('sf-band-cutoff', q.band_cutoff);
+      } catch (e) { /* non-owner or not ready — ignore */ }
+    }
+
+    async function saveSnowflakeConfig() {
+      const btn = $('sf-save-btn'); const st = $('sf-save-state');
+      const val = function (id) { const el = $(id); return el ? el.value.trim() : ''; };
+      const body = {
+        account: val('sf-account'),
+        warehouse: val('sf-warehouse'),
+        database: val('sf-database'),
+        schema: val('sf-schema'),
+        role: val('sf-role'),
+      };
+      // Query params: include only when non-empty (blank keeps the code default).
+      [['sf-n-past', 'n_past'], ['sf-n-future', 'n_future'],
+       ['sf-min-arr', 'min_arr'], ['sf-band-cutoff', 'band_cutoff']].forEach(function (pair) {
+        const raw = val(pair[0]);
+        if (raw !== '') { const n = Number(raw); if (!Number.isNaN(n)) body[pair[1]] = n; }
+      });
+      if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+      if (st) st.textContent = '';
+      try {
+        const res = await fetch('/api/renewals/snowflake-config', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || (res.status + ' ' + res.statusText));
+        showToast('Snowflake settings saved — click Run now to use them.', 'ok');
+        if (st) st.textContent = 'Saved.';
+        refreshSnowflakeStatus();
+      } catch (e) {
+        showToast('Save failed: ' + e.message, 'error');
+        if (st) st.textContent = 'Failed.';
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Save settings'; }
+      }
     }
 
     function renderRefreshResult(data) {
@@ -1162,6 +1259,7 @@
     // Boot — SSO admin only (no shared password)
     $('refresh-status').addEventListener('click', refreshStatus);
     $('snowflake-run-now') && $('snowflake-run-now').addEventListener('click', handleSnowflakeRunNow);
+    $('sf-save-btn') && $('sf-save-btn').addEventListener('click', saveSnowflakeConfig);
     $('refresh-list').addEventListener('click', refreshList);
     $('refresh-users').addEventListener('click', refreshUsers);
     $('user-add-form').addEventListener('submit', handleUserAdd);
