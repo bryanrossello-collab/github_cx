@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -271,6 +272,14 @@ SEED_FILES = [
     # identical to a manual upload.
     ("unified.csv", "active", "Bundled seed - 2026 data.csv"),
 ]
+
+# The bulk ingest (large BYTEA insert + a COPY of up to MAX_ROWS ~500k records
+# into account_snapshots) legitimately far exceeds the pool's 30s
+# command_timeout for a full ~280k-row book — that surfaced as a Run-now
+# "TimeoutError" with 0 parsed rows even though the CSV bytes were stored.
+# These bulk operations get their own generous per-call timeout that overrides
+# the pool default. Env-overridable via DB_INGEST_TIMEOUT_S.
+INGEST_COMMAND_TIMEOUT_S = int(os.environ.get("DB_INGEST_TIMEOUT_S", "600"))
 
 
 class DatabaseUnavailable(RuntimeError):
@@ -760,6 +769,7 @@ class Database:
                 RETURNING id, uploaded_at
                 """,
                 slot, filename, len(content), sha, content, uploaded_by, note,
+                timeout=INGEST_COMMAND_TIMEOUT_S,
             )
         eff = effective_date or resolve_effective_date(filename, row["uploaded_at"])
         parsed_rows = await self.ingest_snapshot(
@@ -869,11 +879,13 @@ class Database:
                 await conn.execute(
                     "DELETE FROM account_snapshots WHERE csv_upload_id = $1",
                     csv_upload_id,
+                    timeout=INGEST_COMMAND_TIMEOUT_S,
                 )
                 await conn.copy_records_to_table(
                     "account_snapshots",
                     records=records,
                     columns=ingest.SNAPSHOT_COLUMNS,
+                    timeout=INGEST_COMMAND_TIMEOUT_S,
                 )
         logger.info(
             "ingest_snapshot: csv_upload_id=%d slot=%s rows=%d",

@@ -420,17 +420,28 @@ function getAtrValue(row, hm, settings) {
 function getBuValue(row, hm, settings) {
   return toNumber(row?.[getBuKey(hm, settings)]);
 }
+function isDoneDeal(row, doneKey, ltgVal) {
+  // A renewal is DONE when there's nothing left to action (ATR_ARR_USD_LTG == 0)
+  // OR the Renewal Manager manually flagged it done (DONE_DEAL). Pending only
+  // when LTG > 0 AND not flagged. Both signals are current-quarter only.
+  if (ltgVal <= 0) return true;
+  const raw = String(row?.[doneKey] ?? "").trim().toLowerCase();
+  return raw === "true" || raw === "1" || raw === "yes" || raw === "y" || raw === "t";
+}
 function ensureEffectiveFields(rows, hm) {
   const atrKey = hm.ATR_STARTING || "ATR_ARR_USD_STARTING";
   const buKey = hm.BU_FC || "BU_FC";
   const ltgKey = hm.ATR_LTG || "ATR_ARR_USD_LTG";
+  const doneKey = hm.DONE_DEAL || "DONE_DEAL";
   let changed = false;
   const next = (rows || []).map((row) => {
     if (row && row[EFFECTIVE_ATR_KEY] != null && row[EFFECTIVE_BU_KEY] != null) return row;
     const atrStarting = toNumber(row?.[atrKey]);
     const buStarting = toNumber(row?.[buKey]);
     const ltgVal = toNumber(row?.[ltgKey]);
-    const effectiveAtr = ltgVal > 0 ? ltgVal : atrStarting;
+    // Done (LTG==0 OR RM flag) => forecast is settled, use full starting ATR;
+    // pending => only the remaining left-to-go amount is still in play.
+    const effectiveAtr = isDoneDeal(row, doneKey, ltgVal) ? atrStarting : ltgVal;
     const effectiveBu = effectiveAtr > 0 ? Math.min(buStarting, effectiveAtr) : 0;
     changed = true;
     return { ...row, [EFFECTIVE_ATR_KEY]: effectiveAtr, [EFFECTIVE_BU_KEY]: effectiveBu };
@@ -1867,7 +1878,8 @@ function AppProvider({ children }) {
         const atrStarting = toNumber(baseRow[atrKey]);
         const buStarting = toNumber(baseRow[buKey]);
         const ltgVal = toNumber(baseRow[ltgKey]);
-        const effectiveAtr = ltgVal > 0 ? ltgVal : atrStarting;
+        // Done = LTG==0 OR RM done flag (same rule as the active store).
+        const effectiveAtr = isDoneDeal(baseRow, headerMap.DONE_DEAL || "DONE_DEAL", ltgVal) ? atrStarting : ltgVal;
         const effectiveBu = effectiveAtr > 0 ? Math.min(buStarting, effectiveAtr) : 0;
         const noteKey = buildNoteKey(baseRow, headerMap);
         return { ...baseRow, __noteKey: noteKey, [EFFECTIVE_ATR_KEY]: effectiveAtr, [EFFECTIVE_BU_KEY]: effectiveBu };
@@ -4063,6 +4075,7 @@ function HistoricalTab() {
   const ccOffKey = hm.CC_OFFCYCLE || "CC_OFFCYCLE_ARR";
   const expKey = hm.EXPANSION || "EXPANSION";
   const doneKey = hm.DONE_DEAL || "DONE_DEAL";
+  const ltgKey = hm.ATR_LTG || "ATR_ARR_USD_LTG";
   const acctKey = hm.ACCOUNT_NAME || "CRM_ACCOUNT_NAME";
   const acctIdKey = hm.ACCOUNT_ID || "CRM_ACCOUNT_ID";
   const dateKey = hm.NEXT_RENEWAL_DATE || "NEXT_RENEWAL_DATE";
@@ -4113,12 +4126,12 @@ function HistoricalTab() {
       s.ccOff += toNumber(r[ccOffKey]);
       s.exp += exp;
       s.count++;
-      const d = safeString(r[doneKey]).toUpperCase();
-      if (d === "TRUE") s.done++;
+      // Done = LTG==0 OR RM done flag (in-quarter signal); else still open.
+      if (isDoneDeal(r, doneKey, toNumber(r[ltgKey]))) s.done++;
       else s.open++;
     });
     return m;
-  }, [histData, qKey, atrKey, buKey, ccKey, ccOffKey, expKey, doneKey, selectedBand, selectedSubregion, subregionKey, selectedCsManager, csManagerKey]);
+  }, [histData, qKey, atrKey, buKey, ccKey, ccOffKey, expKey, doneKey, ltgKey, selectedBand, selectedSubregion, subregionKey, selectedCsManager, csManagerKey]);
   const rowsView = useMemo(
     () => allQuarters.map((q) => qtrStats.get(q)).filter(Boolean),
     [allQuarters, qtrStats]
@@ -5735,6 +5748,7 @@ function generateExecSummary(rows, notes, hm, settings, histData, histHM) {
   const histOwnerKey = hHM.OWNER || "CRM_SUCCESS_OWNER_NAME";
   const histHealthKey = hHM.HEALTH || "CRM_HEALTH_STATUS";
   const histDoneKey = hHM.DONE_DEAL || "DONE_DEAL";
+  const histLtgKey = hHM.ATR_LTG || "ATR_ARR_USD_LTG";
   const big = rows.filter((r) => toNumber(r[atrKey]) > 1e5);
   const byQtr = /* @__PURE__ */ new Map();
   big.forEach((r) => {
@@ -5838,7 +5852,7 @@ function generateExecSummary(rows, notes, hm, settings, histData, histHM) {
       lines.push("| Account | Owner | ATR | C/C | Health | Done |");
       lines.push("|---------|-------|-----|-----|--------|------|");
       histAccts.forEach((r) => {
-        const done = safeString(r[histDoneKey]).toUpperCase() === "TRUE" ? "Yes" : "--";
+        const done = isDoneDeal(r, histDoneKey, toNumber(r[histLtgKey])) ? "Yes" : "--";
         lines.push(`| ${safeString(r[histAcctKey]) || "(Unnamed)"} | ${safeString(r[histOwnerKey]) || "--"} | ${fmtD(toNumber(r[histAtrKey]))} | ${fmtD(toNumber(r[histCcKey]))} | ${safeString(r[histHealthKey]) || "--"} | ${done} |`);
       });
       lines.push("");
@@ -6061,6 +6075,7 @@ function generateQuarterExecSummary(quarter, state, bandFilter, histBandFilter, 
   const histQKey = hHM.FISCAL_QUARTER || hHM.YEAR_QUARTER || "FISCAL_QUARTER";
   const histAcctKey = hHM.ACCOUNT_NAME || "CRM_ACCOUNT_NAME", histHealthKey = hHM.HEALTH || "CRM_HEALTH_STATUS";
   const histDoneKey = hHM.DONE_DEAL || "DONE_DEAL", histExpKey = hHM.EXPANSION || "EXPANSION";
+  const histLtgKey = hHM.ATR_LTG || "ATR_ARR_USD_LTG";
   const histOwnerKey = hHM.OWNER || "CRM_SUCCESS_OWNER_NAME";
   const notes = state.notes || {}, histData = state.historicalData || [], ccData = state.ccData || {};
   const rateTarget = state.rateTargets?.[quarter];
@@ -6072,7 +6087,7 @@ function generateQuarterExecSummary(quarter, state, bandFilter, histBandFilter, 
   const atr = act.reduce((s, r) => s + toNumber(r[atrKey]), 0), buFC = act.reduce((s, r) => s + toNumber(r[buKey]), 0);
   const hAtr = hist.reduce((s, r) => s + toNumber(r[histAtrKey]), 0), hCC = hist.reduce((s, r) => s + toNumber(r[ccKeyH]), 0);
   const hExp = hist.reduce((s, r) => s + toNumber(r[histExpKey]), 0);
-  const hDone = hist.filter((r) => safeString(r[histDoneKey]).toUpperCase() === "TRUE").length;
+  const hDone = hist.filter((r) => isDoneDeal(r, histDoneKey, toNumber(r[histLtgKey]))).length;
   const base = hAtr > 0 ? hAtr : atr, expCC = hCC + buFC;
   const rate = base > 0 ? (base - expCC) / base * 100 : null;
   const attain = rate != null && rateTarget > 0 ? rate / rateTarget * 100 : null;
@@ -6110,13 +6125,13 @@ function generateQuarterExecSummary(quarter, state, bandFilter, histBandFilter, 
     cc: toNumber(r[ccKeyH]),
     h: safeString(r[histHealthKey]),
     own: safeString(r[histOwnerKey]),
-    done: safeString(r[histDoneKey]).toUpperCase() === "TRUE"
+    done: isDoneDeal(r, histDoneKey, toNumber(r[histLtgKey]))
   }));
   const expA = hist.filter((r) => toNumber(r[histExpKey]) > 0).sort((a, b) => toNumber(b[histExpKey]) - toNumber(a[histExpKey])).map((r) => ({
     name: safeString(r[histAcctKey]),
     exp: toNumber(r[histExpKey]),
     h: safeString(r[histHealthKey]),
-    done: safeString(r[histDoneKey]).toUpperCase() === "TRUE"
+    done: isDoneDeal(r, histDoneKey, toNumber(r[histLtgKey]))
   }));
   let djTotal = 0, djOverrides = 0;
   accts.forEach((a) => {
