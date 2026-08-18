@@ -12,11 +12,11 @@
 
 1. [Executive summary](#1-executive-summary)
 2. [System architecture](#2-system-architecture)
-3. [The six dashboard tabs](#3-the-six-dashboard-tabs)
+3. [The seven dashboard tabs](#3-the-seven-dashboard-tabs)
 4. [Account intelligence — the unified modal](#4-account-intelligence--the-unified-modal)
-5. [Notes & ELT Forecast — the core differentiator](#5-notes--dj-forecast--the-core-differentiator)
+5. [Notes & ELT Forecast — the core differentiator](#5-notes--elt-forecast--the-core-differentiator)
 6. [Filters, search, and the slice system](#6-filters-search-and-the-slice-system)
-7. [Data ingestion — how CSVs become a dashboard](#7-data-ingestion--how-csvs-become-a-dashboard)
+7. [Data ingestion — how source data becomes a dashboard](#7-data-ingestion--how-source-data-becomes-a-dashboard)
 8. [Exports & briefings](#8-exports--briefings)
 9. [Persistence & storage architecture](#9-persistence--storage-architecture)
 10. [User journeys (annotated walkthroughs)](#10-user-journeys-annotated-walkthroughs)
@@ -32,47 +32,50 @@
 ## 1. Executive summary
 
 **Renewals Studio** is a self-contained renewal-intelligence dashboard for
-customer-success and renewal-management teams. It turns a flat CSV export
-(Salesforce / data warehouse / spreadsheet) into a live, filterable,
+customer-success and renewal-management teams. It turns a single unified
+Snowflake pull (or a manually-uploaded CSV) into a live, filterable,
 annotatable view of every account up for renewal — with per-account notes,
-forecast overrides, multi-year comparisons, and one-click briefing
-exports.
+forecast overrides, multi-year comparisons, week-over-week movement
+briefs, and one-click exports.
 
 ### One-paragraph elevator
 
 A CSM opens the page and instantly sees every renewal account grouped by
 quarter, region, segment, and partner. They click a row, see the full
 account context, type a note with `Cmd+Enter`, override the forecast for
-that renewal, and the entire team sees the change in seconds. Once a
-week they hit *Export Weekly Update*, paste the markdown into Slack, and
-move on.
+that renewal (via the CS / Renewals decomposition), and the entire team
+sees the change in seconds — durably, across devices. Once a week the CCO
+opens the **Weekly Brief** tab, reads the week-over-week movement by region,
+and downloads a shareable HTML brief.
 
 ### What's included in this build
 
 | Layer | Origin |
 | --- | --- |
 | Dashboard (React app) | **Original Renewals Intelligence Studio**, bundled verbatim — same UI, same logic, same charts. Labels renamed: DJ → ELT (state keys preserved). |
-| HTTP server | **Python 3.12 + FastAPI + asyncpg + pydantic-settings** in `app/` (≈ 1,000 lines across 8 modules) |
-| Persistence | **Cloud SQL Postgres** — notes, tombstones, CSV uploads (with version history), all in tables. **No filesystem state.** |
-| Admin UI | Standalone `public/admin.html` — password-protected (via `ADMIN_TOKEN`) for managing CSV uploads + DB diagnostics |
-| Container | Multi-stage Dockerfile, `python:3.12-slim`, tini PID 1, non-root user, listens on `$PORT` (default 8080) |
-| Default seed | Real Zendesk F1 Sheet CSVs ingested into Postgres on first boot if the table is empty (`UPSERT`-style, never destroys user data) |
-| Deployable | `renewals-studio.zip` (~2.3 MB) — drop on App Foundry / Vibe / Cloud Run |
+| HTTP server | **Python 3.12 + FastAPI + asyncpg + pydantic-settings + structlog** in `app/` |
+| Persistence | **Cloud SQL Postgres** — notes, tombstones, CSV uploads (with version history), parsed `account_snapshots`, call events, users, meta — all in tables. **No filesystem state.** |
+| Data source | **Single unified Snowflake pull** (`sql/unified_dynamic.sql`), on-demand via the admin "Run now" button. Manual CSV upload remains as the fallback path. |
+| Auth | **Header-based SSO** (Pomerium / Okta) with roles owner / admin / standard / guest. Legacy shared-password path (`X-Signal-Password`) hardened for local dev only. |
+| Admin UI | Standalone `public/admin.html` — role-gated (owner/admin) for Snowflake Run-now, editable connection/query settings, CSV upload, snapshot history, user management, tab-access config, and DB diagnostics |
+| Container | Multi-stage Dockerfile, `python:3.12-slim`, tini PID 1, non-root `app` user, listens on `$PORT` (default 8080) |
+| Default seed | Bundled unified CSV (`seeds/unified.csv`) ingested into Postgres on first boot **only when the slot is empty** (never destroys user data; off by default via `SEED_ON_STARTUP`) |
+| Deployable | `renewals-studio.zip` (~1.0 MB) — drop on App Foundry / Vibe / Cloud Run |
 
 ### Key statistics
 
 | Metric | Value |
 | --- | --- |
-| Frontend bundle (compiled React) | 567 KB minified |
+| Frontend bundle (compiled React) | ~680 KB minified (`vendor/app.js`) |
 | CSS (Tailwind, vendored) | 2.9 MB |
 | Image base (Python 3.12 slim) | ≈ 130 MB |
-| Final image size | ≈ 260 MB |
-| Deployable ZIP size | ~2.3 MB |
-| Backend modules (Python) | 8 (`config`, `database`, `logging_setup`, `main`, 3 route modules) |
-| Endpoints | 18 (5 admin, 9 renewals, 2 health, 2 static) |
-| Tabs in the UI | 6 (Region / Partner / Accounts / Notes / Historical / Report) + admin page |
-| Database tables | 5 (`notes`, `note_tombstones`, `csv_uploads`, `app_meta`, `schema_migrations`) |
-| Default seed rows | ~24,000 (Active 2026 data) + ~6,000 (Historical FY27) — ingested into `csv_uploads` table on first boot |
+| Final image size | ≈ 250 MB |
+| Deployable ZIP size | ~1.0 MB |
+| Backend modules (Python) | `main`, `config`, `database`, `ingest`, `warehouse`, `auth`, `users`, `logging_setup`, `call_keys` + 5 route modules (`health`, `admin`, `renewals`, `refresh`, `auth_api`) |
+| Endpoints | 40+ across `/api/renewals/*`, `/admin/*`, `/api/users*`, `/api/whoami`, `/healthz`, `/readyz`, plus the static mount |
+| Tabs in the UI | 7 (Region / Accounts / Partner / Notes / Historical / Report / Weekly Brief) + Admin page. **Trending tab retired** (folded into Weekly Brief) |
+| Database tables | 10 (`notes`, `note_tombstones`, `csv_uploads`, `account_snapshots`, `account_forecasts`, `account_call_events`, `quarter_calls`, `users`, `renewals_meta`, `schema_migrations`) |
+| Default seed | One unified CSV (`seeds/unified.csv`, ~1.7 MB) carrying a rolling 13-quarter window; ingested into `csv_uploads` + `account_snapshots` on first boot when the slot is empty |
 
 ---
 
@@ -84,32 +87,39 @@ move on.
 flowchart TB
     subgraph GCP["Google Cloud Platform"]
         CR["Cloud Run (stateless, $PORT)"]
-        CSQL[("Cloud SQL Postgres 15<br/>(durable storage)")]
-        SM["Secret Manager<br/>(ADMIN_TOKEN, DB creds)"]
+        CSQL[("Cloud SQL Postgres<br/>(durable storage)")]
+        SM["Secret Manager<br/>(DB creds, ADMIN_TOKEN)"]
     end
+
+    subgraph Edge["Identity edge"]
+        Prox["Pomerium / Okta SSO<br/>(injects identity headers +<br/>x-pomerium-idp-access-token)"]
+    end
+
+    SF["Snowflake<br/>(unified_dynamic.sql source)"]
 
     SM -.injects.-> CR
     CR <-->|asyncpg pool<br/>discrete params<br/>backoff retry| CSQL
+    CR -.->|"Run now" (OAuth token,<br/>per-request, never stored)| SF
 
-    subgraph Container["renewals-studio container (python:3.12-slim, tini, non-root)"]
+    subgraph Container["renewals-studio container (python:3.12-slim, tini, non-root app user)"]
         direction TB
         FAPI["FastAPI app (app/main.py)<br/>opens :PORT immediately"]
-        BG["Lifespan BG task:<br/>connect → migrate → seed"]
+        BG["Lifespan BG task:<br/>connect → ensure_schema → migrate → seed"]
         Static["Static assets (public/)"]
         FAPI --> Static
     end
 
     subgraph Static["public/"]
         HTML["index.html<br/>(original verbatim, DJ→ELT label rename)"]
-        AppJS["vendor/app.js<br/>(compiled React, 567KB)"]
+        AppJS["vendor/app.js<br/>(compiled React, ~680KB)"]
         Tailwind["vendor/tailwind.min.css"]
-        Admin["admin.html<br/>(token-gated CSV upload UI)"]
+        Admin["admin.html<br/>(role-gated admin console)"]
     end
 
-    Browser["User's browser"] -->|HTTPS| CR
+    Browser["User's browser"] -->|HTTPS| Prox --> CR
     Browser <-->|same-origin XHR| FAPI
     Browser -.->|loads| AppJS
-    AdminUser["Admin (with ADMIN_TOKEN)"] -->|HTTPS| Admin
+    AdminUser["Owner / Admin (SSO role)"] -->|HTTPS| Admin
 ```
 
 ### 2.2 Component-level
@@ -118,23 +128,26 @@ flowchart TB
 flowchart LR
     subgraph Frontend["React dashboard (vendor/app.js)"]
         AppProvider["AppProvider (Context)"]
-        Tabs["Tabs (Region / Partner / Accounts / Notes / Historical / Report)"]
-        Filters["Filters (modal)"]
+        Tabs["Tabs (Region / Accounts / Partner / Notes / Historical / Report / Weekly Brief)"]
+        Filters["Filters (bar + modal, incl. ARR range)"]
         Modal["AccountNoteModal (unified)"]
-        Exports["Export builders (Summary / Exec / Weekly)"]
-        IDB["IndexedDB store<br/>(active_data, historical_data)"]
+        Exports["Export builders (Summary / Exec / Weekly / Brief HTML)"]
+        IDB["IndexedDB store<br/>(unified rows, split by QUARTER_DIFF)"]
         LS["localStorage<br/>(notes cache, settings, theme)"]
     end
 
     subgraph Backend["FastAPI server (app/)"]
-        Health["/healthz, /readyz"]
-        AdminAPI["/admin/db-status<br/>/admin/csv-uploads (CRUD)"]
-        NotesAPI["/api/renewals/notes (GET/PUT)"]
-        DataSource["/api/renewals/data-source/info<br/>/api/renewals/data-source/file"]
-        CSVList["/api/renewals/csv-list"]
-        Upload["/api/renewals/upload-csv"]
+        Health["/healthz, /readyz, /api/health (compat)"]
+        Auth["/api/whoami, /api/users* (mgmt)"]
+        AdminAPI["/admin/db-status<br/>/admin/csv-uploads (CRUD)<br/>/admin/wipe-all-uploads"]
+        NotesAPI["/api/renewals/notes (GET/PUT)<br/>account-forecasts, quarter-calls,<br/>calls/history"]
+        DataSource["/api/renewals/data-source/info<br/>/api/renewals/data-source/file<br/>/api/renewals/parsed-data"]
+        Snap["/api/renewals/snapshots<br/>/account-history/{id}<br/>/weekly-brief"]
+        Refresh["/api/renewals/refresh (Run now)<br/>/refresh-status<br/>/snowflake-config (GET/PUT)"]
         StaticMount["public/ static mount"]
     end
+
+    SF["Snowflake<br/>(unified_dynamic.sql)"]
 
     Browser["Browser"] --> AppProvider
     AppProvider --> Tabs
@@ -145,7 +158,8 @@ flowchart LR
     AppProvider <--> LS
     AppProvider <-->|fetch| Backend
 
-    Backend <-->|asyncpg pool| PG[("Cloud SQL Postgres<br/>(notes, csv_uploads,<br/>tombstones, app_meta)")]
+    Refresh -.->|per-request OAuth token| SF
+    Backend <-->|asyncpg pool| PG[("Cloud SQL Postgres<br/>(notes, tombstones, csv_uploads,<br/>account_snapshots, account_call_events,<br/>account_forecasts, quarter_calls,<br/>users, renewals_meta)")]
 ```
 
 ### 2.3 The three layers — what we own vs. what we bundle
@@ -155,26 +169,34 @@ flowchart LR
 | **Dashboard UI** (`public/index.html`, `vendor/app.js`, etc.) | The original Renewals Intelligence Studio project | **None** of substance — bundled verbatim. The only edits ever made are (a) removing a 35-line localhost-redirect script in v2 and (b) 24 display-string replacements (DJ → ELT) in v3 — state-key identifiers verified preserved. |
 | **HTTP server** (`app/` Python package) | This codebase | Yes — but cannot change the response shapes the dashboard expects |
 | **Admin UI** (`public/admin.html`) | This codebase | Yes — standalone page, doesn't share JS with the dashboard |
-| **Schema** (`migrations/*.sql`) | This codebase | Additive only (`IF NOT EXISTS`, no `DROP`, no `TRUNCATE`) |
+| **Schema** (inline `SCHEMA_SQL` in `app/database.py` + numbered `migrations/*.sql`) | This codebase | Additive only (`CREATE … IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`; no `DROP`, no `TRUNCATE`) |
 | **Dockerfile** | This codebase | Yes |
 
 ---
 
-## 3. The six dashboard tabs
+## 3. The seven dashboard tabs
 
-The top-of-page tab strip rotates through six views. The tab strip is
-sticky, so it's always one click away regardless of scroll position.
+The top-of-page tab strip rotates through seven views. The tab strip is
+sticky, so it's always one click away regardless of scroll position. A
+separate **Admin** entry (injected into the topbar) navigates to `/admin`.
 
 ```mermaid
 flowchart LR
-    Region --> Partner --> Accounts --> Notes --> Historical --> Report
+    Region --> Accounts --> Partner --> Notes --> Historical --> Report --> WeeklyBrief["Weekly Brief"]
     Region -.->|conditional| Historical
     style Historical stroke-dasharray: 5 5
 ```
 
-> The **Historical** tab only appears when historical CSV data has been
-> imported. Without it, the dashboard hides the tab entirely rather than
-> showing an empty state.
+> The **Historical** tab is populated from the same unified pull: the
+> browser splits the rolling window on `QUARTER_DIFF` (closed quarters,
+> `QUARTER_DIFF < 0`) rather than from a separate file.
+>
+> Per-role **tab access** is configurable from the admin console
+> (`/admin` → "Dashboard tab access"), so leadership can hide tabs a given
+> role shouldn't see.
+>
+> The old **Trending** tab was removed — its week-over-week view is now
+> served, more completely, by the **Weekly Brief** tab (§3.7).
 
 ### 3.1 Region tab
 
@@ -270,6 +292,40 @@ Configurable renewal targets + payout disclosure.
 **Why it matters**: This ties the operational view (forecast / pipeline)
 to the comp view (am I on track for my number).
 
+### 3.7 Weekly Brief tab
+
+The CCO's **Weekly 100K+ Regional Brief** — a week-over-week, bottoms-up
+forecast-movement report scoped by the app's global Filters bar (including
+an **ARR-range** filter that defaults to **≥ $100K**). Served by
+`GET /api/renewals/weekly-brief`, computed server-side against parsed
+`account_snapshots`.
+
+**What you see**
+
+- **KPI strip** — BU Forecast C/C, Best Case, Worst Case, Worsened, and
+  New $0→FC. Counts are the **true, uncapped** totals in scope (the
+  displayed lists are capped, but the KPI counts are not).
+- **Dual-line trend** — the system **BU** total vs the **Adjusted**
+  (ELT / calls-as-of) total, per snapshot, with a legend, per-point
+  tooltips, and a companion `Week · BU FC · Adjusted FC · Δ(Adj−BU)`
+  table (last 12 snapshots).
+- **Worsened WoW** — accounts whose BU_FC increased week-over-week
+  (higher = worse), ranked by adverse swing. A client-side
+  **minimum-swing** noise filter and a **top-100** cap keep the list
+  legible; movers ≥ the threshold (default **$50K**) carry an
+  auto-pulled explanation (forecast summary + last saved note).
+- **New $0 → FC** — accounts that had `$0` BU_FC in the prior snapshot and
+  a forecast now (with a client-side **minimum-new-FC** filter + top-100
+  cap).
+- **Best / Worst Case movement** — WoW movement in the roll-up totals with
+  top up/down drivers.
+- **Snapshot pair selectors** — pick the *current* and *prior* snapshot to
+  compare, labelled by a friendly **date / time**.
+- **Download brief** — a self-contained HTML brief mirroring the tab.
+
+**Why it matters**: It is the one page the CCO reads every week to see
+what moved, where, and why — without waiting for a manual roll-up.
+
 ---
 
 ## 4. Account intelligence — the unified modal
@@ -330,7 +386,7 @@ the app.
 | **ELT Forecast override** | Numeric input with three quick-presets: `= BU FC` (copy the system forecast), `Renew Flat` (sets to $0 = no growth/no churn), `Clear` (back to null) |
 | **Auto-date-stamped notes** | Hitting `Enter` in the new-entry box prepends `--- DD MMM YYYY ---` then your text to the note body |
 | **Timeline / Raw toggle** | View notes as parsed entries (with dates as section breaks) or as a single raw text field |
-| **Edit history** | Last 20 versions retained, with timestamp, DJ value, and truncated note preview |
+| **Edit history** | Last 20 versions retained, with timestamp, ELT Forecast value, and truncated note preview |
 | **Related Renewals** | Lists every other renewal row for the same account across all quarters. Per-entry "Copy" merges that note into the current draft; "Copy & Archive" merges and archives the source. "Consolidate All" merges every related note chronologically and archives the originals — one button, one note, one source of truth |
 | **Cmd+S to save** | The whole modal is keyboard-driven |
 
@@ -342,50 +398,69 @@ This is what sets Renewals Studio apart from a generic CRM view.
 
 ### 5.1 The note data model
 
-Each note is keyed by a composite string tying it to a specific renewal row:
+Each note is keyed by a composite string tying it to a specific
+account-quarter:
 
 ```
-${accountBase}::${period}::${roundedATR}
+${accountBase}::${period}
 ```
 
 Where:
 - `accountBase` = the Salesforce account ID, or normalized account name as fallback
-- `period` = the fiscal quarter (FY27Q2) or `YYYY-MM` of the renewal date
-- `roundedATR` = the ATR rounded to the nearest dollar
+- `period` = the fiscal quarter (e.g. `FY27Q2`)
 
 This means a single account with **four renewals across four quarters**
-has **four independent notes**, each tied to one quarter's renewal —
-not one big note for the whole account.
+has **four independent notes**, each tied to one quarter — not one big
+note for the whole account.
+
+> **Migration note (002).** The historic key was a 3-part
+> `accountBase::period::roundedATR`. Because ATR can drift between CSV
+> refreshes, that third segment orphaned notes. The identity migration
+> collapsed note keys to the 2-part `accountBase::period` form so a note
+> follows an account-quarter even when the ATR changes. The 3-part
+> `call_key` (`account::quarter::roundedATR`) is still used, separately,
+> for the CS / Renewals **call events** (§5.3), keyed to a specific
+> renewal amount.
 
 ### 5.2 Note payload fields
 
 | Field | Type | Purpose |
 | --- | --- | --- |
 | `note` | string | Free-text body, with optional `--- date ---` separators |
-| `djForecast` | number or null | Dollar override of BU FC for this renewal |
+| `djForecast` | number or null | Dollar override of BU FC for this renewal. **Wire key stays `djForecast`** (DB column `dj_forecast`) even though the label is "ELT Forecast" — renaming it would invalidate every existing note. |
 | `archived` | boolean | Soft-archive flag |
 | `updatedAt` | number (ms epoch) | Last-write timestamp; used for newer-wins merge conflict resolution |
 | `accountId`, `accountName`, `owner`, `renewalDate`, `fq`, `atr` | strings/numbers | Cached row context, so the note can survive even if the row changes |
-| `history` | array, capped at 20 | Edit history: each entry is `{ note, djForecast, timestamp }` |
+| `ownerEmail`, `lastEditedBy`, `lastEditedDisplay` | strings | Authorship attribution (who last edited, via SSO identity) |
+| `history` | array, capped at 20 (API layer) | Edit history: each entry is `{ note, djForecast, timestamp }` |
 
 ### 5.3 ELT Forecast vs ELT Call (the most-asked question)
 
 These are **two different things** that share a name. Don't conflate.
+Both are now **decomposed into a CS + Renewals split** and persisted
+server-side (so leadership can see where Customer Success and Renewals
+agree or diverge), not just held in client state.
 
 ```mermaid
 flowchart LR
-    subgraph PerAccount["Per-Account: ELT Forecast"]
-        Note["notes[key].djForecast"]
-        Note -->|sums to| Blended["Blended total<br/>(ATR>$100K accounts)"]
+    subgraph PerAccount["Per-Account: ELT Forecast = CS + Renewals"]
+        CSF["CS Forecast"]
+        RNF["Renewals Forecast"]
+        CSF --> ELTF["ELT Forecast (sum)"]
+        RNF --> ELTF
     end
 
-    subgraph PerQuarter["Per-Quarter: ELT Call"]
-        CC["ccData[quarter].dj"]
+    subgraph PerQuarter["Per-Quarter: ELT Call = CS Call + Renewals Call"]
+        CSC["CS Call"]
+        RNC["Renewals Call"]
+        CSC --> ELTC["ELT Call (sum)"]
+        RNC --> ELTC
     end
 
-    Blended -.->|defaults to| CC
-    CC -->|displayed in| QuarterUI["C/C Budget & Calls table"]
-    Note -->|displayed in| AccountUI["Account modal + Accounts tab + Notes tab KPI"]
+    ELTF -->|persisted| AF[("account_forecasts<br/>+ account_call_events (audit)")]
+    ELTC -->|persisted| QC[("quarter_calls")]
+    ELTF -->|displayed in| AccountUI["Account modal + KPI strip"]
+    ELTC -->|displayed in| QuarterUI["C/C Budget & Calls table"]
 
     style PerAccount fill:#e0f2fe
     style PerQuarter fill:#fef3c7
@@ -393,12 +468,12 @@ flowchart LR
 
 | | **ELT Forecast** | **ELT Call** |
 | --- | --- | --- |
-| **Scope** | Per renewal row | Per quarter |
-| **Storage** | `notes[key].djForecast` | `ccData[quarter].dj` |
-| **Default** | `null` (use BU FC) | Sum of per-account ELT Forecasts, blended with BU FC where DJ is missing |
-| **Override** | User types a number in the modal | User overrides on the C/C Performance table |
-| **Filter** | Only ATR > $100K accounts contribute to the blended total | All accounts roll into the quarter |
-| **UI label** | "ELT Forecast (Dave & Jesse)" | "ELT Call" |
+| **Scope** | Per account (per renewal amount) | Per quarter |
+| **Composition** | `CS Forecast + Renewals Forecast` | `CS Call + Renewals Call` |
+| **Storage** | `account_forecasts` (keyed by `account_id`), append-only audit trail in `account_call_events` (keyed by 3-part `call_key`) | `quarter_calls` (keyed by fiscal quarter) |
+| **Wire key** | `djForecast` in the notes payload (label = "ELT Forecast") | — |
+| **Override** | CSM enters CS Forecast in the account modal; Renewals enters their own; the ELT input shows the computed sum | Entered on the C/C Performance / Calls table |
+| **UI label** | "ELT Forecast" | "ELT Call" |
 
 ### 5.4 Notes lifecycle
 
@@ -465,10 +540,16 @@ and Notes tab. The filter modal is invoked from any tab.
 | Owner (CSM) | `CRM_SUCCESS_OWNER_NAME` | Yes |
 | Partner | `PARTNER_NAME` | Yes |
 | Partner type | `PARTNER_TYPE_C` | Yes |
-| Band (ATR size) | $0-3K / $3K-100K / $100K-1M / $1M+ | Yes |
+| Band (100k+ / <100k) | Computed from `band_cutoff` (default $100K) | Yes |
+| ARR range | `atr` min / max (numeric) | — (range inputs) |
 
-Each option shows the **count of matching rows in parentheses** so you
-can see "AMER (1,247)" before clicking.
+Each option shows a **count in parentheses** so you can see "AMER (1,247)"
+before clicking. As of the current build, those counts are **distinct
+accounts that honor the other active filters** (not raw row counts), so
+the numbers reflect what you'd actually see after selecting.
+
+The **ARR-range** filter (min / max on account ATR) is applied across every
+tab and is what drives the Weekly Brief's default ≥ $100K scope.
 
 ### 6.2 Saved filter sets
 
@@ -484,44 +565,72 @@ new tab preserves your slice.
 
 ---
 
-## 7. Data ingestion — how CSVs become a dashboard
+## 7. Data ingestion — how source data becomes a dashboard
 
-### 7.1 The two CSV slots
+### 7.1 One unified source (the two-file model is retired)
 
-The dashboard expects two distinct CSV families:
+The dashboard is now driven by a **single unified Snowflake pull**
+(`sql/unified_dynamic.sql`) that returns a **rolling 13-quarter window**
+in one result set:
 
-| Slot | Filename pattern | Purpose |
+```
+8 past quarters  +  current quarter  +  4 future quarters
+        (n_past)          (diff = 0)          (n_future)
+```
+
+Every row carries a **`QUARTER_DIFF`** column:
+
+| `QUARTER_DIFF` | Meaning |
+| --- | --- |
+| `< 0` | Closed / historical quarter (`BU_FC` / `QTD_CC` carry realized churn) |
+| `= 0` | Current quarter |
+| `> 0` | Future quarter |
+
+The browser splits that one payload into an **"active" store**
+(`QUARTER_DIFF >= 0`) and a **"historical" store** (`QUARTER_DIFF <= 0`),
+with the **current quarter (`diff = 0`) present in BOTH**. There is no
+longer a separate active/historical two-file model — the unified pull lands
+in a single `active` slot and the split happens client-side.
+
+**Row-inclusion vs labelling.** Two independent knobs:
+
+| Param | Default | Role |
 | --- | --- | --- |
-| **Active** | filename contains `2026 data` | Current-year renewal book (the main render) |
-| **Historical** | filename contains `historical fy27` | Prior-year reference for the Historical tab |
+| `min_arr` | `10000` | **Row-inclusion floor** — a row is pulled only when `NET_ARR_USD_PRIOR_QUARTER_END >= min_arr` |
+| `band_cutoff` | `100000` | **Label only** — tags each row `100k+` vs `<100k`; does not exclude anything |
+| `n_past` | `8` | Quarters of history in the window |
+| `n_future` | `4` | Quarters forward in the window |
 
-Both are case-insensitive substring matches. The Active slot is required;
-the Historical slot is optional (dashboard hides the Historical tab if
-the file isn't present).
+All four are **admin-editable** (persisted in `renewals_meta` under
+`snowflake_config`) alongside the Snowflake connection identifiers — no
+redeploy. See §7.6.
 
-### 7.2 CSV schema (expected columns)
+### 7.2 Source schema (unified query output)
 
-The dashboard reads ~30 columns from the F1 Sheet CSV. Critical ones:
+The unified query projects a stable header (the same one `seeds/unified.csv`
+carries) that the dashboard parses client-side and the server maps into
+`account_snapshots` via `HEADER_ALIASES` (unknown columns still round-trip
+in a `raw_row` JSONB blob). Critical columns:
 
 | Column | Purpose |
 | --- | --- |
-| `YEAR_QUARTER_YYYYQQ` | **Source of quarter truth.** Format: `2027Q1`. Do not derive quarter from renewal dates when this is present. |
+| `YEAR_QUARTER` | Fiscal quarter label (e.g. `Q3\`27`). **Source of quarter truth.** |
+| `QUARTER_DIFF` | Rolling-window offset from the current quarter (drives the active/historical split) |
 | `CRM_ACCOUNT_ID` | Salesforce account ID — primary key for de-dupe and merge |
 | `CRM_ACCOUNT_NAME` | Display name |
 | `ATR_ARR_USD_STARTING` | The renewable book (the most important number) |
-| `BU_FC` | Business-unit forecast |
-| `CC` | Cloud consumption / expansion ARR |
-| `EXPANSION` | Expansion bookings |
-| `BAND` | Size bucket (`<3K` / `<100k` / `<1M` / `>1M`) |
-| `REGION` | AMER / EMEA / APAC |
-| `PRO_FORMA_MARKET_SEGMENT` | Enterprise / Mid-Market / SMB / Commercial / Digital |
-| `PRO_FORMA_SUBREGION` | Geographic sub-region |
+| `ATR_ARR_USD_LTG` | Left-to-go on the current-quarter renewal (drives the "done" rule, §7.4) |
+| `BU_FC` | Business-unit forecast (for closed quarters this carries realized `QTD_CC`) |
+| `QTD_CC` | Quarter-to-date realized churn / contraction (closed-quarter C/C) |
+| `UPSIDE` / `DOWNSIDE` | Best-case / worst-case deltas vs BU_FC (drive Best/Worst Case, §5) |
+| `EXPANSION`, `CC_OFFCYCLE_ARR`, `NET_ARR_USD`, `NET_ARR_USD_PRIOR_QTR_END` | Money columns |
+| `BAND` | `100k+` vs `<100k` (labelled via `band_cutoff`) |
+| `REGION`, `PRO_FORMA_MARKET_SEGMENT`, `PRO_FORMA_SUBREGION`, `BILLING_COUNTRY` | Geo / segment |
 | `NEXT_RENEWAL_DATE` | Renewal close date |
 | `CRM_HEALTH_STATUS` | Green / Yellow / Orange / Red |
-| `CRM_SUCCESS_OWNER_NAME` | CSM owner (the user) |
-| `CRM_RENEWAL_OWNER_NAME` | Renewal manager owner |
-| `PRODUCT_LINES`, `FORECAST_SUMMARY`, `PARTNER_NAME`, `PARTNER_TYPE_C` | Merged across all rows for the same account, regardless of quarter |
-| `AUTO_RENEW` | Auto-renewal flag (TRUE/FALSE) |
+| `CRM_SUCCESS_OWNER_NAME`, `MANAGER_SUCCESS`, `CRM_RENEWAL_OWNER_NAME`, `MANAGER_RENEWAL` | Ownership |
+| `PRODUCT_LINES`, `FORECAST_SUMMARY`, `PARTNER`, `PARTNER_TYPE_C`, `MANAGED_BY_PARTNER_FLAG` | Account context |
+| `AUTO_RENEW`, `RAMP_DEAL`, `DONE_DEAL` | Term / status flags |
 | `DAYS_SINCE_LAST_CS_TOUCH` | Used by the alert system |
 
 ### 7.3 The ingest pipeline
@@ -530,57 +639,92 @@ The dashboard reads ~30 columns from the F1 Sheet CSV. Critical ones:
 sequenceDiagram
     participant User
     participant Browser
-    participant Server as server.js
-    participant FS as /app/data/csv/
+    participant Server as FastAPI (app/)
+    participant PG as Cloud SQL Postgres
+    participant SF as Snowflake
+
+    Note over Server,SF: (optional) Owner clicks "Run now" in /admin
+    Server->>SF: unified_dynamic.sql (per-request OAuth token)
+    SF-->>Server: rolling 13-quarter result set
+    Server->>PG: persist_source_csv → csv_uploads (BYTEA)<br/>+ parse into account_snapshots
 
     User->>Browser: Open page
     Browser->>Server: GET /api/health
-    Server-->>Browser: { ok, apps:[] }
+    Server-->>Browser: { ok, apps:[] }  (stay in server mode)
 
     Note over Browser: Page hydrates from<br/>localStorage + IndexedDB
 
-    par Active slot
-        Browser->>Server: GET /api/renewals/data-source/info?match=2026%20data
-        Server->>FS: Scan, find newest matching CSV
-        Server-->>Browser: { found:true, filename, mtime, size }
-        alt mtime newer than cached
-            Browser->>Server: GET /api/renewals/data-source/file?match=2026%20data
-            Server-->>Browser: text/csv stream
-            Browser->>Browser: Papa.parse (streaming)
-            Browser->>Browser: actions.importCSV(rows, headers, mtimeMs)
-            Browser->>Browser: Enrich rows, build noteKeys, save to IDB
-        else mtime cached
-            Note over Browser: Skip — no-op
-        end
-    and Historical slot
-        Browser->>Server: GET /api/renewals/data-source/info?match=historical%20fy27
-        Server->>FS: Scan, find newest matching CSV
-        Server-->>Browser: { found:true, filename, mtime, size }
-        Browser->>Server: GET /api/renewals/data-source/file?match=historical%20fy27
-        Server-->>Browser: text/csv stream
-        Browser->>Browser: actions.importHistoricalCSV(...)
+    Browser->>Server: GET /api/renewals/data-source/info?match=2026%20data
+    Server->>PG: SELECT newest csv_uploads row for slot
+    Server-->>Browser: { found:true, filename, size, sha256, mtimeMs }
+    alt content changed (sha256 differs)
+        Browser->>Server: GET /api/renewals/data-source/file?match=2026%20data
+        Server-->>Browser: text/csv stream (from csv_uploads BYTEA)
+        Browser->>Browser: Papa.parse (streaming)
+        Browser->>Browser: importCSV(rows, headers, sig)
+        Browser->>Browser: split by QUARTER_DIFF (active >=0 / historical <=0), save to IDB
+    else content unchanged (sha256 match)
+        Note over Browser: Cache hit — skip download
     end
 
     Note over Browser: Render dashboard
 ```
 
-### 7.4 De-duplication and merge rules
+### 7.4 Quarter semantics and the "done" rule (historical calcs)
 
-A "renewal record" is valid only when `ATR_ARR_USD_STARTING > 0`. When
-two rows share an account + quarter, the one with higher ATR wins.
+- **Closed quarters** (`QUARTER_DIFF < 0`): `CC := QTD_CC` — the realized
+  churn / contraction, not a forecast.
+- **Current quarter** (`QUARTER_DIFF = 0`): an account is treated as
+  **"done"** when **`ATR_ARR_USD_LTG = 0` OR the `DONE_DEAL` flag is set**.
+  This drives the **Effective Forecast %**: a *done* account contributes its
+  full starting ATR, while a *pending* account contributes only its
+  remaining left-to-go (`LTG`).
 
 Account-wide context fields (`PRODUCT_LINES`, `FORECAST_SUMMARY`,
-`PARTNER_NAME`, `PARTNER_TYPE_C`) are merged across all rows for the
-same account across any quarter — so a quarterly row inherits the full
-account context.
+`PARTNER`, `PARTNER_TYPE_C`) are attached per account so a quarterly row
+inherits the full account context.
 
-### 7.5 Loading your own data — three options
+### 7.5 Loading data — three paths
 
-| Option | When to use | How |
+| Path | When to use | How |
 | --- | --- | --- |
-| **Mount a volume** | Persistent deployment, multiple files | `docker run -v $(pwd)/my-csvs:/app/data/csv ...` |
-| **Upload via API** | Single replacement | `curl -X POST -H "Content-Type: text/csv" --data-binary @file.csv "https://.../api/renewals/upload-csv?name=Jesse%20and%20Dave%20F1%20Sheet%20-%202026%20data.csv&replace=1"` |
-| **Re-build the image** | Air-gapped / immutable | Drop CSV into `data/csv/` and rebuild |
+| **Snowflake "Run now"** | Normal refresh (weekly / a few times a week) | `/admin` → "Snowflake source — Run now". Pulls the unified query, serializes to CSV, lands it in `csv_uploads` + `account_snapshots`. |
+| **Upload a CSV** | Snowflake unavailable / manual snapshot | `/admin` → "Upload data file", or `POST /api/renewals/upload-csv` (see §12) |
+| **Bundled seed** | First boot with an empty DB | `seeds/unified.csv` auto-ingests when the slot is empty (gated by `SEED_ON_STARTUP`, off by default) |
+
+Every path creates a **new immutable version** in `csv_uploads`; the
+dashboard always reads the newest per slot and full history is retained for
+week-over-week / month-over-month analysis.
+
+### 7.6 Snowflake "Run now" + editable settings (no redeploy)
+
+The refresh (`app/routes/refresh.py` + `app/warehouse.py`):
+
+1. Reads the **per-request Pomerium/Okta OAuth token** from the
+   `x-pomerium-idp-access-token` header. The token is used **in memory
+   only** and is **never logged, stored, or persisted**.
+2. Runs the unified query as a **background job** (`202`-style; a second
+   concurrent trigger returns **409**), off the event loop in a worker
+   thread (the connector is synchronous).
+3. Serializes the result to CSV bytes and lands them through the exact same
+   ingest path a manual upload uses (`persist_source_csv`,
+   `uploaded_by='snowflake:run-now'`), so a generated snapshot is
+   indistinguishable from an uploaded one.
+
+Because the bulk insert (large `BYTEA` + a `COPY` of up to `MAX_ROWS = 500k`
+rows) far exceeds the pool's 30s default, the ingest gets a generous
+per-call timeout — `INGEST_COMMAND_TIMEOUT_S` (default **600s**, env
+`DB_INGEST_TIMEOUT_S`).
+
+The **Snowflake connection** (`account` / `warehouse` / `database` /
+`schema` / `role`) and the **query binds** (`n_past` / `n_future` /
+`min_arr` / `band_cutoff`) are **editable from the admin console** and
+persisted in `renewals_meta` under `snowflake_config` (owner-gated
+`GET`/`PUT /api/renewals/snowflake-config`) — no code change, no redeploy.
+Defaults: account `ZENDESK-GLOBAL`, warehouse `PUBLIC_ZENDESK_L`, database
+`FOUNDATIONAL`, schema `CUSTOMER`, role `PUBLIC`. In **development** (or with
+no token present) the refresh runs in **simulated mode** against
+`seeds/unified.csv`.
 
 ---
 
@@ -591,7 +735,7 @@ clipboard or download as a file.
 
 ### 8.1 Notes Summary (.txt)
 
-Plain-text dump of all active notes grouped by account, with DJ
+Plain-text dump of all active notes grouped by account, with ELT
 Forecast values.
 
 **Sample output:**
@@ -640,13 +784,17 @@ body, not just that something changed.
 ```markdown
 # Weekly Renewal Update — 13 May 2026 → 20 May 2026
 
-## Acme Corporation (+$30K DJ)
+## Acme Corporation (+$30K ELT)
 **Before:** "QBR scheduled."
-**After:** "Got verbal commit from CFO. DJ raised to $510K."
+**After:** "Got verbal commit from CFO. ELT Forecast raised to $510K."
 
-## Globex Industries (no change in DJ)
+## Globex Industries (no change in ELT)
 **New note (15 May):** "Procurement holding due to budget freeze."
 ```
+
+> **Weekly Brief (HTML).** Separately, the **Weekly Brief** tab (§3.7)
+> offers a one-click **Download brief** — a self-contained HTML file of the
+> week-over-week regional movement, KPIs, and the BU-vs-Adjusted trend.
 
 ### 8.4 Export controls
 
@@ -670,7 +818,7 @@ flowchart LR
     subgraph Browser
         React["React state<br/>(in-memory)"]
         LS["localStorage<br/>(notes cache,<br/>settings, theme)"]
-        IDB["IndexedDB<br/>(parsed CSV rows,<br/>'renewals_studio' DB)"]
+        IDB["IndexedDB<br/>(parsed unified rows,<br/>'renewals_studio' DB)"]
     end
 
     subgraph Server["FastAPI"]
@@ -678,10 +826,14 @@ flowchart LR
     end
 
     subgraph PG["Cloud SQL Postgres"]
-        Notes[("notes<br/>(one row per note)")]
+        Notes[("notes")]
         Tomb[("note_tombstones")]
         CSV[("csv_uploads<br/>(BYTEA + history)")]
-        Meta[("app_meta")]
+        Snap[("account_snapshots<br/>(parsed rows, versioned)")]
+        Calls[("account_call_events<br/>+ account_forecasts")]
+        QC[("quarter_calls")]
+        Users[("users")]
+        Meta[("renewals_meta")]
         Mig[("schema_migrations")]
     end
 
@@ -691,6 +843,10 @@ flowchart LR
     Pool <--> Notes
     Pool <--> Tomb
     Pool <--> CSV
+    Pool <--> Snap
+    Pool <--> Calls
+    Pool <--> QC
+    Pool <--> Users
     Pool <--> Meta
     Pool <--> Mig
 ```
@@ -700,14 +856,17 @@ flowchart LR
 | Store | Contents | Why |
 | --- | --- | --- |
 | **React state** | All of the above, deserialized | Working set; what the UI renders from |
-| **localStorage:** `renewals_dashboard_state_v2` | All lightweight state (settings, notes cache, noteDeletes cache, filters, theme, targets) | Synchronous hydrate; instant page load |
-| **localStorage:** `renewals_dashboard_notes_backup_v1` | Redundant copy of `notes` only | Fallback if main cache has empty notes |
-| **IndexedDB:** `active_data`, `historical_data` | Parsed CSV rows | Too big for localStorage |
-| **Postgres `notes`** | One row per note, durable, multi-device | The source of truth — `localStorage` is a hot cache |
+| **localStorage** | Lightweight state (settings, notes cache, noteDeletes cache, filters, theme, targets) + a redundant notes backup | Synchronous hydrate; instant page load |
+| **IndexedDB** | Parsed unified rows (split by `QUARTER_DIFF`) | Too big for localStorage; keyed by content `sha256` for cache hits |
+| **Postgres `notes`** | One row per note, durable, multi-device (+ authorship columns) | The source of truth — `localStorage` is a hot cache |
 | **Postgres `note_tombstones`** | Soft-delete markers | Prevents resurrecting deleted notes from older exports |
-| **Postgres `csv_uploads`** | Full version history of CSV uploads (BYTEA + metadata) | Every upload is a row; dashboard serves the newest per slot |
-| **Postgres `app_meta`** | Key/value (e.g. `notes_saved_at`, `initialized`) | Server-side bookkeeping |
-| **Postgres `schema_migrations`** | Applied migration versions | Lets `apply_migrations()` skip already-run files |
+| **Postgres `csv_uploads`** | Full version history of uploads (BYTEA + metadata) | Every upload/Run-now is a row; dashboard serves the newest per slot |
+| **Postgres `account_snapshots`** | Parsed per-account rows, versioned by upload | Powers WoW / MoM SQL (Weekly Brief, account history) without re-parsing CSVs |
+| **Postgres `account_forecasts` / `account_call_events`** | CS + Renewals forecast (latest + append-only audit) | Per-account ELT Forecast decomposition (§5.3) |
+| **Postgres `quarter_calls`** | Per-quarter CS Call + Renewals Call | ELT Call decomposition |
+| **Postgres `users`** | Email → role (owner/admin/standard) | SSO identity + authorization |
+| **Postgres `renewals_meta`** | Key/value (e.g. `initialized`, `snowflake_config`, `snowflake_last_refresh`) | Server-side bookkeeping + admin-editable settings |
+| **Postgres `schema_migrations`** | Applied migration versions | Lets the boot-time migrations skip already-run steps |
 
 ### 9.2 Sync behavior (server mode)
 
@@ -721,17 +880,18 @@ is reachable), it:
 3. **On server-side change**: a sha256 short-circuit in the server
    prevents writes when the payload is unchanged.
 
-### 9.3 Atomic writes
+### 9.3 Durable, transactional writes (no filesystem state)
 
-Every server-side JSON write goes:
+There are **no filesystem writes** for primary data — Cloud Run wipes the
+disk on every cold start, so everything durable lives in Postgres:
 
-```
-1. Write to /tmp/<file>.<pid>.<ts>.tmp
-2. rename(tmp, final)
-```
-
-This is atomic on POSIX filesystems and prevents corruption from a
-mid-write crash.
+- **Notes** are applied as **UPSERTs with newer-wins** (a `WHERE
+  updated_at` guard) plus tombstone reconciliation, all in one transaction.
+- **Uploads / Run-now** insert an immutable `csv_uploads` row and then
+  `COPY` the parsed rows into `account_snapshots` inside a transaction
+  (idempotent — re-ingesting the same `csv_upload_id` clears + re-inserts).
+- If the DB is unavailable, the API returns **503** rather than silently
+  buffering to disk.
 
 ---
 
@@ -750,8 +910,9 @@ journey
       Open https://renewals.example.com: 5: User
       Browser fetches index.html + vendor/*: 5: System
       Page mounts, hydrates from IDB (empty): 5: System
-      Page fetches /data-source/info (both slots): 5: System
-      Page streams + parses CSVs: 4: System
+      Page fetches /data-source/info (unified slot): 5: System
+      Page streams + parses the unified CSV: 4: System
+      Browser splits rows by QUARTER_DIFF: 5: System
       Dashboard renders with seed data: 5: User
     section First navigation
       User browses Region tab: 5: User
@@ -761,17 +922,20 @@ journey
 
 **Step-by-step (text version):**
 
-1. The operator uploads `renewals-studio.zip` to their PaaS, or runs
-   `docker run -p 8080:8080 renewals-studio` locally.
-2. The PaaS detects the Dockerfile and builds the image. Health check
-   on `/api/health` goes green after ~8 seconds.
-3. The user opens the URL the PaaS gave them.
-4. The dashboard loads the HTML + vendor JS (≈ 1.5 MB on first load,
+1. The operator uploads `renewals-studio.zip` to App Foundry / Vibe /
+   Cloud Run (which provisions Cloud SQL and injects `DB_*`), or runs the
+   container locally.
+2. The container starts; `/healthz` returns **200** immediately while the
+   DB pool connects in the background. `/readyz` flips to **200** once the
+   schema is applied and (optionally) the seed is loaded.
+3. The user opens the URL, authenticated through the SSO edge.
+4. The dashboard loads the HTML + vendor JS (≈ 3.6 MB on first load,
    cached thereafter).
 5. The dashboard fetches `/api/renewals/data-source/info?match=2026 data`,
-   gets back the metadata of the seeded CSV.
-6. The dashboard fetches the CSV file itself (12 MB streaming), parses
-   it client-side with Papaparse, stores the result in IndexedDB.
+   gets back the metadata (incl. `sha256`) of the seeded unified CSV.
+6. The dashboard streams the CSV from `csv_uploads`, parses it client-side
+   with Papaparse, splits rows by `QUARTER_DIFF`, and stores the result in
+   IndexedDB.
 7. The Region tab renders with KPIs and a quarter heatmap.
 
 ### 10.2 Journey B: Daily renewal review (a CSM)
@@ -796,17 +960,22 @@ journey
 
 ### 10.3 Journey C: Replacing the data after a fresh export
 
-```bash
-# 1. Export from Salesforce → CSV, named "Jesse and Dave F1 Sheet - 2026 data (35).csv"
+The usual path is **Snowflake "Run now"** from `/admin` (no file at all).
+To replace the data from a CSV instead:
 
-# 2. Upload to the running container:
-curl -X POST -H "Content-Type: text/csv" \
-     --data-binary @"./Jesse and Dave F1 Sheet - 2026 data (35).csv" \
-     "https://renewals.example.com/api/renewals/upload-csv?name=Jesse%20and%20Dave%20F1%20Sheet%20-%202026%20data.csv&replace=1"
+```bash
+# 1. Obtain a fresh unified CSV (Snowflake export or a saved snapshot).
+
+# 2. Upload to the running service (owner/admin auth):
+curl -X POST "https://renewals.example.com/api/renewals/upload-csv?slot=active" \
+     -H "X-Signal-Password: $ADMIN_TOKEN" \
+     -H "Content-Type: text/csv" \
+     --data-binary @"./unified.csv"
 
 # 3. Refresh the dashboard in the browser.
-#    The page sees the newer mtime on data-source/info, re-fetches, re-parses, re-renders.
-#    Notes that match the new rows by noteKey survive automatically.
+#    The page compares data-source/info's sha256 to its cache; a changed
+#    signature triggers a re-fetch + re-parse + re-render.
+#    Notes that match the new rows by note key survive automatically.
 #    Notes whose rows disappear become "unmatched" in the Notes tab and can be
 #    re-assigned manually or auto-matched by account ID.
 ```
@@ -833,39 +1002,56 @@ curl -X POST -H "Content-Type: text/csv" \
 ### 11.1 Dockerfile (annotated)
 
 ```dockerfile
-# Multi-stage build. Stage 1 installs production deps using a cached layer;
-# stage 2 is the lean runtime image with just node_modules + app code.
-FROM node:20-alpine AS deps
-WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev --no-fund --no-audit
-
-FROM node:20-alpine AS runtime
-ENV NODE_ENV=production \
-    PORT=8080 \
-    HOST=0.0.0.0 \
-    DATA_DIR=/app/data
-
-RUN apk add --no-cache tini wget        # tini = PID-1 signal handler
-
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY server.js package.json ./
+# Multi-stage build. Stage 1 compiles deps (asyncpg needs a C toolchain that
+# never reaches the runtime image); stage 2 is the lean runtime.
+FROM python:3.12-slim AS builder
+ENV PIP_NO_CACHE_DIR=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential \
+ && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt ./
+RUN pip install --prefix=/install -r requirements.txt
+COPY app ./app
+COPY migrations ./migrations
+COPY seeds ./seeds
 COPY public ./public
-COPY data ./data-default                # baked defaults, used if volume is empty
+COPY sql ./sql
 
-RUN mkdir -p /app/data/csv /app/data/notes.history \
- && cp -R /app/data-default/csv/. /app/data/csv/ \
- && chown -R node:node /app
+FROM python:3.12-slim AS runtime
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+    PORT=8080 HOST=0.0.0.0 LOG_LEVEL=INFO \
+    PGPASSWORD=signal ADMIN_TOKEN=signal   # override in prod via secret manager
 
-USER node                               # non-root for safety
+# tini forwards SIGTERM to uvicorn for a clean drain. No curl — the
+# healthcheck uses Python's urllib, saving a package.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tini ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 app \
+ && useradd  --system --uid 10001 --gid app --home /home/app --shell /usr/sbin/nologin app \
+ && mkdir -p /app /home/app && chown -R app:app /app /home/app
+
+WORKDIR /app
+COPY --from=builder /install /usr/local
+COPY --from=builder /build/app        /app/app
+COPY --from=builder /build/migrations /app/migrations
+COPY --from=builder /build/seeds      /app/seeds
+COPY --from=builder /build/public     /app/public
+COPY --from=builder /build/sql        /app/sql
+
+USER app:app                            # non-root (uid 10001)
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=8s --retries=3 \
-    CMD wget --quiet --tries=1 --spider "http://127.0.0.1:${PORT:-8080}/api/health"
+# /healthz returns 200 as soon as the process is alive — even before the DB
+# pool connects. --start-period=120s gives Cloud Run a generous cold-start window.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=120s --retries=3 \
+  CMD python -c "import urllib.request,os,sys; \
+                 r=urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"PORT\",\"8080\")}/healthz', timeout=3); \
+                 sys.exit(0 if r.status==200 else 1)" || exit 1
 
-ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["node", "server.js"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sh", "-c", "exec uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8080} --proxy-headers --forwarded-allow-ips=* --timeout-graceful-shutdown 25"]
 ```
 
 ### 11.2 Deployment matrix (where you can drop the ZIP)
@@ -889,56 +1075,114 @@ CMD ["node", "server.js"]
 | --- | --- | --- |
 | `PORT` | `8080` | Listening port (platform usually injects) |
 | `HOST` | `0.0.0.0` | Interface to bind |
-| `DATA_DIR` | `/app/data` | Storage location (mount as volume for persistence) |
-| `NODE_NO_WARNINGS` | `1` | Suppress Node experimental-feature warnings |
+| `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` | — | Discrete asyncpg params (win over `PG*`); `DATABASE_URL` wins over both when set |
+| `DB_SSL` | `disable` | `disable` (socket) / `require` (public TCP) |
+| `DB_POOL_MAX` | `10` | asyncpg pool high-water mark |
+| `DB_INGEST_TIMEOUT_S` | `600` | Per-call timeout for the bulk snapshot ingest |
+| `ADMIN_TOKEN` | `signal` | Legacy shared password (`X-Signal-Password`). The default `signal` is **rejected outside dev**; set a strong value to re-enable that path |
+| `STRICT_AUTH` | `true` (prod) | Require SSO identity; a guest gets read-only when no header is present |
+| `BOOTSTRAP_ADMINS` / `BOOTSTRAP_OWNERS` | — | Comma-separated emails seeded as admin / owner on boot |
+| `SNOWFLAKE_MODE` | auto | `real` (prod) / `simulated` (dev). Connection identifiers via `SNOWFLAKE_*` |
+| `SEED_ON_STARTUP` | `false` | Auto-ingest the bundled seed when the slot is empty |
+| `LOG_LEVEL` | `INFO` | Log verbosity |
 
 ### 11.4 Health checks
 
-The Dockerfile registers a healthcheck that hits `/api/health` every
-30 seconds with a 5-second timeout. Returns within ~3 ms once the
-server is up.
+Two probes (matching the Signal CX pattern):
 
-**`/api/health` response shape:**
+- **`/healthz`** — liveness; **always 200** while the process is alive.
+  The Dockerfile healthcheck hits this every 15s.
+- **`/readyz`** — readiness; **503 until** the DB pool is connected AND the
+  schema is applied, then **200**. Returns a structured body either way.
+
+**`/healthz` response shape:**
 
 ```json
-{
-  "ok": true,
-  "app": "renewals-studio",
-  "version": "2.0.0",
-  "startedAt": "2026-05-20T16:24:13.137Z",
-  "node": "v20.10.0",
-  "uptimeSec": 42,
-  "apps": []
-}
+{ "status": "ok", "uptime_sec": 42 }
 ```
+
+> A legacy **`/api/health`** alias also exists (returns `{ ok, app,
+> version, apps: [] }`) purely so the bundled dashboard stays in
+> "server mode" and fetches from the API rather than falling back to
+> offline-only. It is not a Cloud Run probe.
 
 ---
 
 ## 12. API reference
 
+Auth key: **none** = public, **signed-in** = any SSO user, **admin** =
+role admin/owner (or the hardened legacy `X-Signal-Password`), **owner** =
+role owner only. Shapes follow `AGENTS.md` §5 and the route files.
+
 ### 12.1 At a glance
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET`  | `/api/health` | Liveness + capability list |
-| `GET`  | `/api/renewals/notes` | Load full notes payload |
-| `PUT`  | `/api/renewals/notes` | Save full notes payload |
-| `GET`  | `/api/renewals/csv-list` | List CSV files in `data/csv/` |
-| `GET`  | `/api/renewals/data-source/info?match=<sub>` | Newest matching CSV metadata |
-| `GET`  | `/api/renewals/data-source/file?match=<sub>` | Stream that CSV |
-| `POST` | `/api/renewals/upload-csv?name=<filename>&replace=<0\|1>` | Upload/replace a CSV |
-| `POST` | `/api/renewals/reveal` | macOS Finder reveal (returns 501 in container) |
-| `POST` | `/api/renewals/mobile-snapshot` | Offline mobile HTML (returns 501 in container) |
-| `GET`  | `/apps/renewals/:filename` | Legacy fallback CSV path |
+**Health & identity**
+
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `GET`  | `/healthz` | none | Liveness (always 200) |
+| `GET`  | `/readyz` | none | Readiness (200 when DB+schema ready, else 503) |
+| `GET`  | `/api/health` | none | Legacy compat alias (keeps dashboard in server mode) |
+| `GET`  | `/api/whoami` | none | Resolved user + identity diagnostics |
+| `GET`  | `/api/users/directory` | signed-in | Email → display-name/role directory |
+| `GET`  | `/api/users` | admin | Full user list |
+| `POST` | `/api/users` | admin | Manually add a user (standard/admin) |
+| `PUT`  | `/api/users/{email}/role` | admin | Change a role (**owner grant requires owner**) |
+| `DELETE` | `/api/users/{email}` | admin | Remove a user (owners protected) |
+
+**Data source & snapshots**
+
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `GET`  | `/api/renewals/notes` | none | Full notes payload `{notes, noteDeletes, savedAt}` |
+| `PUT`  | `/api/renewals/notes` | none | Persist notes (debounced by the dashboard) |
+| `GET`  | `/api/renewals/notes/export` | none | Notes in import-friendly shape |
+| `POST` | `/api/renewals/notes/import` | owner | Bulk import notes JSON |
+| `GET`  | `/api/renewals/csv-list` | none | Newest CSV per slot |
+| `GET`  | `/api/renewals/data-source/info?match=<sub>` | none | Newest matching upload metadata (+ `sha256`) |
+| `GET`  | `/api/renewals/data-source/file?match=<sub>` | none | Stream that CSV (from `csv_uploads`) |
+| `GET`  | `/api/renewals/parsed-data` | none | Parsed rows from `account_snapshots` |
+| `POST` | `/api/renewals/upload-csv?slot=<active>` | admin | Upload a CSV → new `csv_uploads` version + parse |
+| `GET`  | `/api/renewals/snapshots` | none | Upload history with parsed-row counts |
+| `GET`  | `/api/renewals/snapshots/{id}/summary` | none | One snapshot's totals + health/region breakdown |
+| `GET`  | `/api/renewals/account-history/{account_id}` | none | One account's timeline across snapshots |
+| `GET`  | `/api/renewals/weekly-brief` | none | Weekly 100K+ Regional Brief (WoW movement) |
+
+**Forecasts & calls**
+
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `GET`  | `/api/renewals/account-forecasts/{account_id}` | none | Latest CS/Renewals/ELT + audit `history` |
+| `PUT`  | `/api/renewals/account-forecasts/{account_id}` | signed-in | Set CS / Renewals forecast (audited) |
+| `GET`/`POST` | `/api/renewals/account-forecasts/totals` | none/signed-in | Rolled-up CS/Renewals/ELT totals |
+| `GET`  | `/api/renewals/calls/history` | none | Call-event audit trail |
+| `GET`/`PUT`/`DELETE` | `/api/renewals/quarter-calls/{quarter}` | mixed | Per-quarter CS/Renewals Call |
+| `GET`/`PUT` | `/api/renewals/tab-access/config` | admin | Per-role tab visibility |
+
+**Admin, Snowflake & legacy**
+
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `GET`  | `/admin/db-status` | admin | Diagnostics: row counts, pool, DB version |
+| `GET`  | `/admin/csv-uploads` | owner | Upload history (`?slot=` to filter) |
+| `GET`  | `/admin/csv-uploads/{id}/download` | owner | Download a historical version |
+| `DELETE` | `/admin/csv-uploads/{id}` | owner | Delete a version |
+| `POST` | `/admin/wipe-all-uploads?confirm=yes` | owner | Clear uploads + snapshots |
+| `POST` | `/api/renewals/refresh` | owner | Snowflake "Run now" (background job; 409 if in-flight) |
+| `GET`  | `/api/renewals/refresh-status` | none | Last/current refresh + effective settings |
+| `GET`/`PUT` | `/api/renewals/snowflake-config` | owner | Read/write connection + query overrides |
+| `POST` | `/api/renewals/mobile-snapshot` | — | **Removed** (returns 404) |
+| `POST` | `/api/renewals/reveal` | — | macOS only (returns 501) |
 
 ### 12.2 Detailed shapes
 
-**`GET /api/renewals/notes`**
+**`GET /api/renewals/notes`** — note the 2-part key and the `djForecast`
+wire key (label = "ELT Forecast"):
 
 ```json
 {
   "notes": {
-    "0011E00001j99CgQAI::2027Q1::1320": {
+    "0011E00001j99CgQAI::FY27Q1": {
       "note": "--- 15 Apr 2026 ---\nQBR scheduled.",
       "djForecast": null,
       "archived": false,
@@ -947,46 +1191,22 @@ server is up.
       "accountName": "TEKit",
       "owner": "Sam Hansen",
       "renewalDate": "2026-06-13",
-      "fq": "2027Q1",
+      "fq": "FY27Q1",
       "atr": 1320,
+      "ownerEmail": "sam.hansen@zendesk.com",
+      "lastEditedDisplay": "Sam Hansen",
       "history": [
         { "note": "older version", "djForecast": null, "timestamp": 1745211443210 }
       ]
     }
   },
-  "noteDeletes": {
-    "abandoned-key": 1744700000000
-  },
+  "noteDeletes": { "abandoned-key": 1744700000000 },
   "savedAt": "2026-05-20T16:24:13.137Z"
 }
 ```
 
-**`PUT /api/renewals/notes` request body**: same shape minus `savedAt`.
-
-**`PUT /api/renewals/notes` response**:
-
-```json
-{ "ok": true, "savedAt": "2026-05-20T16:27:36.344Z", "noteCount": 47, "deleteCount": 2 }
-```
-
-**`GET /api/renewals/csv-list`**
-
-```json
-{
-  "files": [
-    {
-      "name": "Jesse and Dave F1 Sheet - 2026 data.csv",
-      "size": 12275670,
-      "mtime": 1779294253128
-    },
-    {
-      "name": "Jesse and Dave F1 Sheet - Historical FY27.csv",
-      "size": 2985498,
-      "mtime": 1779294253137
-    }
-  ]
-}
-```
+**`PUT /api/renewals/notes`** — body is `{ notes, noteDeletes }`;
+response `{ ok, savedAt, noteCount, deleteCount }`.
 
 **`GET /api/renewals/data-source/info?match=2026 data`**
 
@@ -994,29 +1214,54 @@ server is up.
 {
   "ok": true,
   "found": true,
-  "directory": "/app/data/csv",
-  "filename": "Jesse and Dave F1 Sheet - 2026 data.csv",
-  "size": 12275670,
-  "mtime": "2026-05-20T16:24:13.128Z",
-  "mtimeMs": 1779294253128,
-  "format": "csv"
+  "directory": "postgres:csv_uploads",
+  "filename": "Snowflake Run-now - 2026 data.csv",
+  "size": 1701024,
+  "sha256": "…",
+  "mtime": "2026-08-13T15:44:00.000Z",
+  "mtimeMs": 1786…,
+  "format": "csv",
+  "slot": "active"
 }
 ```
 
-**`POST /api/renewals/upload-csv` (text/csv body)**
+**`POST /api/renewals/upload-csv?slot=active`** (text/csv or multipart)
 
 ```bash
-curl -X POST \
+curl -X POST "https://renewals.example.com/api/renewals/upload-csv?slot=active" \
+  -H "X-Signal-Password: $ADMIN_TOKEN" \
   -H "Content-Type: text/csv" \
-  --data-binary @./my.csv \
-  "https://renewals.example.com/api/renewals/upload-csv?name=my-renewals.csv&replace=1"
+  --data-binary @./unified.csv
 ```
 
-Response:
+Response: `{ ok, id, slot, filename, size, sha256, uploaded_at }`.
+
+**`GET /api/renewals/refresh-status`** — the `settings` block is the
+**effective** connection + query params (defaults with admin overrides
+applied):
 
 ```json
-{ "ok": true, "filename": "my-renewals.csv", "size": 1234567, "mtime": "..." }
+{
+  "status": "done",
+  "data_as_of": "2026-08-13T15:44:00Z",
+  "mode": "real",
+  "slots": { "active": { "ok": true, "rows": 86231 } },
+  "simulated": false,
+  "settings": {
+    "mode": "real",
+    "account": "ZENDESK-GLOBAL", "warehouse": "PUBLIC_ZENDESK_L",
+    "database": "FOUNDATIONAL", "schema": "CUSTOMER", "role": "PUBLIC",
+    "n_past": 8, "n_future": 4, "min_arr": 10000, "band_cutoff": 100000
+  }
+}
 ```
+
+**`GET /api/renewals/weekly-brief`** — abbreviated (see `AGENTS.md` §5.10
+for the full contract): returns `{ ok, slot, band, threshold, quarter,
+current, prior, snapshots, sections }`, where `sections` carries
+`bu_movement` (per-region + rollup + dual trend), `worsened`,
+`new_forecast`, `best_case`, and `worst_case`. `best_case = BU_FC +
+UPSIDE`, `worst_case = BU_FC + DOWNSIDE`.
 
 ---
 
@@ -1066,37 +1311,42 @@ Seven pre-built background gradients selectable from settings:
 | Metric | Target | Actual |
 | --- | --- | --- |
 | First contentful paint | < 1 s | ~600 ms (cached) |
-| Time to interactive | < 3 s | ~2 s (12 MB CSV parsed in worker) |
+| Time to interactive | < 4 s | parses the unified CSV in a worker, split by `QUARTER_DIFF` |
 | Tab switch | < 50 ms | ~30 ms |
-| Filter apply | < 200 ms | ~120 ms (24K rows) |
-| Note save | Optimistic, async | < 5 ms perceived |
+| Filter apply | < 300 ms | scales with the in-scope row count |
+| Note save | Optimistic, async | < 5 ms perceived; debounced PUT to Postgres |
 
 ### 14.2 Reliability features
 
-- **Atomic writes** on every JSON file write (tmp + rename)
-- **Rolling history** of notes (50 snapshots) for recovery
+- **All primary state in Postgres** — no filesystem writes; DB-down returns 503
+- **Immutable upload versions** in `csv_uploads` (+ parsed `account_snapshots`), full history retained
+- **UPSERT + newer-wins** note merge (a `WHERE updated_at` guard) inside one transaction
 - **Tombstones** prevent deleted notes from resurfacing on import
-- **Newer-wins merge** for concurrent edits across devices
-- **Sha256 short-circuit** in PUT handler — no-op if the payload is unchanged
-- **Health check** every 30s for early detection of process death
-- **`tini` as PID 1** for clean shutdown on SIGTERM
-- **Non-root user** (`node`, uid 1000) for security
+- **Content-signature (`sha256`) cache key** so an unchanged snapshot is a cache hit even if `uploaded_at` moved
+- **Non-blocking startup** — HTTP listener opens before the DB pool; backoff retry with `/readyz` gating
+- **`tini` as PID 1** for clean SIGTERM drain (`--timeout-graceful-shutdown 25`)
+- **Non-root user** (`app`, uid 10001) for security
+- **Structured JSON logs** to stdout (Cloud Run captures them); the Snowflake OAuth token is never logged
 
 ### 14.3 Offline behavior
 
-The dashboard is **offline-capable** in two distinct modes:
+The dashboard degrades gracefully when the server is unreachable:
 
 | Mode | How |
 | --- | --- |
-| **Hybrid offline** | If the server is unreachable, the dashboard falls back to localStorage + IndexedDB. Reads work; saves stay queued until the server returns. |
-| **Fully offline** | `Renewals - Offline.html` is a 4 MB self-contained file with React, Papaparse, the Inter font, the compiled `vendor/app.js`, and the entire CSV inlined as base64. Open in any browser (file:// or Drive sync). |
+| **Hybrid offline** | If the API is unreachable, the dashboard falls back to localStorage + IndexedDB. Reads work; saves stay queued until the server returns. |
+
+> **Removed:** the client-side **mobile snapshot** feature and its
+> `mobile.html` output were removed entirely (the endpoint now 404s, and
+> the Settings UI + auto-rebuild effect were deleted). There is no separate
+> offline HTML build in this container.
 
 ### 14.4 Browser support
 
 - **Chromium** (Chrome, Edge, Brave, Arc) — full support
 - **Safari 16.4+** — full support
 - **Firefox** — full support
-- **Mobile Safari / Chrome Mobile** — read-only mobile snapshot via `mobile.html` (separate file, not bundled in this container build)
+- **Mobile** — the responsive dashboard renders on mobile browsers; the old dedicated mobile-snapshot build is gone (see above)
 
 ---
 
@@ -1105,19 +1355,23 @@ The dashboard is **offline-capable** in two distinct modes:
 | Term | Meaning |
 | --- | --- |
 | **ATR** | Annual Target Revenue — the renewable book (the most important number) |
-| **CC** | Cloud Consumption — usage-based expansion ARR |
+| **CC** | Churn / Contraction — for closed quarters this is the realized `QTD_CC` |
+| **QTD_CC** | Quarter-to-date realized churn / contraction (closed-quarter C/C) |
 | **BU FC** | Business Unit Forecast — the system / RevOps forecast for a renewal |
-| **ELT Forecast** | Dave & Jesse Forecast — per-renewal manual override of BU FC |
-| **ELT Call** | Dave & Jesse Call — per-quarter manual override of the quarter total |
-| **F1 Sheet** | The internal name for the Zendesk renewals CSV |
+| **ELT Forecast** | Per-account manual forecast (= CS Forecast + Renewals Forecast). The wire key stays `djForecast`; only the **label** is "ELT Forecast". |
+| **ELT Call** | Per-quarter manual call (= CS Call + Renewals Call) |
+| **Best / Worst Case** | Roll-up of the source data: `best_case = BU_FC + UPSIDE`, `worst_case = BU_FC + DOWNSIDE` |
+| **LTG** | Left-to-go on a renewal. For the current quarter, an account is "done" when **`ATR_ARR_USD_LTG = 0` OR the `DONE_DEAL` flag** is set (drives Effective Forecast %) |
+| **QUARTER_DIFF** | Rolling-window offset from the current quarter (`<0` closed, `0` current, `>0` future); the browser splits the unified pull on it |
 | **FY27Q2** | Fiscal Year 2027, Quarter 2 (Zendesk fiscal year ends 31 Jan) |
-| **GRR** | Gross Revenue Retention — (renewed ATR) / (total starting ATR) |
-| **noteKey** | Composite key tying a note to a specific renewal row: `accountBase::period::roundedATR` |
-| **Active slot** | The current-year CSV (filename contains "2026 data") |
-| **Historical slot** | The prior-year CSV (filename contains "historical fy27") |
-| **Unmatched note** | A note whose noteKey doesn't match any current renewal row (e.g., the row was removed or the ATR changed significantly) |
+| **noteKey** | 2-part key tying a note to an account-quarter: `accountBase::period` |
+| **call_key** | 3-part key for CS/Renewals call events: `account::quarter::roundedATR` |
+| **Snowflake "Run now"** | On-demand admin refresh that runs `sql/unified_dynamic.sql` and lands the result in `csv_uploads` + `account_snapshots` |
+| **Pomerium / Okta** | The SSO edge that injects identity headers + the per-request OAuth token used for Snowflake |
+| **Roles** | `owner` (super-user) / `admin` (user + diagnostics) / `standard` (edit notes/forecasts) / `guest` (read-only) |
+| **Unmatched note** | A note whose noteKey doesn't match any current renewal row (e.g., the row was removed) |
 | **Tombstone** | A timestamp recorded when a note is deleted, preventing it from being re-imported by an older export |
-| **Slot** | One of the two CSV families the dashboard ingests (active or historical) |
+| **Slot** | Storage bucket for uploads; the app now uses a single `active` slot (the unified pull) split client-side by `QUARTER_DIFF` |
 
 ---
 
@@ -1138,6 +1392,14 @@ A one-page summary table you can paste straight into a slide or doc.
 | **Related-renewals consolidation** | ✅ | RelatedRenewalsPanel |
 | **Cross-year (YoY) comparison** | ✅ | Historical tab (conditional) |
 | **Configurable targets + payout disclosure** | ✅ | Report tab |
+| **Weekly 100K+ Regional Brief (WoW movement)** | ✅ | Weekly Brief tab + `/weekly-brief`; dual BU-vs-Adjusted trend, downloadable HTML |
+| **Snowflake "Run now" refresh** | ✅ | Owner-gated; unified query → `csv_uploads` + `account_snapshots` |
+| **Admin-editable Snowflake connection + query settings** | ✅ | Persisted in `renewals_meta`, no redeploy |
+| **Faceted filter counts (distinct accounts, filter-aware)** | ✅ | Filter dropdowns |
+| **ARR-range filter** | ✅ | Global Filters bar (drives Weekly Brief ≥ $100K default) |
+| **CS + Renewals forecast decomposition (audited)** | ✅ | `account_forecasts` + `account_call_events` |
+| **SSO roles (owner/admin/standard/guest)** | ✅ | Pomerium / Okta header-based |
+| **Owner can promote users to owner** | ✅ | Admin console user management |
 | **Notes Summary export** | ✅ | .txt, copy or download |
 | **Exec Summary export** | ✅ | .md, copy or download, >$100K accounts |
 | **Weekly Update export** | ✅ | .md, last 3/7/14 days with diffs |
@@ -1146,19 +1408,18 @@ A one-page summary table you can paste straight into a slide or doc.
 | **Bulk archive/delete unmatched notes** | ✅ | Notes tab unmatched section |
 | **Dark mode** | ✅ | Toggle, persisted |
 | **7 background themes** | ✅ | Lavender / Slate / Ocean / Sunset / Forest / Rose / Midnight |
-| **CSV upload from UI** | ✅ | New endpoint, /upload-csv |
-| **CSV upload via API** | ✅ | curl --data-binary |
-| **CSV mount via Docker volume** | ✅ | -v $(pwd)/csvs:/app/data/csv |
-| **Server-side notes sync** | ✅ | PUT /api/renewals/notes |
-| **Rolling notes history (50 snapshots)** | ✅ | data/notes.history/ |
-| **Atomic file writes** | ✅ | tmp + rename |
-| **Healthcheck endpoint** | ✅ | /api/health, every 30s |
-| **Non-root container user** | ✅ | node, uid 1000 |
-| **Multi-stage Dockerfile** | ✅ | node:20-alpine, ~180 MB final |
-| **Compression** | ✅ | gzip via Express middleware |
-| **Access log** | ✅ | morgan, one line per request |
+| **CSV upload from UI** | ✅ | Admin console → Upload data file |
+| **CSV upload via API** | ✅ | `POST /api/renewals/upload-csv` (admin) |
+| **Server-side notes sync** | ✅ | PUT /api/renewals/notes (UPSERT, newer-wins) |
+| **Immutable upload version history** | ✅ | `csv_uploads` + parsed `account_snapshots` |
+| **Snapshot history + account timeline** | ✅ | `/snapshots`, `/account-history/{id}` |
+| **Liveness + readiness probes** | ✅ | `/healthz` (always 200) + `/readyz` (503 until ready) |
+| **Non-root container user** | ✅ | `app`, uid 10001 |
+| **Multi-stage Dockerfile** | ✅ | python:3.12-slim, tini PID 1, ~250 MB final |
+| **Structured JSON logs** | ✅ | structlog → stdout |
+| **Trending tab** | ❌ | Removed — folded into the Weekly Brief |
+| **Mobile snapshot generation** | ❌ | Removed entirely (endpoint 404s; UI deleted) |
 | **macOS Finder reveal** | ❌ | 501 — not applicable in container |
-| **Mobile snapshot generation** | ❌ | 501 — use separate offline build instead |
 | **Anthropic "Ask Claude" panel** | ❌ | Disabled (no API key wired) |
 
 ---
@@ -1176,19 +1437,18 @@ graph LR
     end
 
     subgraph "Container ($PORT)"
-        Server["Express<br/>(server.js)"]
-        Disk[("CSVs + notes.json")]
+        Server["FastAPI<br/>(app/, Python 3.12)"]
     end
 
-    subgraph "Salesforce / Warehouse"
-        Source["F1 Sheet CSV"]
-    end
+    PG[("Cloud SQL Postgres<br/>notes + versioned snapshots")]
+    Source["Snowflake<br/>(unified_dynamic.sql)"]
 
-    Source -->|export| Operator
-    Operator -->|"curl /upload-csv"| Server
-    Server <--> Disk
+    Owner["Owner"] -->|"Run now (OAuth token)"| Server
+    Server -->|unified query| Source
+    Source -->|rows| Server
+    Server <--> PG
     UI <-->|fetch| Server
-    UI -->|"copy paste"| Slack
+    UI -->|"copy paste / download brief"| Slack
 ```
 
 ---
@@ -1242,6 +1502,6 @@ Things Gemini Canvas can do well with this readout:
 
 ---
 
-*End of readout — 9,200 words, ~30 sections, 9 Mermaid diagrams,
-15 tables. Drop this entire file into Gemini Canvas, Notion,
+*End of readout — 16 sections + appendices, 9 Mermaid diagrams, and a
+capability matrix. Drop this entire file into Gemini Canvas, Notion,
 Confluence, or any Markdown surface and the structure will travel.*

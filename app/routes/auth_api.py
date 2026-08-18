@@ -63,9 +63,70 @@ async def users_list(
                 "role": u.role,
                 "createdAt": u.created_at.isoformat() if u.created_at else None,
                 "updatedAt": u.updated_at.isoformat() if u.updated_at else None,
+                "lastSeenAt": u.last_seen_at.isoformat() if u.last_seen_at else None,
             }
             for u in rows
         ]
+    }
+
+
+@router.get("/users/usage")
+async def users_usage(
+    request: Request,
+    _admin=Depends(require_admin),
+) -> dict:
+    """Overall usage rollup from user_activity_daily (sampled at the ~45s
+    login-cache granularity, so `hits` is an approximate activity count)."""
+    db = _db(request)
+    async with db.acquire() as conn:
+        daily_rows = await conn.fetch(
+            "SELECT day, COUNT(DISTINCT email) AS users, COALESCE(SUM(hits), 0) AS hits "
+            "FROM user_activity_daily "
+            "WHERE day >= CURRENT_DATE - INTERVAL '29 days' "
+            "GROUP BY day ORDER BY day ASC"
+        )
+        active_7d = await conn.fetchval(
+            "SELECT COUNT(DISTINCT email) FROM user_activity_daily "
+            "WHERE day >= CURRENT_DATE - 6"
+        )
+        active_30d = await conn.fetchval(
+            "SELECT COUNT(DISTINCT email) FROM user_activity_daily "
+            "WHERE day >= CURRENT_DATE - 29"
+        )
+        top_rows = await conn.fetch(
+            "SELECT a.email, "
+            "       COALESCE(SUM(a.hits), 0) AS hits30d, "
+            "       MAX(a.last_seen_at) AS last_seen_at, "
+            "       u.display_name AS display_name, u.role AS role "
+            "FROM user_activity_daily a "
+            "LEFT JOIN users u ON u.email = a.email "
+            "WHERE a.day >= CURRENT_DATE - 29 "
+            "GROUP BY a.email, u.display_name, u.role "
+            "ORDER BY hits30d DESC, last_seen_at DESC NULLS LAST "
+            "LIMIT 20"
+        )
+    return {
+        "ok": True,
+        "daily": [
+            {
+                "day": r["day"].isoformat() if r["day"] else None,
+                "users": int(r["users"] or 0),
+                "hits": int(r["hits"] or 0),
+            }
+            for r in daily_rows
+        ],
+        "active_7d": int(active_7d or 0),
+        "active_30d": int(active_30d or 0),
+        "top_users": [
+            {
+                "email": r["email"],
+                "displayName": r["display_name"] or "",
+                "role": r["role"] or "",
+                "lastSeenAt": r["last_seen_at"].isoformat() if r["last_seen_at"] else None,
+                "hits30d": int(r["hits30d"] or 0),
+            }
+            for r in top_rows
+        ],
     }
 
 

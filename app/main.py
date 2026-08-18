@@ -144,6 +144,13 @@ async def _bring_db_online(app: FastAPI, db: Database) -> None:
         return
 
     try:
+        await db.migrate_user_activity()
+    except Exception:
+        logger.exception("User activity migration failed")
+        app.state.db_status = "schema-error"
+        return
+
+    try:
         profiles = settings.bootstrap_admin_profiles()
         if profiles:
             n = await db.seed_bootstrap_admins(profiles)

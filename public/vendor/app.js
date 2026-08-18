@@ -7080,9 +7080,38 @@ function RegionQuarterTable() {
   useScopedAccountIds(focusRows, acctIdKey, acctKey);
   useScopedCallKeys(focusRows, hm, state.settings);
   useScopedCallRollup(focusRows, hm, state.settings, notes, fcByAccount);
+  const histArrFilter = useMemo(() => {
+    const f = state.filters || {};
+    const ranges = Array.isArray(f.arrRanges) ? f.arrRanges : [];
+    const arrMin = f.arrMin != null && f.arrMin !== "" ? Number(f.arrMin) : null;
+    const arrMax = f.arrMax != null && f.arrMax !== "" ? Number(f.arrMax) : null;
+    const active = ranges.length > 0 || arrMin != null && isFinite(arrMin) || arrMax != null && isFinite(arrMax);
+    if (!active) return null;
+    return (r) => {
+      const atrVal = toNumber(r[histAtrKey]);
+      if (ranges.length > 0) {
+        return ranges.some((rg) => {
+          const lo = rg.min != null && rg.min !== "" ? Number(rg.min) : null;
+          const hi = rg.max != null && rg.max !== "" ? Number(rg.max) : null;
+          if (lo != null && isFinite(lo) && !(atrVal >= lo)) return false;
+          if (hi != null && isFinite(hi) && !(atrVal <= hi)) return false;
+          return true;
+        });
+      }
+      if (arrMin != null && isFinite(arrMin) && !(atrVal >= arrMin)) return false;
+      if (arrMax != null && isFinite(arrMax) && !(atrVal <= arrMax)) return false;
+      return true;
+    };
+  }, [state.filters, histAtrKey]);
+  const histGlobalMatcher = useMemo(() => {
+    const f = state.filters || {};
+    const matcherFilters = { ...f, arrRanges: [], arrMin: null, arrMax: null, hasNotes: false };
+    return makeRowMatcher(histHM, matcherFilters, settings, notes, { ignoreQuarters: true, ignoreBand: true });
+  }, [histHM, state.filters, settings, notes]);
   const histRowsFiltered = useMemo(() => {
     if (!histData || !histData.length) return [];
     let pool = histData.filter((r) => toNumber(r[histAtrKey]) > 0 || toNumber(r[histCcKey]) > 0);
+    pool = pool.filter((r) => histGlobalMatcher(r, null));
     if (selectedFQ && selectedFQ !== "__ALL_FQ__") {
       pool = pool.filter((r) => safeString(r[histQKey]) === selectedFQ);
     } else if (selectedFQ === "__ALL_FQ__") {
@@ -7100,8 +7129,11 @@ function RegionQuarterTable() {
     if (selectedCsManager && selectedCsManager !== "__ALL_CSM__") {
       pool = pool.filter((r) => safeString(r[histCsManagerKey]) === selectedCsManager);
     }
+    if (histArrFilter) {
+      pool = pool.filter(histArrFilter);
+    }
     return pool;
-  }, [histData, histAtrKey, histCcKey, histQKey, histBandKey, histSegKey, histFlag3kKey, histSubregionKey, histCsManagerKey, selectedFQ, selectedBand, selectedSubregions, selectedCsManager, rowsView]);
+  }, [histData, histAtrKey, histCcKey, histQKey, histBandKey, histSegKey, histFlag3kKey, histSubregionKey, histCsManagerKey, selectedFQ, selectedBand, selectedSubregions, selectedCsManager, rowsView, histArrFilter, histGlobalMatcher]);
   const chartActiveRows = useMemo(() => {
     let pool = validRows;
     if (selectedBand && selectedBand !== "all") pool = pool.filter((r) => matchesBand_(r, selectedBand));
@@ -7112,11 +7144,13 @@ function RegionQuarterTable() {
   const chartHistRows = useMemo(() => {
     if (!histData || !histData.length) return [];
     let pool = histData.filter((r) => toNumber(r[histAtrKey]) > 0 || toNumber(r[histCcKey]) > 0);
+    pool = pool.filter((r) => histGlobalMatcher(r, null));
     if (selectedBand && selectedBand !== "all") pool = pool.filter((r) => matchesBand(r, selectedBand, histAtrKey, histSegKey, histFlag3kKey, histBandKey));
     if (selectedSubregions.size > 0) pool = pool.filter((r) => selectedSubregions.has(safeString(r[histSubregionKey])));
     if (selectedCsManager && selectedCsManager !== "__ALL_CSM__") pool = pool.filter((r) => safeString(r[histCsManagerKey]) === selectedCsManager);
+    if (histArrFilter) pool = pool.filter(histArrFilter);
     return pool;
-  }, [histData, histAtrKey, histCcKey, histBandKey, histSegKey, histFlag3kKey, histSubregionKey, histCsManagerKey, selectedBand, selectedSubregions, selectedCsManager]);
+  }, [histData, histAtrKey, histCcKey, histBandKey, histSegKey, histFlag3kKey, histSubregionKey, histCsManagerKey, selectedBand, selectedSubregions, selectedCsManager, histArrFilter, histGlobalMatcher]);
   const forecastByQuarter = useMemo(() => {
     const map = /* @__PURE__ */ new Map();
     rowsView.forEach((r) => {
@@ -7327,12 +7361,13 @@ function RegionQuarterTable() {
       if (h === "red" || h === "churning") atRisk += atr;
       if (h === "churning") churnAtr += atr;
     }
+    const activeQuarters = new Set(focusRows.map((r) => safeString(r[qKey])));
     let bookedCC = 0, histAtr = 0, histCount = 0;
     for (let i = 0, len = histRowsFiltered.length; i < len; i++) {
       const r = histRowsFiltered[i];
-      histAtr += toNumber(r[histAtrKey]);
       bookedCC += toNumber(r[histCcKey]);
       histCount++;
+      if (!activeQuarters.has(safeString(r[histQKey]))) histAtr += toNumber(r[histAtrKey]);
     }
     const remainingCC = buTotal;
     const expectedCC = bookedCC + remainingCC;
@@ -7348,7 +7383,7 @@ function RegionQuarterTable() {
     const gap = target > 0 ? totalAtr - target : null;
     const attain = target > 0 ? totalAtr / target : null;
     return { totalAtr, fullAtr, histAtr, histCount, bookedCC, remainingCC, expectedCC, expectedCcRate, expectedDj, expectedDjRate, acctCount, buTotal, ccRate, djTotal, djOverrideCount, atRisk, churnAtr, target, gap, attain, reviewedCount };
-  }, [focusRows, histRowsFiltered, atrKey, buKey, acctKey, acctIdKey, healthKey, histAtrKey, histCcKey, state.targets, selectedFQ, rowsView, notes, fcByAccount, hm, settings]);
+  }, [focusRows, histRowsFiltered, atrKey, buKey, acctKey, acctIdKey, healthKey, histAtrKey, histCcKey, histQKey, qKey, state.targets, selectedFQ, rowsView, notes, fcByAccount, hm, settings]);
   const gapColor = (g) => g >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-red-500 dark:text-red-400";
   const attainColor = (a) => a >= 1 ? "text-emerald-600 dark:text-emerald-400" : a >= 0.9 ? "text-amber-600 dark:text-amber-400" : "text-red-500 dark:text-red-400";
   const _mobileBandLabel = selectedBand && selectedBand !== "all" ? BAND_OPTIONS.find((b) => b.value === selectedBand)?.label || selectedBand : "All accounts";

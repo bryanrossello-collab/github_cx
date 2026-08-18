@@ -16,17 +16,21 @@ class UserRecord:
     role: str  # 'standard' | 'admin' | 'owner'
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
     ephemeral: bool = False
     source: str = "database"
 
 
 def _row_to_user(row: asyncpg.Record, *, source: str = "database") -> UserRecord:
+    # last_seen_at is absent on rows returned by the UPSERT RETURNING clauses
+    # (they don't select it); .get() tolerates that and yields None.
     return UserRecord(
         email=row["email"],
         display_name=row["display_name"] or "",
         role=row["role"],
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
+        last_seen_at=row.get("last_seen_at"),
         ephemeral=False,
         source=source,
     )
@@ -34,7 +38,7 @@ def _row_to_user(row: asyncpg.Record, *, source: str = "database") -> UserRecord
 
 async def get_user(conn: asyncpg.Connection, email: str) -> Optional[UserRecord]:
     row = await conn.fetchrow(
-        "SELECT email, display_name, role, created_at, updated_at "
+        "SELECT email, display_name, role, created_at, updated_at, last_seen_at "
         "FROM users WHERE email = $1",
         email.lower(),
     )
@@ -43,7 +47,7 @@ async def get_user(conn: asyncpg.Connection, email: str) -> Optional[UserRecord]
 
 async def list_users(conn: asyncpg.Connection) -> list[UserRecord]:
     rows = await conn.fetch(
-        "SELECT email, display_name, role, created_at, updated_at "
+        "SELECT email, display_name, role, created_at, updated_at, last_seen_at "
         "FROM users ORDER BY email"
     )
     return [_row_to_user(r) for r in rows]

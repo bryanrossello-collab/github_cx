@@ -281,6 +281,13 @@ SEED_FILES = [
 # the pool default. Env-overridable via DB_INGEST_TIMEOUT_S.
 INGEST_COMMAND_TIMEOUT_S = int(os.environ.get("DB_INGEST_TIMEOUT_S", "600"))
 
+# Advisory-lock namespace for ingest. Concurrent ingests of the SAME upload can
+# race (e.g. the Snowflake Run-now background ingest vs the /parsed-data
+# on-demand ingest the dashboard triggers when rows are still 0). Without a lock
+# both transactions see 0 existing rows and both COPY the full set, doubling
+# account_snapshots. A per-upload transaction lock serializes them.
+_INGEST_LOCK_NS = 0x52454E57  # "RENW"
+
 
 class DatabaseUnavailable(RuntimeError):
     """Raised by ``Database.acquire`` when the pool isn't connected. Mapped
@@ -479,6 +486,30 @@ class Database:
                     "003_account_call_events",
                 )
         logger.info("Applied call-events migration 003_account_call_events (%d backfilled)", n)
+
+    async def migrate_user_activity(self) -> None:
+        """Add users.last_seen_at + user_activity_daily (usage tracking)."""
+        migration_path = (
+            Path(__file__).resolve().parent.parent / "migrations" / "004_user_activity.sql"
+        )
+        sql = migration_path.read_text(encoding="utf-8")
+        async with self.pool.acquire() as conn:
+            done = await conn.fetchval(
+                "SELECT 1 FROM schema_migrations WHERE version = $1",
+                "004_user_activity",
+            )
+            if done:
+                return
+
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(sql)
+                await conn.execute(
+                    "INSERT INTO schema_migrations (version) VALUES ($1) "
+                    "ON CONFLICT (version) DO NOTHING",
+                    "004_user_activity",
+                )
+        logger.info("Applied user-activity migration 004_user_activity")
 
     async def _backfill_call_events_from_forecasts(self, conn) -> int:
         from app.call_keys import build_call_key
@@ -876,6 +907,28 @@ class Database:
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                # Serialize concurrent ingests of the SAME upload so the
+                # DELETE+COPY stays idempotent and rows can't be double-inserted
+                # (Run-now background ingest vs /parsed-data on-demand ingest).
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1, $2)",
+                    _INGEST_LOCK_NS, int(csv_upload_id),
+                    timeout=INGEST_COMMAND_TIMEOUT_S,
+                )
+                # If a concurrent ingest already materialized this exact upload,
+                # don't redo the work (also removes the redundant on-demand
+                # re-ingest the dashboard would otherwise trigger).
+                existing = await conn.fetchval(
+                    "SELECT COUNT(*) FROM account_snapshots WHERE csv_upload_id = $1",
+                    csv_upload_id,
+                    timeout=INGEST_COMMAND_TIMEOUT_S,
+                )
+                if existing and int(existing) == len(records):
+                    logger.info(
+                        "ingest_snapshot: csv_upload_id=%d already materialized "
+                        "(%d rows); skipping re-ingest", csv_upload_id, int(existing),
+                    )
+                    return len(records)
                 await conn.execute(
                     "DELETE FROM account_snapshots WHERE csv_upload_id = $1",
                     csv_upload_id,

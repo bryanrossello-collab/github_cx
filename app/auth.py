@@ -252,6 +252,26 @@ async def resolve_user(request: Request) -> ResolvedUser:
                 owner_emails=owners,
                 auto_provision=settings.auto_provision_users,
             )
+            # Record activity (last-seen + daily hit tally). This runs only on
+            # a cache MISS, so it's naturally throttled to ~1 write / user /
+            # _USER_CACHE_TTL_S. FULLY guarded — it must NEVER break auth.
+            if record is not None:
+                try:
+                    await conn.execute(
+                        "UPDATE users SET last_seen_at = NOW() WHERE email = $1",
+                        record.email,
+                    )
+                    await conn.execute(
+                        "INSERT INTO user_activity_daily (email, day, hits, last_seen_at) "
+                        "VALUES ($1, CURRENT_DATE, 1, NOW()) "
+                        "ON CONFLICT (email, day) DO UPDATE SET "
+                        "hits = user_activity_daily.hits + 1, last_seen_at = NOW()",
+                        record.email,
+                    )
+                except Exception:
+                    logger.debug(
+                        "activity tracking failed for %s", record.email, exc_info=True
+                    )
     except Exception:
         logger.exception("user_provision_failed email=%s", identity.email)
         if identity.email in owners:

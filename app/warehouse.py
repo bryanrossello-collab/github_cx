@@ -42,6 +42,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -59,13 +60,13 @@ SEEDS_DIR = _ROOT / "seeds"
 # one source); the frontend splits it by QUARTER_DIFF into active/historical
 # views. The query binds live in DEFAULT_QUERY_PARAMS (below) and are
 # admin-overridable at runtime (persisted in renewals_meta 'snowflake_config').
-# The "2026 data" filename marker keeps slot inference + data-source matching
-# identical to a manual upload.
+# The slot is persisted EXPLICITLY (slot="active"), and data-source resolution
+# selects by slot — so the upload's filename is free to be a human-friendly,
+# timestamped name (generated per run in refresh_all), not a magic marker.
 SLOT_SPECS: dict[str, dict[str, Any]] = {
     "active": {
         "sql": "unified_dynamic.sql",
         "seed": "unified.csv",
-        "filename": "Snowflake Run-now - 2026 data.csv",
     },
 }
 
@@ -297,12 +298,19 @@ async def refresh_all(
                 "Snowflake Run-now"
                 + (" (simulated)" if simulated else "")
             )
+            # Timestamped, sortable UTC filename for traceability in the
+            # snapshot history, e.g. "Snowflake Run-Now_20260813_1206Z.csv".
+            run_ts = datetime.now(timezone.utc)
+            filename = f"Snowflake Run-Now_{run_ts:%Y%m%d_%H%M}Z.csv"
             persisted = await db.persist_source_csv(
                 slot=slot,
-                filename=spec["filename"],
+                filename=filename,
                 content=content,
                 uploaded_by=uploaded_by,
                 note=note,
+                # Pass a precise effective_date so snapshot ordering stays exact
+                # and the YYYYMMDD in the filename isn't parsed to noon-of-day.
+                effective_date=run_ts,
             )
             slot_res.update(
                 ok=True,

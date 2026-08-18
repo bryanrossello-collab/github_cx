@@ -359,14 +359,66 @@
                 <th>Email</th>
                 <th>Name</th>
                 <th>Role</th>
+                <th>Last active</th>
                 <th>Updated</th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody id="users-tbody">
-              <tr><td colspan="5" class="muted" style="text-align:center;padding:24px;">Loading…</td></tr>
+              <tr><td colspan="6" class="muted" style="text-align:center;padding:24px;">Loading…</td></tr>
             </tbody>
           </table>
+        </div>
+      </section>
+
+      <section class="card" data-section="admin">
+        <h2>Usage</h2>
+        <p class="muted">
+          Who's actually using Renewals Studio. Activity is sampled at the ~45s
+          login-cache granularity, so <strong>hits</strong> is an approximate
+          activity count (not a raw request count).
+        </p>
+        <div style="margin:14px 0 8px;display:flex;gap:8px;align-items:center;">
+          <button class="btn btn-sm" id="refresh-usage" type="button">Refresh</button>
+          <span class="muted" id="usage-note"></span>
+        </div>
+        <div class="status-grid" style="margin-bottom:16px;">
+          <div class="status-item">
+            <div class="status-label">Active · last 7 days</div>
+            <div class="status-value" id="usage-active-7d">—</div>
+          </div>
+          <div class="status-item">
+            <div class="status-label">Active · last 30 days</div>
+            <div class="status-value" id="usage-active-30d">—</div>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:minmax(240px,1fr) minmax(320px,1.4fr);gap:16px;align-items:start;">
+          <div>
+            <h3 style="font-size:13px;margin:0 0 8px;">Daily active users (30d)</h3>
+            <div style="overflow-x:auto;max-height:320px;overflow-y:auto;">
+              <table>
+                <thead>
+                  <tr><th>Day</th><th class="num">Users</th><th class="num">Hits</th></tr>
+                </thead>
+                <tbody id="usage-daily-tbody">
+                  <tr><td colspan="3" class="muted" style="text-align:center;padding:16px;">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3 style="font-size:13px;margin:0 0 8px;">Most active users (30d)</h3>
+            <div style="overflow-x:auto;max-height:320px;overflow-y:auto;">
+              <table>
+                <thead>
+                  <tr><th>Email</th><th>Role</th><th>Last active</th><th class="num">Hits</th></tr>
+                </thead>
+                <tbody id="usage-top-tbody">
+                  <tr><td colspan="4" class="muted" style="text-align:center;padding:16px;">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -558,7 +610,10 @@
           if (d && d.status === 'running') { setSnowflakeRunning(true); startSnowflakePolling(); }
         });
       }
-      if (currentUser && (currentUser.role === 'admin' || currentUser.role === 'owner')) refreshUsers();
+      if (currentUser && (currentUser.role === 'admin' || currentUser.role === 'owner')) {
+        refreshUsers();
+        refreshUsage();
+      }
     }
 
     const TAB_LABELS = {
@@ -811,13 +866,13 @@
       const tbody = $('users-tbody');
       const countEl = $('users-count');
       if (!tbody) return;
-      tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center;padding:24px;">Loading…</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" class="muted" style="text-align:center;padding:24px;">Loading…</td></tr>';
       try {
         const data = await api('/api/users');
         const users = data.users || [];
         if (countEl) countEl.textContent = users.length + ' user(s)';
         if (!users.length) {
-          tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center;padding:24px;">No users yet. Add an email above.</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="6" class="muted" style="text-align:center;padding:24px;">No users yet. Add an email above.</td></tr>';
           return;
         }
         tbody.innerHTML = users.map(function (u) {
@@ -844,6 +899,7 @@
             '<td><code>' + email + '</code></td>' +
             '<td>' + (u.displayName || '—') + '</td>' +
             '<td><span class="pill ' + rolePill + '">' + role + '</span></td>' +
+            '<td class="muted">' + (u.lastSeenAt ? fmtDate(u.lastSeenAt) : '—') + '</td>' +
             '<td class="muted">' + (u.updatedAt ? fmtDate(u.updatedAt) : '—') + '</td>' +
             '<td style="white-space:nowrap">' + actions.join(' ') + '</td>' +
           '</tr>';
@@ -865,7 +921,52 @@
           btn.addEventListener('click', function () { removeUser(btn.dataset.removeUser); });
         });
       } catch (err) {
-        tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center;padding:24px;color:var(--red);">' + err.message + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" class="muted" style="text-align:center;padding:24px;color:var(--red);">' + err.message + '</td></tr>';
+      }
+    }
+
+    async function refreshUsage() {
+      const dailyBody = $('usage-daily-tbody');
+      const topBody = $('usage-top-tbody');
+      const a7 = $('usage-active-7d');
+      const a30 = $('usage-active-30d');
+      if (!dailyBody || !topBody) return;
+      dailyBody.innerHTML = '<tr><td colspan="3" class="muted" style="text-align:center;padding:16px;">Loading…</td></tr>';
+      topBody.innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center;padding:16px;">Loading…</td></tr>';
+      try {
+        const data = await api('/api/users/usage');
+        if (a7) a7.textContent = (data.active_7d || 0).toLocaleString();
+        if (a30) a30.textContent = (data.active_30d || 0).toLocaleString();
+        const daily = data.daily || [];
+        if (!daily.length) {
+          dailyBody.innerHTML = '<tr><td colspan="3" class="muted" style="text-align:center;padding:16px;">No activity recorded yet.</td></tr>';
+        } else {
+          dailyBody.innerHTML = daily.slice().reverse().map(function (d) {
+            const day = d.day ? new Date(d.day + 'T00:00:00').toLocaleDateString() : '—';
+            return '<tr><td>' + day + '</td>' +
+              '<td class="num">' + (d.users || 0).toLocaleString() + '</td>' +
+              '<td class="num">' + (d.hits || 0).toLocaleString() + '</td></tr>';
+          }).join('');
+        }
+        const top = data.top_users || [];
+        if (!top.length) {
+          topBody.innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center;padding:16px;">No activity recorded yet.</td></tr>';
+        } else {
+          topBody.innerHTML = top.map(function (u) {
+            const email = u.email || '';
+            const role = u.role || 'standard';
+            const rolePill = role === 'owner' ? 'owner-badge' : (role === 'admin' ? 'pill-ok' : '');
+            return '<tr>' +
+              '<td><code>' + email + '</code></td>' +
+              '<td><span class="pill ' + rolePill + '">' + role + '</span></td>' +
+              '<td class="muted">' + (u.lastSeenAt ? fmtDate(u.lastSeenAt) : '—') + '</td>' +
+              '<td class="num">' + (u.hits30d || 0).toLocaleString() + '</td>' +
+            '</tr>';
+          }).join('');
+        }
+      } catch (err) {
+        dailyBody.innerHTML = '<tr><td colspan="3" class="muted" style="text-align:center;padding:16px;color:var(--red);">' + err.message + '</td></tr>';
+        topBody.innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center;padding:16px;color:var(--red);">' + err.message + '</td></tr>';
       }
     }
 
@@ -1262,6 +1363,7 @@
     $('sf-save-btn') && $('sf-save-btn').addEventListener('click', saveSnowflakeConfig);
     $('refresh-list').addEventListener('click', refreshList);
     $('refresh-users').addEventListener('click', refreshUsers);
+    $('refresh-usage').addEventListener('click', refreshUsage);
     $('user-add-form').addEventListener('submit', handleUserAdd);
     $('filter-slot').addEventListener('change', refreshList);
     $('notes-import-form').addEventListener('submit', handleNotesImport);
