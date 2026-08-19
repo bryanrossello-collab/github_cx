@@ -624,15 +624,17 @@
       notes: 'Notes',
       historical: 'Historical',
       targets: 'Report',
+      weekly: 'Weekly Brief',
+      pacing: 'Pacing',
     };
     let _tabAccessAllTabs = [];
     let _tabAccessMatrix = null;
 
     function defaultTabMatrix() {
       return {
-        owner: ['region', 'trending', 'partner', 'accounts', 'notes', 'historical', 'targets'],
-        admin: ['region', 'partner', 'accounts', 'notes', 'historical', 'targets'],
-        standard: ['region', 'partner', 'accounts', 'notes', 'targets'],
+        owner: ['region', 'trending', 'partner', 'accounts', 'notes', 'historical', 'targets', 'weekly', 'pacing'],
+        admin: ['region', 'partner', 'accounts', 'notes', 'historical', 'targets', 'weekly', 'pacing'],
+        standard: ['region', 'partner', 'accounts', 'notes', 'targets', 'weekly', 'pacing'],
       };
     }
 

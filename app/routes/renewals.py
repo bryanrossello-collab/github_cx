@@ -1462,15 +1462,15 @@ async def call_history(
 TAB_ACCESS_META_KEY = "tab_access"
 ALL_DASHBOARD_TABS = (
     "region", "trending", "partner", "accounts", "notes", "historical",
-    "targets", "weekly"
+    "targets", "weekly", "pacing"
 )
 
 
 def _default_tab_access_matrix() -> dict[str, list[str]]:
     return {
         "owner": list(ALL_DASHBOARD_TABS),
-        "admin": ["region", "partner", "accounts", "notes", "historical", "targets", "weekly"],
-        "standard": ["region", "partner", "accounts", "notes", "targets", "weekly"],
+        "admin": ["region", "partner", "accounts", "notes", "historical", "targets", "weekly", "pacing"],
+        "standard": ["region", "partner", "accounts", "notes", "targets", "weekly", "pacing"],
     }
 
 
@@ -1585,6 +1585,7 @@ def _empty_planning_response() -> dict:
         "rateTargets": {},
         "ccData": {},
         "expansionTargets": {},
+        "regionCcTargets": {},
         "savedAt": None,
         "updatedBy": None,
     }
@@ -1623,6 +1624,7 @@ async def get_planning_data(request: Request) -> dict:
         "rateTargets": payload.get("rateTargets") if isinstance(payload.get("rateTargets"), dict) else {},
         "ccData": payload.get("ccData") if isinstance(payload.get("ccData"), dict) else {},
         "expansionTargets": payload.get("expansionTargets") if isinstance(payload.get("expansionTargets"), dict) else {},
+        "regionCcTargets": payload.get("regionCcTargets") if isinstance(payload.get("regionCcTargets"), dict) else {},
         "savedAt": payload.get("savedAt"),
         "updatedBy": payload.get("updatedBy"),
     }
@@ -1645,6 +1647,7 @@ async def put_planning_data(
         "rateTargets": _coerce_planning_dict(body, "rateTargets"),
         "ccData": _coerce_planning_dict(body, "ccData"),
         "expansionTargets": _coerce_planning_dict(body, "expansionTargets"),
+        "regionCcTargets": _coerce_planning_dict(body, "regionCcTargets"),
         "savedAt": saved_at.isoformat(),
         "updatedBy": user.email,
     }

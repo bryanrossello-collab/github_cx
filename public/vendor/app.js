@@ -61,6 +61,7 @@ const BG_THEMES = [
 ];
 const STORAGE_CC_DATA_KEY = "renewals_cc_data_v1";
 const STORAGE_EXPANSION_TARGETS_KEY = "renewals_expansion_targets_v1";
+const STORAGE_REGION_CC_TARGETS_KEY = "renewals_region_cc_targets_v1";
 const STORAGE_HISTORICAL_KEY = "renewals_historical_v1";
 const STORAGE_ACTIVE_DATA_KEY = "renewals_active_data_v1";
 const STORAGE_ACTIVE_HM_KEY = "renewals_active_hm_v1";
@@ -1010,6 +1011,33 @@ function isCurrentOrPastQuarter(label) {
   const cf = getCurrentFiscal();
   return p.fy < cf.fy || p.fy === cf.fy && p.fq <= cf.fq;
 }
+const PACING_REGIONS = ["AMER", "EMEA", "APAC", "LATAM"];
+function canonPacingRegion(raw) {
+  const s = safeString(raw).trim().toUpperCase();
+  if (PACING_REGIONS.indexOf(s) >= 0) return s;
+  if (s.indexOf("LATAM") >= 0 || s.indexOf("LATIN") >= 0) return "LATAM";
+  if (s.indexOf("EMEA") >= 0 || s.indexOf("EUROPE") >= 0) return "EMEA";
+  if (s.indexOf("APAC") >= 0 || s.indexOf("ASIA") >= 0 || s.indexOf("ANZ") >= 0) return "APAC";
+  if (s.indexOf("AMER") >= 0 || s.indexOf("NORTH AMERICA") >= 0 || s === "NA") return "AMER";
+  return "Other";
+}
+function fiscalQuarterBounds(fy, fq) {
+  const endYear = 2000 + Number(fy);
+  if (fq === 1) return { start: new Date(endYear - 1, 1, 1), end: new Date(endYear - 1, 3, 30, 23, 59, 59) };
+  if (fq === 2) return { start: new Date(endYear - 1, 4, 1), end: new Date(endYear - 1, 6, 31, 23, 59, 59) };
+  if (fq === 3) return { start: new Date(endYear - 1, 7, 1), end: new Date(endYear - 1, 9, 31, 23, 59, 59) };
+  return { start: new Date(endYear - 1, 10, 1), end: new Date(endYear, 0, 31, 23, 59, 59) };
+}
+function fiscalQuarterElapsed(fy, fq, now) {
+  const cf = getCurrentFiscal();
+  if (fy < cf.fy || fy === cf.fy && fq < cf.fq) return 1;
+  if (fy > cf.fy || fy === cf.fy && fq > cf.fq) return 0;
+  const { start, end } = fiscalQuarterBounds(fy, fq);
+  const span = end.getTime() - start.getTime();
+  if (!(span > 0)) return 0;
+  const t = (now || new Date()).getTime();
+  return Math.max(0, Math.min(1, (t - start.getTime()) / span));
+}
 function detectInitialTheme() {
   try {
     const stored = localStorage.getItem(STORAGE_THEME_KEY);
@@ -1045,7 +1073,7 @@ const BAND_OPTIONS = [
   { value: "smb", label: "SMB accounts only" },
   { value: "digital", label: "Digital accounts only" }
 ];
-const VALID_TABS = ["region", "partner", "accounts", "notes", "historical", "targets", "weekly"];
+const VALID_TABS = ["region", "partner", "accounts", "notes", "historical", "targets", "weekly", "pacing"];
 const DEFAULT_QUARTERS = ["FY25Q4", "FY26Q1", "FY27Q1", "FY27Q2", "FY27Q3", "FY27Q4"];
 const initialState = {
   data: [],
@@ -1075,6 +1103,7 @@ const initialState = {
   targets: {},
   rateTargets: {},
   ccData: {},
+  regionCcTargets: {},
   historicalData: [],
   historicalHeaderMap: {},
   visibleCols: {
@@ -1182,6 +1211,13 @@ function AppProvider({ children }) {
               return {};
             }
           })(),
+          regionCcTargets: (() => {
+            try {
+              return JSON.parse(localStorage.getItem(STORAGE_REGION_CC_TARGETS_KEY)) || {};
+            } catch {
+              return {};
+            }
+          })(),
           historicalData: [],
           historicalHeaderMap: {},
           ui: { ...initialState.ui, ...parsed.ui || {}, activeTab: savedTab }
@@ -1217,7 +1253,14 @@ function AppProvider({ children }) {
         return {};
       }
     })();
-    return { ...initialState, data: [], headers: [], headerMap: {}, targets: savedTargets, rateTargets: savedRateTargets, ccData: savedCcData, expansionTargets: savedExpansionTargets, historicalData: [], historicalHeaderMap: {} };
+    const savedRegionCcTargets = (() => {
+      try {
+        return JSON.parse(localStorage.getItem(STORAGE_REGION_CC_TARGETS_KEY)) || {};
+      } catch {
+        return {};
+      }
+    })();
+    return { ...initialState, data: [], headers: [], headerMap: {}, targets: savedTargets, rateTargets: savedRateTargets, ccData: savedCcData, expansionTargets: savedExpansionTargets, regionCcTargets: savedRegionCcTargets, historicalData: [], historicalHeaderMap: {} };
   });
   useEffect(() => {
     const root = document.documentElement;
@@ -1812,6 +1855,7 @@ function AppProvider({ children }) {
         localStorage.removeItem(STORAGE_HISTORICAL_KEY);
         localStorage.removeItem(STORAGE_HISTORICAL_KEY + "_hm");
         localStorage.removeItem(STORAGE_EXPANSION_TARGETS_KEY);
+        localStorage.removeItem(STORAGE_REGION_CC_TARGETS_KEY);
       } catch {
       }
       idbClear().catch(() => {
@@ -1948,6 +1992,13 @@ function AppProvider({ children }) {
       setState((s) => ({ ...s, expansionTargets: expansionTargets || {} }));
       try {
         localStorage.setItem(STORAGE_EXPANSION_TARGETS_KEY, JSON.stringify(expansionTargets || {}));
+      } catch {
+      }
+    },
+    setRegionCcTargets: (regionCcTargets) => {
+      setState((s) => ({ ...s, regionCcTargets: regionCcTargets || {} }));
+      try {
+        localStorage.setItem(STORAGE_REGION_CC_TARGETS_KEY, JSON.stringify(regionCcTargets || {}));
       } catch {
       }
     },
@@ -4549,7 +4600,7 @@ function Header() {
       title: "Export Notes"
     },
     /* @__PURE__ */ React.createElement("svg", { className: "w-3.5 h-3.5", style: { color: "var(--ink-muted)" }, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 1.8 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" }))
-  ), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowActions(true), className: "iconbtn", title: "Settings & actions" }, /* @__PURE__ */ React.createElement("svg", { className: "w-3.5 h-3.5", style: { color: "var(--ink-muted)" }, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 1.8 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.573-1.066z" }), /* @__PURE__ */ React.createElement("circle", { cx: "12", cy: "12", r: "3" })))))), hasData && /* @__PURE__ */ React.createElement("div", { className: "border-t border-gray-200/40 dark:border-slate-700/40 glass-card-surface" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-7xl mx-auto" }, /* @__PURE__ */ React.createElement(Filters, null))), actionsModal, notesHeadlessEl);
+  ), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowActions(true), className: "iconbtn", title: "Settings & actions" }, /* @__PURE__ */ React.createElement("svg", { className: "w-3.5 h-3.5", style: { color: "var(--ink-muted)" }, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 1.8 }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", d: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.573-1.066z" }), /* @__PURE__ */ React.createElement("circle", { cx: "12", cy: "12", r: "3" })))))), hasData && state.ui.activeTab !== "pacing" && /* @__PURE__ */ React.createElement("div", { className: "border-t border-gray-200/40 dark:border-slate-700/40 glass-card-surface" }, /* @__PURE__ */ React.createElement("div", { className: "max-w-7xl mx-auto" }, /* @__PURE__ */ React.createElement(Filters, null))), actionsModal, notesHeadlessEl);
 }
 function Tabs() {
   const { state, actions } = useApp();
@@ -4568,6 +4619,7 @@ function Tabs() {
     { id: "notes", label: "Notes" },
     ...hasHist ? [{ id: "historical", label: "Historical" }] : [],
     { id: "targets", label: "Report" },
+    { id: "pacing", label: "Pacing" },
     { id: "weekly", label: "Weekly Brief" }
   ].filter((t) => !allowed || allowed.has(t.id));
   void accessTick;
@@ -7134,60 +7186,6 @@ function RegionQuarterTable() {
     }
     return pool;
   }, [histData, histAtrKey, histCcKey, histQKey, histBandKey, histSegKey, histFlag3kKey, histSubregionKey, histCsManagerKey, selectedFQ, selectedBand, selectedSubregions, selectedCsManager, rowsView, histArrFilter, histGlobalMatcher]);
-  const chartActiveRows = useMemo(() => {
-    let pool = validRows;
-    if (selectedBand && selectedBand !== "all") pool = pool.filter((r) => matchesBand_(r, selectedBand));
-    if (selectedCsManager && selectedCsManager !== "__ALL_CSM__") pool = pool.filter((r) => safeString(r[csManagerKey]) === selectedCsManager);
-    if (selectedSubregions.size > 0) pool = pool.filter((r) => selectedSubregions.has(safeString(r[subregionKey])));
-    return pool;
-  }, [validRows, selectedBand, atrKey, segKey, selectedCsManager, csManagerKey, selectedSubregions, subregionKey]);
-  const chartHistRows = useMemo(() => {
-    if (!histData || !histData.length) return [];
-    let pool = histData.filter((r) => toNumber(r[histAtrKey]) > 0 || toNumber(r[histCcKey]) > 0);
-    pool = pool.filter((r) => histGlobalMatcher(r, null));
-    if (selectedBand && selectedBand !== "all") pool = pool.filter((r) => matchesBand(r, selectedBand, histAtrKey, histSegKey, histFlag3kKey, histBandKey));
-    if (selectedSubregions.size > 0) pool = pool.filter((r) => selectedSubregions.has(safeString(r[histSubregionKey])));
-    if (selectedCsManager && selectedCsManager !== "__ALL_CSM__") pool = pool.filter((r) => safeString(r[histCsManagerKey]) === selectedCsManager);
-    if (histArrFilter) pool = pool.filter(histArrFilter);
-    return pool;
-  }, [histData, histAtrKey, histCcKey, histBandKey, histSegKey, histFlag3kKey, histSubregionKey, histCsManagerKey, selectedBand, selectedSubregions, selectedCsManager, histArrFilter, histGlobalMatcher]);
-  const forecastByQuarter = useMemo(() => {
-    const map = /* @__PURE__ */ new Map();
-    rowsView.forEach((r) => {
-      map.set(r.fq, { fq: r.fq, booked: 0, buFC: 0, djFC: 0, pendingAtr: 0, closedAtr: 0, pendingCount: 0, closedCount: 0, djOverrides: 0 });
-    });
-    chartActiveRows.forEach((r) => {
-      const fq = safeString(r[qKey]);
-      const entry = map.get(fq);
-      if (!entry) return;
-      const bu = toNumber(r[buKey]);
-      const atr = toNumber(r[atrKey]);
-      entry.buFC += bu;
-      entry.pendingAtr += atr;
-      entry.pendingCount += 1;
-      const nk = r.__noteKey;
-      const note = nk ? notes[nk] : null;
-      const dj = note && !note.archived && note.djForecast != null && isFinite(toNumber(note.djForecast)) ? toNumber(note.djForecast) : null;
-      if (dj !== null) {
-        entry.djFC += dj;
-        entry.djOverrides += 1;
-      } else {
-        entry.djFC += bu;
-      }
-    });
-    chartHistRows.forEach((r) => {
-      const fq = safeString(r[histQKey]);
-      const entry = map.get(fq);
-      if (!entry) return;
-      entry.booked += toNumber(r[histCcKey]);
-      entry.closedAtr += toNumber(r[histAtrKey]);
-      entry.closedCount += 1;
-    });
-    return Array.from(map.values()).sort((a, b) => {
-      const pa = parseFiscalLabel(a.fq), pb = parseFiscalLabel(b.fq);
-      return pa.fy !== pb.fy ? pa.fy - pb.fy : pa.fq - pb.fq;
-    });
-  }, [rowsView, chartActiveRows, chartHistRows, qKey, atrKey, buKey, histQKey, histAtrKey, histCcKey, notes]);
   const quarterPool = useMemo(() => {
     if (!selectedFQ) return [];
     if (selectedFQ === "__ALL_FQ__") return validRows;
@@ -7436,26 +7434,8 @@ function RegionQuarterTable() {
   }), "region-filter-chip-emerald"), _subActive && _mkChip("sub", selectedSubregions.size === 1 ? Array.from(selectedSubregions)[0] : selectedSubregions.size + " sub-regions", () => React.startTransition(() => setSelectedSubregions(/* @__PURE__ */ new Set()))), _csmActive && _mkChip("csm", selectedCsManager, () => React.startTransition(() => setSelectedCsManager("__ALL_CSM__"))), _arrActive && _mkChip("arr", _arrLabel, clearArrFilter), focusRows.length > 0 && /* @__PURE__ */ React.createElement("span", { key: "cnt", className: "region-filter-chip region-filter-chip-muted" }, focusRows.length.toLocaleString(), " accounts"), _anyFilterActive && /* @__PURE__ */ React.createElement("button", { key: "reset", type: "button", className: "region-filter-reset", onClick: (e) => {
     e.stopPropagation();
     resetAllRegionFilters();
-  } }, "Reset filters"))), !filtersCollapsed && /* @__PURE__ */ React.createElement("div", { className: "region-filter-sections" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-section region-filter-section-primary glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setFqOpen((p) => !p), className: "region-filter-section-head" }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${fqOpen ? "is-open" : ""}` }, "\u25BC"), /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-title" }, "Fiscal Quarters"), selectedFQ && /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-badge" }, selectedFQ === "__ALL_FQ__" ? "All quarters" : selectedFQ)), fqOpen && /* @__PURE__ */ React.createElement("div", { className: "region-filter-section-body" }, /* @__PURE__ */ React.createElement("div", { className: "region-fq-scroll" }, (() => {
-    const COLOR_BOOKED = "#6366f1";
-    const COLOR_BU = "#d97706";
-    const COLOR_DJ = "#8b5cf6";
-    const forecastByFQ = new Map(forecastByQuarter.map((q) => [q.fq, q]));
-    const fqMaxTotal = Math.max(1, ...forecastByQuarter.map((q) => Math.max(q.booked + q.buFC, q.booked + q.djFC)));
-    return rowsView.map((r, idx) => {
+  } }, "Reset filters"))), !filtersCollapsed && /* @__PURE__ */ React.createElement("div", { className: "region-filter-sections" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-section region-filter-section-primary glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", onClick: () => setFqOpen((p) => !p), className: "region-filter-section-head" }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${fqOpen ? "is-open" : ""}` }, "\u25BC"), /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-title" }, "Fiscal Quarters"), selectedFQ && /* @__PURE__ */ React.createElement("span", { className: "region-filter-section-badge" }, selectedFQ === "__ALL_FQ__" ? "All quarters" : selectedFQ)), fqOpen && /* @__PURE__ */ React.createElement("div", { className: "region-filter-section-body" }, /* @__PURE__ */ React.createElement("div", { className: "region-fq-scroll" }, rowsView.map((r) => {
       const active = r.fq === selectedFQ;
-      const target = (state.targets || {})[r.fq];
-      const fc = forecastByFQ.get(r.fq);
-      const booked = fc ? fc.booked : 0;
-      const buFC = fc ? fc.buFC : 0;
-      const djFC = fc ? fc.djFC : 0;
-      const totalBu = booked + buFC;
-      const totalDj = booked + djFC;
-      const widthPct = totalBu / fqMaxTotal * 100;
-      const bookedPct = totalBu > 0 ? booked / totalBu * 100 : 0;
-      const buPct = totalBu > 0 ? buFC / totalBu * 100 : 0;
-      const djTickPct = totalDj / fqMaxTotal * 100;
-      const showDjTick = totalDj > 0 && Math.abs(totalDj - totalBu) > 1;
       return /* @__PURE__ */ React.createElement(
         "button",
         {
@@ -7467,22 +7447,11 @@ function RegionQuarterTable() {
             "region-fq-card text-left rounded-lg px-2.5 py-1.5 transition border shrink-0",
             active ? "border-2 border-indigo-400 dark:border-indigo-500 bg-indigo-50/70 dark:bg-indigo-900/20" : "border-transparent bg-white/[0.15]"
           ].join(" "),
-          title: `${r.fq}: Booked ${formatCurrencyUSD(booked)} + BU FC ${formatCurrencyUSD(buFC)} = ${formatCurrencyUSD(totalBu)} | ELT total ${formatCurrencyUSD(totalDj)}`
+          title: "Filter to " + r.fq
         },
-        /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("span", { className: "font-medium text-xs truncate" }, r.fq), /* @__PURE__ */ React.createElement("span", { className: "text-[10px] tabular-nums text-gray-500 dark:text-gray-400 pill-chip" }, r.accounts.toLocaleString())),
-        /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500 dark:text-gray-400 mt-px tabular-nums" }, formatCurrencyUSD(r.atr), " \xB7 ", formatCurrencyUSD(r.bu), " BU"),
-        totalBu > 0 && /* @__PURE__ */ React.createElement("div", { className: "mt-1" }, /* @__PURE__ */ React.createElement("div", { className: "h-2 rounded-full glass-track overflow-hidden relative" }, /* @__PURE__ */ React.createElement("div", { className: "flex h-full", style: { width: `${widthPct.toFixed(2)}%` } }, booked > 0 && /* @__PURE__ */ React.createElement("div", { className: "h-full transition-all duration-300", style: { width: `${bookedPct.toFixed(2)}%`, backgroundColor: COLOR_BOOKED } }), buFC > 0 && /* @__PURE__ */ React.createElement("div", { className: "h-full transition-all duration-300", style: { width: `${buPct.toFixed(2)}%`, backgroundColor: COLOR_BU } })), showDjTick && /* @__PURE__ */ React.createElement(
-          "div",
-          {
-            className: "absolute top-0 bottom-0 pointer-events-none transition-all duration-300",
-            style: { left: `calc(${Math.min(djTickPct, 100).toFixed(2)}% - 1px)`, width: "2px", backgroundColor: COLOR_DJ, boxShadow: "0 0 0 1px rgba(255,255,255,0.55)" }
-          }
-        )), /* @__PURE__ */ React.createElement("div", { className: "text-[9px] mt-0.5 tabular-nums text-gray-500 dark:text-gray-400" }, formatCurrencyUSD(totalBu), showDjTick && /* @__PURE__ */ React.createElement(React.Fragment, null, " \xB7 ", /* @__PURE__ */ React.createElement("span", { style: { color: COLOR_DJ } }, "ELT ", formatCurrencyUSD(totalDj))))),
-        target > 0 && /* @__PURE__ */ React.createElement("div", { className: "text-[9px] mt-0.5 tabular-nums text-gray-400 dark:text-gray-500" }, formatPercent(r.atr / target), " of ", formatCurrencyUSD(target), " target"),
-        !active && /* @__PURE__ */ React.createElement("div", { className: "text-[9px] text-indigo-400 mt-0.5" }, "Click to drill in \u2192")
+        /* @__PURE__ */ React.createElement("span", { className: "font-medium text-xs truncate" }, r.fq)
       );
-    });
-  })(), rowsView.length > 1 && /* @__PURE__ */ React.createElement(
+    }), rowsView.length > 1 && /* @__PURE__ */ React.createElement(
     "button",
     {
       onClick: () => React.startTransition(() => {
@@ -7865,6 +7834,11 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
   const [newEntry, setNewEntry] = React.useState("");
   const [showRaw, setShowRaw] = React.useState(false);
   const [showForecast, setShowForecast] = React.useState(false);
+  const _rowFq = deriveFiscalFromQuarterLabel(row[qKey] || row.FISCAL_QUARTER || row.YEAR_QUARTER).fq;
+  const _cfNow = getCurrentFiscal();
+  const _currentQNow = "FY" + String(_cfNow.fy).padStart(2, "0") + "Q" + _cfNow.fq;
+  const isCurrentQCall = !!_rowFq && _rowFq === _currentQNow;
+  const [callOpen, setCallOpen] = React.useState(isCurrentQCall);
   const inputRef = React.useRef(null);
   React.useEffect(() => {
     if (inputRef.current) inputRef.current.focus();
@@ -8055,7 +8029,7 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
     _hasUpside ? ["Best case", fmtCompact(bestCase)] : null,
     _hasDownside ? ["Worst case", fmtCompact(worstCase)] : null,
     safeString(row[headerMap.DICTATED_BY]) ? ["Dictated by", safeString(row[headerMap.DICTATED_BY])] : null
-  ].filter(Boolean).map(([label, val]) => /* @__PURE__ */ React.createElement("div", { key: label, className: "flex justify-between items-baseline" }, /* @__PURE__ */ React.createElement("span", { className: "text-[10px] uppercase tracking-wider font-semibold text-gray-500 dark:text-gray-400" }, label), /* @__PURE__ */ React.createElement("span", { className: "text-xs font-medium text-gray-800 dark:text-gray-100" }, val)))), safeString(row[partnerKey]) && /* @__PURE__ */ React.createElement("div", { className: "space-y-1 pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Partner"), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-700 dark:text-gray-200" }, safeString(row[partnerKey]))), products.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-1 pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Products"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1" }, products.map((p, i) => /* @__PURE__ */ React.createElement("span", { key: `${p}-${i}`, className: "pill-chip pill-chip-muted" }, p)))), summaryText && /* @__PURE__ */ React.createElement("div", { className: "pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "flex items-center gap-1 text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-widest hover:text-gray-700 dark:hover:text-gray-300 transition-colors", onClick: () => setShowForecast(!showForecast) }, /* @__PURE__ */ React.createElement("svg", { className: `w-3 h-3 transition-transform ${showForecast ? "rotate-90" : ""}`, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor" }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M9 5l7 7-7 7" })), "Forecast Summary"), showForecast && /* @__PURE__ */ React.createElement("div", { className: "mt-1.5 text-[11px] text-gray-700 dark:text-gray-200 leading-relaxed" }, summaryText))), /* @__PURE__ */ React.createElement("div", { className: "acct-modal-main" }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 mb-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400 mb-1" }, "CS Forecast"), /* @__PURE__ */ React.createElement("input", { className: "w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-slate-900 text-xs font-bold px-2.5 py-1.5 tabular-nums", inputMode: "decimal", placeholder: "--", value: csDraft, onChange: (e) => setCsDraft(e.target.value), onFocus: () => setCsDraft(normDj(csDraft)), onBlur: () => {
+  ].filter(Boolean).map(([label, val]) => /* @__PURE__ */ React.createElement("div", { key: label, className: "flex justify-between items-baseline" }, /* @__PURE__ */ React.createElement("span", { className: "text-[10px] uppercase tracking-wider font-semibold text-gray-500 dark:text-gray-400" }, label), /* @__PURE__ */ React.createElement("span", { className: "text-xs font-medium text-gray-800 dark:text-gray-100" }, val)))), safeString(row[partnerKey]) && /* @__PURE__ */ React.createElement("div", { className: "space-y-1 pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Partner"), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-700 dark:text-gray-200" }, safeString(row[partnerKey]))), products.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-1 pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Products"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1" }, products.map((p, i) => /* @__PURE__ */ React.createElement("span", { key: `${p}-${i}`, className: "pill-chip pill-chip-muted" }, p)))), summaryText && /* @__PURE__ */ React.createElement("div", { className: "pt-2 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "flex items-center gap-1 text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-widest hover:text-gray-700 dark:hover:text-gray-300 transition-colors", onClick: () => setShowForecast(!showForecast) }, /* @__PURE__ */ React.createElement("svg", { className: `w-3 h-3 transition-transform ${showForecast ? "rotate-90" : ""}`, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor" }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M9 5l7 7-7 7" })), "Forecast Summary"), showForecast && /* @__PURE__ */ React.createElement("div", { className: "mt-1.5 text-[11px] text-gray-700 dark:text-gray-200 leading-relaxed" }, summaryText))), /* @__PURE__ */ React.createElement("div", { className: "acct-modal-main" }, !isCurrentQCall && /* @__PURE__ */ React.createElement("button", { type: "button", className: "flex items-center gap-2 w-full text-left mb-3 pb-2 border-b border-gray-100 dark:border-gray-700", onClick: () => setCallOpen((o) => !o), "aria-expanded": callOpen }, /* @__PURE__ */ React.createElement("svg", { className: `w-3 h-3 shrink-0 transition-transform ${callOpen ? "rotate-90" : ""}`, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor" }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M9 5l7 7-7 7" })), /* @__PURE__ */ React.createElement("span", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Adjust call"), /* @__PURE__ */ React.createElement("span", { className: "text-[11px] tabular-nums text-gray-500 truncate" }, "CS ", csDraft || "\u2014", " \u00b7 RN ", rnDraft || "\u2014", " \u00b7 ELT ", _hasCall ? fmtCurr(_eltComputed) : djDraft || "\u2014"), _rowFq && /* @__PURE__ */ React.createElement("span", { className: "ml-auto shrink-0 text-[9px] uppercase tracking-wider text-gray-400" }, _rowFq, " \u00b7 not current")), (isCurrentQCall || callOpen) && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 mb-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400 mb-1" }, "CS Forecast"), /* @__PURE__ */ React.createElement("input", { className: "w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-slate-900 text-xs font-bold px-2.5 py-1.5 tabular-nums", inputMode: "decimal", placeholder: "--", value: csDraft, onChange: (e) => setCsDraft(e.target.value), onFocus: () => setCsDraft(normDj(csDraft)), onBlur: () => {
     const raw = normDj(csDraft);
     setCsDraft(raw === "" ? "" : isFinite(toNumber(raw)) ? fmtCurr(toNumber(raw)) : "");
   }, onKeyDown: (e) => {
@@ -8107,7 +8081,7 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
       },
       onFocus: () => setDjDraft(normDj(djDraft))
     }
-  ), !_hasCall && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-indigo", onClick: () => setDjDraft(fmtCurr(bu)) }, "= BU FC"), !_hasCall && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-emerald", onClick: () => setDjDraft("$0") }, "Flat"), !_hasCall && djDraft && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-slate", onClick: () => setDjDraft("") }, "Clear"), _hasCall && /* @__PURE__ */ React.createElement("span", { className: "text-[10px] text-gray-400" }, "= CS + Renewals")), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement(
+  ), !_hasCall && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-indigo", onClick: () => setDjDraft(fmtCurr(bu)) }, "= BU FC"), !_hasCall && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-emerald", onClick: () => setDjDraft("$0") }, "Flat"), !_hasCall && djDraft && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-slate", onClick: () => setDjDraft("") }, "Clear"), _hasCall && /* @__PURE__ */ React.createElement("span", { className: "text-[10px] text-gray-400" }, "= CS + Renewals"))), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement(
     "input",
     {
       ref: inputRef,
@@ -9481,6 +9455,326 @@ function WeeklyBriefTab() {
   const casesRow = /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 lg:grid-cols-2 gap-3" }, bestCaseCard, worstCaseCard);
   return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, briefHeader, brief.warning && /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300" }, brief.warning), kpiRow, buRegionCard, trendCard, worsenedCard, newFcCard, casesRow);
 }
+function PacingTab() {
+  const { state, actions } = useApp();
+  const fmtC = fmtCompactDash;
+  const fmtMoney = fmtCompact;
+  const signed = (n) => (n >= 0 ? "+" : "\u2212") + fmtMoney(Math.abs(n));
+  const fmtPct0 = (v) => v == null || !isFinite(v) ? "\u2014" : v.toFixed(0) + "%";
+  const signedPp = (n) => n == null || !isFinite(n) ? "\u2014" : (n >= 0 ? "+" : "\u2212") + Math.abs(n).toFixed(0) + "pp";
+  const TIPS = {
+    expected: "Booked C/C + remaining BU FC. Full-quarter outlook, not year-to-date.",
+    fullTarget: "Maximum C/C loss budget for the quarter (not a quota to hit).",
+    vsCap: "Expected \u2212 full-quarter target. Same as leftover BU \u2212 leftover budget.",
+    capPace: "Will Expected land inside the C/C cap? Binding constraint when leftover BU exceeds leftover budget.",
+    booked: "QTD Churn & Contraction already closed (historical) in the selected band.",
+    budgetConsumed: "QTD C/C \u00f7 quarterly C/C target. How much of the loss budget has actually hit.",
+    bookClosed: "Done ATR \u00f7 (done + open ATR) on Historical for this quarter and band \u2014 same Done/Open split as the Historical tab.",
+    scope: "Uses the Band control on this tab (default 100K+ Official = BAND column, not ATR \u2265 $100K). Region filter is local to Pacing.",
+    regionFilter: "Scope KPIs and the table to selected regions. Empty = all four.",
+    bandFilter: "Same band list as Region. 100K+ Official follows the BAND field (100K+ / >100K), not a raw ATR cutoff.",
+    quarterComplete: "Calendar progress through the Zendesk FY quarter (linear).",
+    pacingGap: "Budget consumed % \u2212 quarter complete %. Vs calendar only \u2014 not a pass/fail when landing is over cap.",
+    projected: "Expected C/C \u00f7 loss budget. If pending BU holds, where you land vs the cap.",
+    leftover: "Leftover budget = cap \u2212 booked. Leftover BU = pending forecast. Difference = vs cap.",
+    remaining: "Open-book Bottoms-Up C/C forecast. Not ELT calls.",
+    target: "Your region C/C $ loss budget. Saves with planning data.",
+    status: "Landing is the constraint when leftover BU exceeds leftover budget. Realized pace is a back-load diagnostic, not a pass."
+  };
+  const regionSelectOptions = useMemo(() => PACING_REGIONS.map((r) => ({ label: r, value: r })), []);
+  const [selectedRegions, setSelectedRegions] = useState([]);
+  const [band, setBand] = useState("100k_official");
+  const [floatTip, setFloatTip] = useState(null);
+  const toggleRegion = (val) => {
+    setSelectedRegions((prev) => {
+      const next = new Set(prev);
+      next.has(val) ? next.delete(val) : next.add(val);
+      return Array.from(next);
+    });
+  };
+  const clearRegions = () => setSelectedRegions([]);
+  const activeRegions = selectedRegions.length ? selectedRegions.filter((r) => PACING_REGIONS.indexOf(r) >= 0) : PACING_REGIONS;
+  const hm = state.headerMap || {};
+  const histHM = state.historicalHeaderMap || {};
+  const qKey = hm.FISCAL_QUARTER || hm.YEAR_QUARTER || "YEAR_QUARTER";
+  const atrKey = hm.ATR_STARTING || "ATR_ARR_USD_STARTING";
+  const buKey = hm.BU_FC || "BU_FC";
+  const regionKey = hm.REGION || "REGION";
+  const histQKey = histHM.FISCAL_QUARTER || histHM.YEAR_QUARTER || "FISCAL_QUARTER";
+  const histAtrKey = histHM.ATR_STARTING || "ATR_ARR_USD_STARTING";
+  const histCcKey = histHM.CC || "CC";
+  const histRegionKey = histHM.REGION || "REGION";
+  const histDoneKey = histHM.DONE_DEAL || "DONE_DEAL";
+  const histLtgKey = histHM.ATR_LTG || "ATR_ARR_USD_LTG";
+  const bandKey = hm.BAND || hm.ATR_BAND || "BAND";
+  const segKey = hm.SEGMENT || "PRO_FORMA_MARKET_SEGMENT";
+  const flag3kKey = hm.FLAG_TOP3K || "FLAG_3K";
+  const histBandKey = histHM.BAND || histHM.ATR_BAND || "BAND";
+  const histSegKey = histHM.SEGMENT || "PRO_FORMA_MARKET_SEGMENT";
+  const histFlag3kKey = histHM.FLAG_TOP3K || "FLAG_3K";
+  const bandLabel = (BAND_OPTIONS.find((b) => b.value === band) || {}).label || "All accounts";
+  const passBand = (r, isHist) => {
+    if (!band || band === "all") return true;
+    if (isHist) return matchesBand(r, band, histAtrKey, histSegKey, histFlag3kKey, histBandKey);
+    return matchesBand(r, band, atrKey, segKey, flag3kKey, bandKey);
+  };
+  const cf = getCurrentFiscal();
+  const currentQ = "FY" + String(cf.fy).padStart(2, "0") + "Q" + cf.fq;
+  const quarters = useMemo(() => {
+    const qs = new Set();
+    const addQ = (label) => {
+      const n = deriveFiscalFromQuarterLabel(label).fq;
+      if (n) qs.add(n);
+    };
+    (state.data || []).forEach((r) => {
+      addQ(r[qKey]);
+      addQ(r.FISCAL_QUARTER);
+      addQ(r.YEAR_QUARTER);
+    });
+    (state.historicalData || []).forEach((r) => {
+      addQ(r[histQKey]);
+      addQ(r.FISCAL_QUARTER);
+      addQ(r.YEAR_QUARTER);
+    });
+    qs.add(currentQ);
+    return [...qs].sort((a, b) => {
+      const pa = parseFiscalLabel(a), pb = parseFiscalLabel(b);
+      return pa.fy !== pb.fy ? pa.fy - pb.fy : pa.fq - pb.fq;
+    });
+  }, [state.data, state.historicalData, qKey, histQKey, currentQ]);
+  const [quarter, setQuarter] = useState(currentQ);
+  useEffect(() => {
+    if (quarters.indexOf(quarter) < 0 && quarters.length) setQuarter(currentQ);
+  }, [quarters, quarter, currentQ]);
+  const parsed = parseFiscalLabel(quarter);
+  const elapsed = fiscalQuarterElapsed(parsed.fy, parsed.fq);
+  const targetsByQ = (state.regionCcTargets || {})[quarter] || {};
+  const pending = useMemo(() => {
+    const out = { AMER: { atr: 0, bu: 0, n: 0 }, EMEA: { atr: 0, bu: 0, n: 0 }, APAC: { atr: 0, bu: 0, n: 0 }, LATAM: { atr: 0, bu: 0, n: 0 }, Other: { atr: 0, bu: 0, n: 0 } };
+    (state.data || []).forEach((r) => {
+      const q = deriveFiscalFromQuarterLabel(r[qKey] || r.FISCAL_QUARTER || r.YEAR_QUARTER).fq;
+      if (q !== quarter) return;
+      if (!passBand(r, false)) return;
+      const atr = toNumber(r[atrKey]);
+      const rg = canonPacingRegion(r[regionKey]);
+      if (!out[rg]) out[rg] = { atr: 0, bu: 0, n: 0 };
+      out[rg].atr += atr;
+      out[rg].bu += toNumber(r[buKey]);
+      out[rg].n += 1;
+    });
+    return out;
+  }, [state.data, qKey, atrKey, buKey, regionKey, quarter, band, bandKey, segKey, flag3kKey]);
+  const booked = useMemo(() => {
+    const empty = () => ({ closedAtr: 0, openAtr: 0, cc: 0, n: 0, doneN: 0, openN: 0 });
+    const out = { AMER: empty(), EMEA: empty(), APAC: empty(), LATAM: empty(), Other: empty() };
+    (state.historicalData || []).forEach((r) => {
+      const q = deriveFiscalFromQuarterLabel(r[histQKey] || r.FISCAL_QUARTER || r.YEAR_QUARTER).fq;
+      if (q !== quarter) return;
+      if (!passBand(r, true)) return;
+      const atr = toNumber(r[histAtrKey]);
+      const cc = toNumber(r[histCcKey]);
+      const rg = canonPacingRegion(r[histRegionKey]);
+      if (!out[rg]) out[rg] = empty();
+      const done = isDoneDeal(r, histDoneKey, toNumber(r[histLtgKey]));
+      if (done) {
+        out[rg].closedAtr += atr;
+        out[rg].doneN += 1;
+      } else {
+        out[rg].openAtr += atr;
+        out[rg].openN += 1;
+      }
+      out[rg].cc += cc;
+      out[rg].n += 1;
+    });
+    return out;
+  }, [state.historicalData, histQKey, histAtrKey, histCcKey, histRegionKey, histDoneKey, histLtgKey, histBandKey, histSegKey, histFlag3kKey, quarter, band]);
+
+  const quarterCompletePct = parsed.fy ? elapsed * 100 : null;
+  const allRows = PACING_REGIONS.map((rg) => {
+    const p = pending[rg] || { atr: 0, bu: 0, n: 0 };
+    const b = booked[rg] || { closedAtr: 0, openAtr: 0, cc: 0, n: 0, doneN: 0, openN: 0 };
+    const pendingAtr = p.atr || 0;
+    const closedAtr = b.closedAtr || 0;
+    const openAtr = b.openAtr || 0;
+    const bookAtr = closedAtr + openAtr;
+    const bookClosedPct = bookAtr > 0 ? closedAtr / bookAtr * 100 : null;
+    const remaining = p.bu || 0;
+    const bookedCC = b.cc || 0;
+    const expected = bookedCC + remaining;
+    const targetRaw = targetsByQ[rg];
+    const target = targetRaw != null && targetRaw !== "" && isFinite(Number(targetRaw)) ? Number(targetRaw) : null;
+    const gapFull = target != null ? expected - target : null;
+    const budgetConsumedPct = target != null && target > 0 ? bookedCC / target * 100 : null;
+    const projectedPct = target != null && target > 0 ? expected / target * 100 : null;
+    const leftoverBudget = target != null ? target - bookedCC : null;
+    const pacingGapPp = budgetConsumedPct != null && quarterCompletePct != null && elapsed > 0 ? budgetConsumedPct - quarterCompletePct : null;
+    return { region: rg, pendingAtr, closedAtr, openAtr, bookAtr, bookClosedPct, pendingN: p.n, closedN: b.doneN || 0, openN: b.openN || 0, remaining, bookedCC, expected, target, gapFull, budgetConsumedPct, projectedPct, leftoverBudget, pacingGapPp };
+  });
+  const rows = allRows.filter((r) => activeRegions.indexOf(r.region) >= 0);
+  const targeted = rows.filter((r) => r.target != null);
+  const missingTargets = rows.filter((r) => r.target == null).map((r) => r.region);
+  const total = rows.reduce((s, r) => ({
+    pendingAtr: s.pendingAtr + r.pendingAtr,
+    closedAtr: s.closedAtr + r.closedAtr,
+    openAtr: s.openAtr + r.openAtr,
+    pendingN: s.pendingN + r.pendingN,
+    closedN: s.closedN + r.closedN,
+    remaining: s.remaining + r.remaining,
+    bookedCC: s.bookedCC + r.bookedCC,
+    expected: s.expected + r.expected
+  }), { pendingAtr: 0, closedAtr: 0, openAtr: 0, pendingN: 0, closedN: 0, remaining: 0, bookedCC: 0, expected: 0 });
+  total.bookAtr = total.closedAtr + total.openAtr;
+  total.bookClosedPct = total.bookAtr > 0 ? total.closedAtr / total.bookAtr * 100 : null;
+  total.target = targeted.length ? targeted.reduce((s, r) => s + r.target, 0) : null;
+  total.expectedTgt = targeted.length ? targeted.reduce((s, r) => s + r.expected, 0) : null;
+  total.bookedTgt = targeted.length ? targeted.reduce((s, r) => s + r.bookedCC, 0) : null;
+  total.remainingTgt = targeted.length ? targeted.reduce((s, r) => s + r.remaining, 0) : null;
+  total.gapFull = total.target != null ? total.expectedTgt - total.target : null;
+  total.budgetConsumedPct = total.target != null && total.target > 0 ? total.bookedTgt / total.target * 100 : null;
+  total.projectedPct = total.target != null && total.target > 0 ? total.expectedTgt / total.target * 100 : null;
+  total.leftoverBudget = total.target != null ? total.target - total.bookedTgt : null;
+  total.pacingGapPp = total.budgetConsumedPct != null && quarterCompletePct != null && elapsed > 0 ? total.budgetConsumedPct - quarterCompletePct : null;
+  const landingStatus = (r) => {
+    if (r.budgetConsumedPct == null && (r.gapFull == null)) return { txt: "Set a target", color: "#64748b" };
+    if (r.budgetConsumedPct != null && r.budgetConsumedPct >= 100) return { txt: "Budget exhausted", color: "#ef4444" };
+    const over = r.gapFull != null && r.gapFull > 0;
+    const under = r.pacingGapPp != null && r.pacingGapPp < 0;
+    if (over && under) return { txt: "Under-consuming \u00b7 over cap", color: "#d97706" };
+    if (over) return { txt: "Over cap", color: "#ef4444" };
+    if (r.gapFull != null && r.gapFull <= 0) {
+      if (r.pacingGapPp != null && r.pacingGapPp <= -5) return { txt: "Favorable", color: "#16a34a" };
+      if (r.pacingGapPp != null && r.pacingGapPp > 5) return { txt: "Hot pace \u00b7 under cap", color: "#d97706" };
+      return { txt: "Under cap", color: "#16a34a" };
+    }
+    if (r.pacingGapPp == null) return { txt: "\u2014", color: "#64748b" };
+    if (r.pacingGapPp <= -5) return { txt: "Under-consuming", color: "#16a34a" };
+    if (r.pacingGapPp <= 5) return { txt: "Near pace", color: "#d97706" };
+    return { txt: "Unfavorable", color: "#ef4444" };
+  };
+  const gapColor = (n) => n == null ? "#64748b" : n > 0 ? "#ef4444" : n < 0 ? "#16a34a" : "#64748b";
+  const paceGapColor = (pp) => pp == null ? "#64748b" : pp > 0 ? "#ef4444" : pp < 0 ? "#16a34a" : "#64748b";
+  const budgetConsumedColor = (pct) => pct == null ? "#64748b" : pct >= 100 ? "#ef4444" : pct >= 70 ? "#d97706" : "#6366f1";
+  const setTarget = (rg, raw) => {
+    const n = raw === "" ? null : Number(String(raw).replace(/[$,]/g, ""));
+    const nextQ = { ...(state.regionCcTargets || {})[quarter] || {} };
+    if (n == null || !isFinite(n)) delete nextQ[rg];
+    else nextQ[rg] = n;
+    actions.setRegionCcTargets({ ...(state.regionCcTargets || {}), [quarter]: nextQ });
+  };
+  const infoIcon = (label, info) => {
+    if (!info) return null;
+    const show = (e) => {
+      const r = e.currentTarget.getBoundingClientRect();
+      const width = 260;
+      let left = r.right - width;
+      if (left < 8) left = 8;
+      if (left + width > window.innerWidth - 8) left = window.innerWidth - width - 8;
+      const below = r.bottom + 8;
+      const top = below + 80 > window.innerHeight ? r.top - 8 : below;
+      setFloatTip({ text: info, left, top, placeUp: below + 80 > window.innerHeight });
+    };
+    return /* @__PURE__ */ React.createElement("span", { className: "kpi-info kpi-info-js", tabIndex: 0, role: "note", "aria-label": label + ": " + info, title: info, onMouseEnter: show, onFocus: show, onMouseLeave: () => setFloatTip(null), onBlur: () => setFloatTip(null) }, "\u24D8");
+  };
+  const kpiCard = (label, value, sub, accent, info) => /* @__PURE__ */ React.createElement("div", { className: "glass-kpi" },
+    /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-labelrow" }, /* @__PURE__ */ React.createElement("span", { className: "glass-kpi-label" }, label), infoIcon(label, info)),
+    /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-value", style: { color: accent || "#0ea5e9" } }, value),
+    sub ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub", style: { color: typeof sub === "object" ? sub.color : undefined } }, typeof sub === "object" ? sub.txt : sub) : null);
+  const totStatus = landingStatus(total);
+  const cell = (txt, cls) => /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 " + (cls || "") }, txt);
+  const th = (txt, cls, info) => /* @__PURE__ */ React.createElement("th", { className: "px-2 py-1.5 text-left font-semibold uppercase tracking-wider text-[9px] text-gray-500 " + (cls || ""), title: info || undefined }, info ? /* @__PURE__ */ React.createElement("span", { className: "inline-flex items-center gap-0.5" }, txt, infoIcon(txt, info)) : txt);
+  const otherN = ((pending.Other && pending.Other.n) || 0) + ((booked.Other && booked.Other.n) || 0);
+  const missingNote = missingTargets.length ? missingTargets.join(", ") + (missingTargets.length === 1 ? " has" : " have") + " no target \u2014 excluded from budget totals" : null;
+  const regionScopeLabel = activeRegions.length === PACING_REGIONS.length ? "All regions" : activeRegions.join(", ");
+  const bookClosedSub = total.bookClosedPct == null ? "No ATR in scope" : fmtC(total.closedAtr) + " done \u00b7 " + fmtC(total.openAtr) + " open";
+  const leftoverStory = total.leftoverBudget != null && total.remainingTgt != null ? "Leftover BU " + fmtC(total.remainingTgt) + " vs leftover budget " + fmtC(total.leftoverBudget) + (total.gapFull == null ? "" : " \u2192 " + signed(total.gapFull) + " vs cap") : null;
+  const storyBanner = leftoverStory ? /* @__PURE__ */ React.createElement("div", { className: "rounded-lg px-3 py-2 text-[11px]", style: { background: total.gapFull > 0 ? "rgba(217,119,6,0.08)" : "rgba(22,163,74,0.08)", color: total.gapFull > 0 ? "#b45309" : "#15803d" } }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, totStatus.txt, ". "), leftoverStory, ".", total.bookClosedPct != null ? " " + fmtPct0(total.bookClosedPct) + " of the book is closed." : "") : null;
+  const projectedColor = (pct) => pct == null ? "#64748b" : pct > 100 ? "#ef4444" : pct > 95 ? "#d97706" : "#16a34a";
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" },
+    /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3 flex flex-wrap items-end gap-3" },
+      /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-[220px]" },
+        /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold inline-flex items-center gap-1" }, "C/C pacing \u00b7 ", bandLabel, infoIcon("Scope", TIPS.scope)),
+        /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500 mt-0.5" }, "Landing vs cap is the constraint. Realized pace and % of book closed show how much of that landing is still a forecast.")),
+      /* @__PURE__ */ React.createElement("div", null,
+        /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Quarter"),
+        /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: quarter, onChange: (e) => setQuarter(e.target.value) },
+          quarters.map((q) => /* @__PURE__ */ React.createElement("option", { key: q, value: q }, q, q === currentQ ? " (current)" : "")))),
+      /* @__PURE__ */ React.createElement("div", { className: "min-w-[140px]" },
+        /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1 inline-flex items-center gap-0.5" }, "Region", infoIcon("Region filter", TIPS.regionFilter)),
+        /* @__PURE__ */ React.createElement(MultiSelect, { label: "Region", options: regionSelectOptions, selected: selectedRegions, onToggle: toggleRegion, onClear: clearRegions })),
+      /* @__PURE__ */ React.createElement("div", null,
+        /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1 inline-flex items-center gap-0.5" }, "Band", infoIcon("Band filter", TIPS.bandFilter)),
+        /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: band, onChange: (e) => setBand(e.target.value) },
+          BAND_OPTIONS.map((opt) => /* @__PURE__ */ React.createElement("option", { key: opt.value, value: opt.value }, opt.label))))),
+    storyBanner,
+    /* @__PURE__ */ React.createElement("div", { className: "space-y-3" },
+      /* @__PURE__ */ React.createElement("div", null,
+        /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold uppercase tracking-wider text-gray-500 mb-1.5 inline-flex items-center gap-1" }, "Realized (closed only)", infoIcon("Realized", TIPS.bookClosed)),
+        /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2" },
+          kpiCard("Budget consumed", fmtPct0(total.budgetConsumedPct), total.target == null ? "Set region targets" : fmtC(total.bookedCC) + " of " + fmtC(total.target) + " budget", budgetConsumedColor(total.budgetConsumedPct), TIPS.budgetConsumed),
+          kpiCard("Book closed", fmtPct0(total.bookClosedPct), bookClosedSub, "#0ea5e9", TIPS.bookClosed),
+          kpiCard("Quarter complete", fmtPct0(quarterCompletePct), regionScopeLabel, "#64748b", TIPS.quarterComplete),
+          kpiCard("Pacing gap", signedPp(total.pacingGapPp), { txt: totStatus.txt, color: totStatus.color }, paceGapColor(total.pacingGapPp), TIPS.pacingGap))),
+      /* @__PURE__ */ React.createElement("div", null,
+        /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold uppercase tracking-wider text-gray-500 mb-1.5 inline-flex items-center gap-1" }, "Projected landing (closed + pending BU)", infoIcon("Projected landing", TIPS.projected)),
+        /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2" },
+          kpiCard("Expected C/C", fmtC(total.expected), "Remaining BU " + fmtC(total.remaining) + " \u00b7 " + total.pendingN.toLocaleString() + " pending", "#0ea5e9", TIPS.expected),
+          kpiCard("Projected consumption", fmtPct0(total.projectedPct), total.target == null ? "Set region targets" : "Expected \u00f7 loss budget", projectedColor(total.projectedPct), TIPS.projected),
+          kpiCard("Loss budget", total.target == null ? "\u2014" : fmtC(total.target), targeted.length ? targeted.length + " of " + rows.length + " regions" : "Set region targets", "#8b5cf6", TIPS.fullTarget),
+          kpiCard("vs cap", total.gapFull == null ? "\u2014" : signed(total.gapFull), totStatus, gapColor(total.gapFull), TIPS.vsCap))),
+      leftoverStory ? /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500 inline-flex items-center gap-1" }, infoIcon("Leftover budget vs leftover BU", TIPS.leftover), leftoverStory) : null),
+    (missingNote || otherN > 0) && /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500 space-y-0.5" },
+      missingNote ? /* @__PURE__ */ React.createElement("div", null, missingNote) : null,
+      otherN > 0 ? /* @__PURE__ */ React.createElement("div", null, "Other region: ", otherN, " accounts not in AMER / EMEA / APAC / LATAM \u2014 excluded from totals.") : null),
+    /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
+      /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold inline-flex items-center gap-1 flex-wrap" }, "By region \u00b7 ", quarter, " \u00b7 ", bandLabel, " \u00b7 ", regionScopeLabel, infoIcon("Scope", TIPS.scope)),
+      /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
+        /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" },
+          th("Region"),
+          th("Loss budget $", "text-right", TIPS.target),
+          th("Booked C/C", "text-right", TIPS.booked),
+          th("Consumed", "text-right", TIPS.budgetConsumed),
+          th("Book closed", "text-right", TIPS.bookClosed),
+          th("Qtr complete", "text-right", TIPS.quarterComplete),
+          th("Pacing gap", "text-right", TIPS.pacingGap),
+          th("Status", "", TIPS.status),
+          th("Projected", "text-right", TIPS.projected),
+          th("Expected", "text-right", TIPS.expected),
+          th("vs cap", "text-right", TIPS.vsCap),
+          th("Remaining BU", "text-right", TIPS.remaining))),
+        /* @__PURE__ */ React.createElement("tbody", null,
+          rows.map((r) => {
+            const st = landingStatus(r);
+            return /* @__PURE__ */ React.createElement("tr", { key: r.region, className: "glass-row-accent" },
+              cell(r.region, "font-medium"),
+              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right" }, /* @__PURE__ */ React.createElement("input", { className: "filter-input text-xs w-28 text-right tabular-nums", type: "number", step: "1000", min: "0", placeholder: "\u2014", value: r.target == null ? "" : r.target, onChange: (e) => setTarget(r.region, e.target.value) })),
+              cell(fmtC(r.bookedCC), "text-right tabular-nums"),
+              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums font-semibold", style: { color: budgetConsumedColor(r.budgetConsumedPct) } }, fmtPct0(r.budgetConsumedPct)),
+              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: "#0ea5e9" } }, fmtPct0(r.bookClosedPct)),
+              cell(fmtPct0(quarterCompletePct), "text-right tabular-nums text-gray-500"),
+              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: paceGapColor(r.pacingGapPp) } }, signedPp(r.pacingGapPp)),
+              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5", style: { color: st.color } }, st.txt),
+              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums font-semibold", style: { color: projectedColor(r.projectedPct) } }, fmtPct0(r.projectedPct)),
+              cell(fmtC(r.expected), "text-right tabular-nums"),
+              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: gapColor(r.gapFull) } }, r.gapFull == null ? "\u2014" : signed(r.gapFull)),
+              cell(fmtC(r.remaining), "text-right tabular-nums"));
+          }),
+          rows.length > 1 && /* @__PURE__ */ React.createElement("tr", { className: "font-bold border-t-2", style: { borderColor: "var(--border)" } },
+            cell("Total"),
+            cell(total.target == null ? "\u2014" : fmtC(total.target), "text-right tabular-nums"),
+            cell(fmtC(total.bookedCC), "text-right tabular-nums"),
+            /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: budgetConsumedColor(total.budgetConsumedPct) } }, fmtPct0(total.budgetConsumedPct)),
+            /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: "#0ea5e9" } }, fmtPct0(total.bookClosedPct)),
+            cell(fmtPct0(quarterCompletePct), "text-right tabular-nums text-gray-500"),
+            /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: paceGapColor(total.pacingGapPp) } }, signedPp(total.pacingGapPp)),
+            /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5", style: { color: totStatus.color } }, totStatus.txt),
+            /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: projectedColor(total.projectedPct) } }, fmtPct0(total.projectedPct)),
+            cell(fmtC(total.expected), "text-right tabular-nums"),
+            /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: gapColor(total.gapFull) } }, total.gapFull == null ? "\u2014" : signed(total.gapFull)),
+            cell(fmtC(total.remaining), "text-right tabular-nums")))))),
+    /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500" }, "Three clocks: budget consumed (C/C $), book closed (ATR), quarter complete (calendar). Landing = Expected \u00f7 budget. Favorable only when leftover BU is also under leftover budget. Zendesk FY ends 31 Jan."),
+    floatTip ? ReactDOM.createPortal(/* @__PURE__ */ React.createElement("div", { className: "pacing-float-tip", style: { left: floatTip.left, top: floatTip.top, transform: floatTip.placeUp ? "translateY(-100%)" : undefined } }, floatTip.text), document.body) : null
+  );
+}
 function App() {
   const { state, actions, idbReady, serverInfo } = useApp();
   const { csvAutoLoadStatus } = useAppStatus();
@@ -9527,7 +9821,7 @@ function App() {
       hasNotes: false
     }));
   }, [hasData, gateStep, actions]);
-  return /* @__PURE__ */ React.createElement("div", { className: "min-h-full region-font" }, gateStep === "loading" && /* @__PURE__ */ React.createElement("div", { className: "splash-shell", style: { display: "flex", alignItems: "center", justifyContent: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", color: "var(--muted)" } }, /* @__PURE__ */ React.createElement("svg", { className: "mx-auto mb-3 animate-spin", width: "32", height: "32", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2" }, /* @__PURE__ */ React.createElement("path", { d: "M21 12a9 9 0 11-6.219-8.56" })), /* @__PURE__ */ React.createElement("div", { style: { fontSize: "0.9rem", fontWeight: 600 } }, "Restoring your session..."))), /* @__PURE__ */ React.createElement("div", { className: `app-shell ${gateStep !== "done" ? "is-hidden" : ""}` }, /* @__PURE__ */ React.createElement(Header, null), /* @__PURE__ */ React.createElement("main", { className: "max-w-7xl mx-auto px-4 pt-4 pb-6 space-y-4" }, !hasData && /* @__PURE__ */ React.createElement(NoDataBanner, null), /* @__PURE__ */ React.createElement(React.Fragment, null, state.ui.activeTab === "partner" && /* @__PURE__ */ React.createElement(Partner, null), state.ui.activeTab === "accounts" && /* @__PURE__ */ React.createElement(Accounts, null), state.ui.activeTab === "region" && /* @__PURE__ */ React.createElement(RegionQuarterTable, null), state.ui.activeTab === "notes" && /* @__PURE__ */ React.createElement(NotesHub, null), state.ui.activeTab === "historical" && /* @__PURE__ */ React.createElement(HistoricalTab, null), state.ui.activeTab === "targets" && /* @__PURE__ */ React.createElement(TargetsTab, null), state.ui.activeTab === "weekly" && /* @__PURE__ */ React.createElement(WeeklyBriefTab, null)), /* @__PURE__ */ React.createElement("footer", { className: "text-xs text-gray-500 dark:text-gray-400 text-center pt-6" }, "Data, notes, targets, and settings persist in your browser. Use Reset to clear everything.")), /* @__PURE__ */ React.createElement(ColumnsDrawer, null)), /* @__PURE__ */ React.createElement(RefreshOverlay, null));
+  return /* @__PURE__ */ React.createElement("div", { className: "min-h-full region-font" }, gateStep === "loading" && /* @__PURE__ */ React.createElement("div", { className: "splash-shell", style: { display: "flex", alignItems: "center", justifyContent: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", color: "var(--muted)" } }, /* @__PURE__ */ React.createElement("svg", { className: "mx-auto mb-3 animate-spin", width: "32", height: "32", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2" }, /* @__PURE__ */ React.createElement("path", { d: "M21 12a9 9 0 11-6.219-8.56" })), /* @__PURE__ */ React.createElement("div", { style: { fontSize: "0.9rem", fontWeight: 600 } }, "Restoring your session..."))), /* @__PURE__ */ React.createElement("div", { className: `app-shell ${gateStep !== "done" ? "is-hidden" : ""}` }, /* @__PURE__ */ React.createElement(Header, null), /* @__PURE__ */ React.createElement("main", { className: "max-w-7xl mx-auto px-4 pt-4 pb-6 space-y-4" }, !hasData && /* @__PURE__ */ React.createElement(NoDataBanner, null), /* @__PURE__ */ React.createElement(React.Fragment, null, state.ui.activeTab === "partner" && /* @__PURE__ */ React.createElement(Partner, null), state.ui.activeTab === "accounts" && /* @__PURE__ */ React.createElement(Accounts, null), state.ui.activeTab === "region" && /* @__PURE__ */ React.createElement(RegionQuarterTable, null), state.ui.activeTab === "notes" && /* @__PURE__ */ React.createElement(NotesHub, null), state.ui.activeTab === "historical" && /* @__PURE__ */ React.createElement(HistoricalTab, null), state.ui.activeTab === "targets" && /* @__PURE__ */ React.createElement(TargetsTab, null), state.ui.activeTab === "pacing" && /* @__PURE__ */ React.createElement(PacingTab, null), state.ui.activeTab === "weekly" && /* @__PURE__ */ React.createElement(WeeklyBriefTab, null)), /* @__PURE__ */ React.createElement("footer", { className: "text-xs text-gray-500 dark:text-gray-400 text-center pt-6" }, "Data, notes, targets, and settings persist in your browser. Use Reset to clear everything.")), /* @__PURE__ */ React.createElement(ColumnsDrawer, null)), /* @__PURE__ */ React.createElement(RefreshOverlay, null));
 }
 function NoDataBanner() {
   return /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-4 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 text-[13px] text-amber-800 dark:text-amber-200" }, /* @__PURE__ */ React.createElement("svg", { width: "18", height: "18", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round", style: { flexShrink: 0 } }, /* @__PURE__ */ React.createElement("path", { d: "M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" }), /* @__PURE__ */ React.createElement("line", { x1: "12", y1: "9", x2: "12", y2: "13" }), /* @__PURE__ */ React.createElement("line", { x1: "12", y1: "17", x2: "12.01", y2: "17" })), /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, "No data loaded yet"), " \u2014 load it from Admin (CSV upload or Snowflake \u2018Run now\u2019).")), /* @__PURE__ */ React.createElement("a", { href: "/admin", className: "smallbtn smallbtn-indigo whitespace-nowrap", style: { textDecoration: "none" } }, "Go to Admin"));

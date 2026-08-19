@@ -535,6 +535,109 @@ Session 11 — 2026-08-11
   wins over it via `effective_conn`, so the UI is now the source of truth.
 ```
 
+```
+Session 12 — 2026-08-18 (cache-buster v=20260818b)
+- User asked for: Pacing tab two-gauge layout (land vs full-quarter cap as
+  headline; booked vs plan-to-date as realized) + concise ⓘ tooltips on
+  every calc, and fix calc accuracy (headline was Expected vs linear
+  plan-to-date, which painted Q3 red at ~19% elapsed).
+- Delivered (frontend-only, `public/vendor/app.js` PacingTab): two KPI groups
+  (Land vs cap: Expected / Full-qtr target / vs cap+Under|Near|Over cap;
+  Realized so far: Booked / Plan-to-date / vs time+time-budget labels).
+  Table reordered to Region | Target | Expected | vs cap | Cap pace |
+  Booked | Plan-to-date | vs time | Remaining BU. Remaining BU kept as
+  Expected sub-line + table column. kpi-info tips on KPIs, elapsed chip,
+  100K+ header, and every calc table header (plus native title= for
+  overflow-x clip). Headline Cap pace uses gapFull vs full target (Near
+  cap = over by <5% of full target). Realized uses gapTime = booked −
+  plan-to-date; elapsed=0 or plan-to-date=0 ⇒ "—" (no booked-vs-$0
+  "behind"). Totals: Expected/Booked/Remaining still sum all 4 regions;
+  vs-cap / vs-time / plan-to-date / Cap pace only include regions with a
+  target; muted note lists missing targets. Other-region n>0 gets a muted
+  note (not dumped into AMER). Booked 100K+ filter simplified to
+  ATR >= PACING_ARR_FLOOR. Unused pctS removed. Remaining stays BU FC
+  (not ELT); scope still ignores the Filters bar.
+- Verified: node --check public/vendor/app.js clean. No Python change ⇒
+  NO server restart. Cache-buster 20260818a → 20260818b. Zip rebuilt
+  excluding github_cx, ingress.yaml, .git, .venv, __pycache__, zips,
+  DS_Store.
+- Open question / TODO: none. Residual risks — (1) if a region lacks a
+  target, Expected KPI still includes it while vs-cap excludes it (note
+  explains); (2) linear time only, no seasonality; (3) Other-region
+  accounts are noted but never folded into the 4-region table.
+```
+
+```
+Session 13 — 2026-08-19 (cache-buster v=20260819a)
+- User asked for: (a) local Region multi-select on Pacing (next to Quarter);
+  hide the global Filters bar on the Pacing tab; (b) reframe primary pacing
+  as C/C Loss Budget Consumption vs calendar progress (not ATR/time or
+  booked-vs-plan-to-date $).
+- Delivered (frontend-only): Header hides `<Filters />` when
+  `activeTab === "pacing"`. PacingTab adds `MultiSelect` region control
+  (empty = all four; scopes KPIs + table). Primary row **C/C pace vs
+  budget**: Budget consumed % = QTD C/C ÷ loss budget; Quarter complete
+  %; Pacing gap (pp) = consumed − complete (negative = favorable);
+  labels Favorable / Near pace / Unfavorable / Budget exhausted (100%+).
+  Secondary row **Forward outlook (land vs cap)** (Expected / loss budget /
+  vs cap). Table reordered for budget pace columns + forward outlook.
+  Tooltips updated; target column renamed loss budget.
+- Verified: node --check clean. No Python change ⇒ NO server restart.
+  Cache-buster 20260818b → 20260819a. Zip rebuilt.
+- Open question / TODO: paired forward-looking **Risk Resolution /
+  Forecast Maturity** metric — discussed, not built this session.
+```
+
+```
+Session 14 — 2026-08-19 (cache-buster v=20260819b)
+- User asked for: (a) make realized vs outlook cohesive — don't grade
+  Favorable when landing is over cap; (b) add % of ATR / book closed as a
+  third clock next to budget consumed and quarter complete.
+- Delivered (frontend-only, PacingTab): closed ATR now summed from
+  historical 100K+ rows. **Book closed** = closed ATR ÷ (closed + pending
+  ATR). Realized row: consumed / book closed / quarter complete / pacing
+  gap. Projected row: Expected / projected consumption (Expected÷budget) /
+  loss budget / vs cap. Compound **Status** (Favorable only if leftover BU
+  also under leftover budget; else "Under-consuming · over cap"). Story
+  banner + leftover BU vs leftover budget identity. Table columns match.
+- Verified: node --check clean. No Python change. Cache-buster a → b.
+  Zip rebuilt.
+- Open question / TODO: none. Residual — current-quarter accounts in both
+  active and historical CSVs would inflate book ATR if they are not a
+  clean done-vs-pending split.
+```
+
+```
+Session 15 — 2026-08-19 (cache-buster v=20260819c)
+- User asked for: (a) collapse CS/RN/ELT on the account modal for
+  non-current-quarter rows into Adjust call; (b) fix Book closed % (was
+  50% because hist 100K+ ATR was treated as closed and active 100K+ as
+  open — same book twice); (c) table ⓘ tooltips clipped by overflow-x.
+- Delivered: AccountNoteModal keeps full call editor on current FY
+  quarter; otherwise collapsed Adjust call (same fields, same Done/PUT).
+  Book closed = Historical done ATR ÷ (done + open ATR) via isDoneDeal
+  (LTG==0 OR DONE_DEAL), 100K+ / region / quarter — same split as
+  Historical. Pacing tips portaled to document.body (kpi-info-js).
+- Verified: node --check clean. Cache-buster b → c. Zip rebuilt.
+- Open question / TODO: none.
+```
+
+```
+Session 16 — 2026-08-19 (cache-buster v=20260819d)
+- User asked for: (a) Pacing 100K+ must use the 100K+ Official band, not
+  ATR ≥ $100K (Region ATR totals were not matching); (b) a Band filter on
+  Pacing; (c) Region fiscal-quarter preview cards showed unfiltered
+  sums/counts (4,086 / $293.8M vs 740 / $198.9M with Official on) — remove
+  those preview numbers to reduce confusion.
+- Delivered (frontend-only): Pacing pending + booked + book-closed now
+  use matchesBand (default `100k_official` = BAND column). Local Band
+  <select> next to Quarter/Region (same BAND_OPTIONS as Region). Quarter
+  picker cards are FY labels only (no account chip, ATR/BU, bars, ELT).
+- Verified: node --check clean. No Python change ⇒ NO server restart.
+  Cache-buster c → d. Zip rebuilt.
+- Open question / TODO: none.
+```
+
 ---
 
 ## 3. Communication protocol

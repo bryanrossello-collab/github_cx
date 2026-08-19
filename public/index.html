@@ -2273,9 +2273,10 @@
         scroll-behavior: smooth;
       }
       .region-fq-card {
-        flex: 0 0 180px;
-        width: 180px;
-        max-width: 180px;
+        flex: 0 0 auto;
+        min-width: 5.5rem;
+        width: auto;
+        max-width: none;
       }
       .region-main-panel {
         width: 100%;
@@ -2404,6 +2405,30 @@
         visibility: visible;
         transform: translateY(0);
       }
+      .kpi-info.kpi-info-js::after {
+        display: none !important;
+        content: none;
+      }
+      .pacing-float-tip {
+        position: fixed;
+        z-index: 400;
+        width: max-content;
+        max-width: 260px;
+        background: rgba(17, 24, 39, 0.97);
+        color: #fff;
+        font-size: 11px;
+        font-weight: 400;
+        line-height: 1.45;
+        padding: 8px 10px;
+        border-radius: 8px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+        pointer-events: none;
+        text-align: left;
+      }
+      html.dark .pacing-float-tip {
+        background: rgba(30, 41, 59, 0.98);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+      }
       /* ---- Weekly Brief: BU-forecast trend chart ---------------------- */
       .wb-trend-headline {
         display: flex;
@@ -2498,7 +2523,7 @@
     <script src="vendor/vibe-session-lock.js"></script>
 
     <!-- App (compiled from app.jsx by ./build.sh) -->
-    <script src="vendor/app.js?v=20260817b"></script>
+    <script src="vendor/app.js?v=20260819d"></script>
 
     <!--
       Container-mode toolbar tweaks. Mounted after the React app so we can
@@ -3216,6 +3241,7 @@
             rateTargets: peek.rateTargets || {},
             ccData: peek.ccData || {},
             expansionTargets: peek.expansionTargets || {},
+            regionCcTargets: peek.regionCcTargets || {},
           };
         }
 
@@ -3225,7 +3251,8 @@
             Object.keys(obj.targets || {}).length ||
             Object.keys(obj.rateTargets || {}).length ||
             Object.keys(obj.ccData || {}).length ||
-            Object.keys(obj.expansionTargets || {}).length
+            Object.keys(obj.expansionTargets || {}).length ||
+            Object.keys(obj.regionCcTargets || {}).length
           );
         }
 
@@ -3239,6 +3266,9 @@
             if (data.ccData && actions.setCcData) actions.setCcData(data.ccData);
             if (data.expansionTargets && actions.setExpansionTargets) {
               actions.setExpansionTargets(data.expansionTargets);
+            }
+            if (data.regionCcTargets && actions.setRegionCcTargets) {
+              actions.setRegionCcTargets(data.regionCcTargets);
             }
           } finally {
             _planningSuppressPut = false;
@@ -3281,6 +3311,7 @@
           actions.setRateTargets = wrap(actions.setRateTargets);
           actions.setCcData = wrap(actions.setCcData);
           actions.setExpansionTargets = wrap(actions.setExpansionTargets);
+          actions.setRegionCcTargets = wrap(actions.setRegionCcTargets);
           actions.__planningWrapped = true;
         }
 
@@ -3303,6 +3334,7 @@
                   rateTargets: remote.rateTargets || {},
                   ccData: remote.ccData || {},
                   expansionTargets: remote.expansionTargets || {},
+                  regionCcTargets: remote.regionCcTargets || {},
                 });
               } catch (_) {}
             } else if (localHas) {
