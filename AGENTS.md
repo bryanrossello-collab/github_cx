@@ -638,6 +638,60 @@ Session 16 — 2026-08-19 (cache-buster v=20260819d)
 - Open question / TODO: none.
 ```
 
+```
+Session 17 — 2026-08-19 (cache-buster v=20260819e)
+- User asked for: Pacing loss-budget edits (e.g. AMER 1520000 → 15200000)
+  revert on hard refresh / redeploy.
+- Root cause: planning PUT peeked React state in the same tick as setState
+  (still the old 1520000), matched the last saved payload, and skipped the
+  write — Postgres kept the typo; refresh always re-applies remote.
+- Delivered: schedulePlanningPut now peeks inside the 800ms flush (after
+  React has committed); queue PUTs that happen before planning has loaded;
+  pagehide keepalive flush. Frontend-only (`public/index.html`).
+- Verified: no Python change ⇒ NO server restart. Cache-buster d → e.
+- Open question / TODO: none. After deploy, re-enter 15200000 once and wait
+  ~1s so the corrected value actually lands in Postgres.
+```
+
+```
+Session 18 — 2026-08-19 (cache-buster v=20260819f)
+- User asked for: account-modal Updates not capturing (type + Add/Enter,
+  then Done) — LATAM Airlines example.
+- Root cause: (1) Done saved noteDraft only, discarding text still in the
+  composer; (2) Last-saved timestamp on that note is in the future
+  (2029), so newer-wins on client + Postgres WHERE updated_at <=
+  incoming dropped the 2026 save.
+- Delivered: composer flushes into the note on Add and Done; Add is
+  type=button and reads the live input; save timestamp is
+  max(now, existing+1). Frontend-only.
+- Verified: node --check clean. Cache-buster e → f.
+- Open question / TODO: none.
+```
+
+```
+Session 19 — 2026-08-19 (cache-buster v=20260819g)
+- User asked for: Pacing projected landing as three replicated KPI rows
+  (Best Case, BU FC, Worst Case), same glass tiles as today, not a new
+  visual; missing UPSIDE/DOWNSIDE default to 0.
+- Delivered: pending loop sums UPSIDE + DOWNSIDE (toNumber → 0 if blank).
+  Remaining Best = BU+UPSIDE, Worst = BU+DOWNSIDE, landing = booked +
+  remaining. Same 4-tile row (Expected / Projected % / Loss budget /
+  vs cap) × 3. Banner + Status stay BU-based. Table replaces Expected +
+  Projected % with Best Case / BU FC / Worst Case. Frontend-only.
+- Verified: node --check clean. No Python change ⇒ NO server restart.
+  Cache-buster f → g.
+- Open question / TODO: none.
+```
+
+```
+Session 20 — 2026-08-19 (cache-buster v=20260819h)
+- User asked for: rename Pacing “Book closed” → “Closed renewal”.
+- Delivered: KPI, table header, banner, intro, and footer copy. Math
+  unchanged. Frontend-only.
+- Verified: node --check clean. Cache-buster g → h.
+- Open question / TODO: none.
+```
+
 ---
 
 ## 3. Communication protocol

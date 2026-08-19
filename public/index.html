@@ -2523,7 +2523,7 @@
     <script src="vendor/vibe-session-lock.js"></script>
 
     <!-- App (compiled from app.jsx by ./build.sh) -->
-    <script src="vendor/app.js?v=20260819d"></script>
+    <script src="vendor/app.js?v=20260819h"></script>
 
     <!--
       Container-mode toolbar tweaks. Mounted after the React app so we can
@@ -3232,6 +3232,7 @@
         let _planningSuppressPut = false;
         let _planningLastPut = '';
         let _planningPutTimer = null;
+        let _planningPutQueued = false;
 
         function planningPayloadFromPeek() {
           const peek = window.__renewalsPeekState && window.__renewalsPeekState();
@@ -3276,25 +3277,33 @@
         }
 
         function schedulePlanningPut() {
+          if (_planningSuppressPut) return;
+          if (!_planningLoaded) {
+            _planningPutQueued = true;
+            return;
+          }
+          clearTimeout(_planningPutTimer);
+          _planningPutTimer = setTimeout(flushPlanningPut, PLANNING_PUT_MS);
+        }
+
+        async function flushPlanningPut() {
           if (_planningSuppressPut || !_planningLoaded) return;
           const payload = planningPayloadFromPeek();
           if (!payload) return;
           let serialized;
           try { serialized = JSON.stringify(payload); } catch (_) { return; }
           if (serialized === _planningLastPut) return;
-          clearTimeout(_planningPutTimer);
-          _planningPutTimer = setTimeout(async function () {
-            try {
-              const res = await fetch('/api/renewals/planning-data', {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: serialized,
-              });
-              if (!res.ok) return;
-              const json = await res.json();
-              if (json && json.ok) _planningLastPut = serialized;
-            } catch (_) {}
-          }, PLANNING_PUT_MS);
+          try {
+            const res = await fetch('/api/renewals/planning-data', {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: serialized,
+              keepalive: true,
+            });
+            if (!res.ok) return;
+            const json = await res.json();
+            if (json && json.ok) _planningLastPut = serialized;
+          } catch (_) {}
         }
 
         function wrapPlanningActions(actions) {
@@ -3338,10 +3347,14 @@
                 });
               } catch (_) {}
             } else if (localHas) {
-              schedulePlanningPut();
+              _planningPutQueued = true;
             }
           } catch (_) {}
           _planningLoaded = true;
+          if (_planningPutQueued) {
+            _planningPutQueued = false;
+            schedulePlanningPut();
+          }
         }
 
         function ensurePlanningSync() {
@@ -3351,6 +3364,11 @@
           if (!_planningLoaded) loadPlanningData();
           return true;
         }
+
+        window.addEventListener('pagehide', function () {
+          if (!_planningLoaded || _planningSuppressPut) return;
+          flushPlanningPut();
+        });
 
         function parseMoneyInput(raw) {
           if (raw == null || raw === '') return null;

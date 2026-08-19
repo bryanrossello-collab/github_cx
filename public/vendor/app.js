@@ -7891,14 +7891,16 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
     return out;
   }, [callHistory]);
   const handleAddEntry = () => {
-    const text = newEntry.trim();
+    const text = ((newEntry || "").trim() || (inputRef.current ? String(inputRef.current.value || "").trim() : ""));
     if (!text) return;
     setNoteDraft((prev) => prependNoteEntry(prev, text));
     setNewEntry("");
+    if (inputRef.current) inputRef.current.value = "";
   };
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      e.stopPropagation();
       handleAddEntry();
     }
   };
@@ -7907,8 +7909,15 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
       alert("Missing stable key");
       return;
     }
+    const pending = ((newEntry || "").trim() || (inputRef.current ? String(inputRef.current.value || "").trim() : ""));
+    const noteToSave = pending ? prependNoteEntry(noteDraft, pending) : noteDraft;
+    if (pending) {
+      setNoteDraft(noteToSave);
+      setNewEntry("");
+    }
     const djRaw = normDj(djDraft);
     const djVal = djRaw === "" ? null : toNumber(djRaw);
+    const prevTs = Number(existing && existing.updatedAt) || 0;
     onSave(nk, {
       accountId: safeString(row[acctIdKey]),
       accountName: safeString(row[acctKey]),
@@ -7916,10 +7925,10 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
       renewalDate: safeString(row[dateKey]),
       fq: safeString(row[qKey]),
       atr,
-      note: noteDraft,
+      note: noteToSave,
       djForecast: _hasCall ? null : djVal !== null && isFinite(djVal) ? djVal : null,
       archived: false,
-      updatedAt: Date.now()
+      updatedAt: Math.max(Date.now(), prevTs + 1)
     });
     if (_callKey && _callAccountId && _hasCall) {
       const yq = typeof RenewalsCallKeys !== "undefined" ? RenewalsCallKeys.yearQuarterFromRow(row, headerMap) : "";
@@ -8085,13 +8094,14 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
     "input",
     {
       ref: inputRef,
+      type: "text",
       className: "flex-1 rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-slate-900 text-xs px-3 py-2.5",
       placeholder: "Type your update and press Enter...",
       value: newEntry,
       onChange: (e) => setNewEntry(e.target.value),
       onKeyDown: handleKeyDown
     }
-  ), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-indigo text-[11px] px-4", onClick: handleAddEntry, disabled: !newEntry.trim() }, "Add")), /* @__PURE__ */ React.createElement("div", { className: "text-[9px] text-gray-400 mt-1" }, "Enter to add entry \xB7 Cmd+S to save")), /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-2" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Updates"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-slate", onClick: () => setShowRaw(!showRaw) }, showRaw ? "Timeline view" : "Edit raw")), showRaw ? /* @__PURE__ */ React.createElement(
+  ), /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-indigo text-[11px] px-4", onMouseDown: (e) => e.preventDefault(), onClick: handleAddEntry }, "Add")), /* @__PURE__ */ React.createElement("div", { className: "text-[9px] text-gray-400 mt-1" }, "Enter to add entry \xB7 Cmd+S to save")), /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-2" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Updates"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-slate", onClick: () => setShowRaw(!showRaw) }, showRaw ? "Timeline view" : "Edit raw")), showRaw ? /* @__PURE__ */ React.createElement(
     "textarea",
     {
       className: "w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-slate-900 text-[11px] leading-relaxed p-3 resize-y",
@@ -8102,7 +8112,7 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
   ) : /* @__PURE__ */ React.createElement("div", { className: "space-y-1 min-h-[10rem]" }, entries.length === 0 && callUpdates.length === 0 && /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-400 italic py-4" }, "No notes yet. Type an update above and press Enter."), entries.map((e, i) => {
     const meta = parseNoteEntryMeta(e.date);
     return /* @__PURE__ */ React.createElement("div", { key: i, className: "note-timeline-entry" }, meta.when && /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-indigo-600 dark:text-indigo-400 mb-0.5" }, meta.when), meta.author && /* @__PURE__ */ React.createElement("div", { className: "text-[9px] text-gray-500 dark:text-gray-400 mb-0.5" }, meta.author), !meta.when && !meta.author && i === 0 && /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-gray-400 mb-0.5" }, "(undated)"), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-700 dark:text-gray-200 leading-relaxed whitespace-pre-wrap", style: { wordBreak: "break-word" } }, e.text));
-  }), callUpdates.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "pt-1.5 mt-1.5 border-t border-gray-100 dark:border-gray-700 space-y-1" }, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-widest font-bold text-gray-400 mb-1" }, "Forecast call changes"), callUpdates.map((c) => /* @__PURE__ */ React.createElement("div", { key: c.key, className: "note-timeline-entry" }, c.ts && /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-indigo-600 dark:text-indigo-400 mb-0.5" }, formatNoteDate(c.ts)), c.who && /* @__PURE__ */ React.createElement("div", { className: "text-[9px] text-gray-500 dark:text-gray-400 mb-0.5" }, c.who), c.changes.map((ch, j) => /* @__PURE__ */ React.createElement("div", { key: j, className: "text-[11px] text-gray-700 dark:text-gray-200 leading-relaxed" }, ch)))))), /* @__PURE__ */ React.createElement(NoteHistoryPanel, { history: existing ? existing.history : null }), /* @__PURE__ */ React.createElement(RelatedRenewalsPanel, { noteKey: nk, notes, accountName: safeString(row[acctKey]), onCopyFrom: copyFromRelated, onCopyAndArchive: copyAndArchiveFromRelated, onConsolidateAll: consolidateAllRelated, onDeleteRelated: onDeleteNote }), /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mt-3 pt-3 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-400 truncate" }, existing && existing.updatedAt ? `Last saved: ${formatNoteDate(existing.updatedAt)}${existing.editedByDisplay ? ` by ${existing.editedByDisplay}` : ""}` : "Not yet saved"), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-emerald", onClick: handleSave }, "Done")))))));
+  }), callUpdates.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "pt-1.5 mt-1.5 border-t border-gray-100 dark:border-gray-700 space-y-1" }, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-widest font-bold text-gray-400 mb-1" }, "Forecast call changes"), callUpdates.map((c) => /* @__PURE__ */ React.createElement("div", { key: c.key, className: "note-timeline-entry" }, c.ts && /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-indigo-600 dark:text-indigo-400 mb-0.5" }, formatNoteDate(c.ts)), c.who && /* @__PURE__ */ React.createElement("div", { className: "text-[9px] text-gray-500 dark:text-gray-400 mb-0.5" }, c.who), c.changes.map((ch, j) => /* @__PURE__ */ React.createElement("div", { key: j, className: "text-[11px] text-gray-700 dark:text-gray-200 leading-relaxed" }, ch)))))), /* @__PURE__ */ React.createElement(NoteHistoryPanel, { history: existing ? existing.history : null }), /* @__PURE__ */ React.createElement(RelatedRenewalsPanel, { noteKey: nk, notes, accountName: safeString(row[acctKey]), onCopyFrom: copyFromRelated, onCopyAndArchive: copyAndArchiveFromRelated, onConsolidateAll: consolidateAllRelated, onDeleteRelated: onDeleteNote }), /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mt-3 pt-3 border-t border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-400 truncate" }, existing && existing.updatedAt ? `Last saved: ${formatNoteDate(existing.updatedAt)}${existing.editedByDisplay ? ` by ${existing.editedByDisplay}` : ""}` : "Not yet saved"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-emerald", onClick: handleSave }, "Done")))))));
 }
 function AccountInsightCard({ row, headerMap, settings, touchByAccount, rollups }) {
   const fmtUSD = (v) => `$${Math.round(Number(v) || 0).toLocaleString()}`;
@@ -9464,8 +9474,13 @@ function PacingTab() {
   const signedPp = (n) => n == null || !isFinite(n) ? "\u2014" : (n >= 0 ? "+" : "\u2212") + Math.abs(n).toFixed(0) + "pp";
   const TIPS = {
     expected: "Booked C/C + remaining BU FC. Full-quarter outlook, not year-to-date.",
+    bestExpected: "Booked C/C + remaining Best Case (BU FC + UPSIDE). Missing UPSIDE counts as 0.",
+    worstExpected: "Booked C/C + remaining Worst Case (BU FC + DOWNSIDE). Missing DOWNSIDE counts as 0.",
+    projectedLanding: "Three landings, same booked C/C. Best Case = BU + UPSIDE, BU FC = BU, Worst Case = BU + DOWNSIDE. Blank UPSIDE/DOWNSIDE count as 0.",
     fullTarget: "Maximum C/C loss budget for the quarter (not a quota to hit).",
-    vsCap: "Expected \u2212 full-quarter target. Same as leftover BU \u2212 leftover budget.",
+    vsCap: "BU FC landing \u2212 full-quarter target. Same as leftover BU \u2212 leftover budget. Status stays on BU.",
+    vsCapBest: "Best Case landing \u2212 full-quarter target. Same as leftover Best \u2212 leftover budget.",
+    vsCapWorst: "Worst Case landing \u2212 full-quarter target. Same as leftover Worst \u2212 leftover budget.",
     capPace: "Will Expected land inside the C/C cap? Binding constraint when leftover BU exceeds leftover budget.",
     booked: "QTD Churn & Contraction already closed (historical) in the selected band.",
     budgetConsumed: "QTD C/C \u00f7 quarterly C/C target. How much of the loss budget has actually hit.",
@@ -9499,6 +9514,8 @@ function PacingTab() {
   const qKey = hm.FISCAL_QUARTER || hm.YEAR_QUARTER || "YEAR_QUARTER";
   const atrKey = hm.ATR_STARTING || "ATR_ARR_USD_STARTING";
   const buKey = hm.BU_FC || "BU_FC";
+  const upsideKey = hm.UPSIDE || "UPSIDE";
+  const downsideKey = hm.DOWNSIDE || "DOWNSIDE";
   const regionKey = hm.REGION || "REGION";
   const histQKey = histHM.FISCAL_QUARTER || histHM.YEAR_QUARTER || "FISCAL_QUARTER";
   const histAtrKey = histHM.ATR_STARTING || "ATR_ARR_USD_STARTING";
@@ -9550,20 +9567,23 @@ function PacingTab() {
   const elapsed = fiscalQuarterElapsed(parsed.fy, parsed.fq);
   const targetsByQ = (state.regionCcTargets || {})[quarter] || {};
   const pending = useMemo(() => {
-    const out = { AMER: { atr: 0, bu: 0, n: 0 }, EMEA: { atr: 0, bu: 0, n: 0 }, APAC: { atr: 0, bu: 0, n: 0 }, LATAM: { atr: 0, bu: 0, n: 0 }, Other: { atr: 0, bu: 0, n: 0 } };
+    const empty = () => ({ atr: 0, bu: 0, upside: 0, downside: 0, n: 0 });
+    const out = { AMER: empty(), EMEA: empty(), APAC: empty(), LATAM: empty(), Other: empty() };
     (state.data || []).forEach((r) => {
       const q = deriveFiscalFromQuarterLabel(r[qKey] || r.FISCAL_QUARTER || r.YEAR_QUARTER).fq;
       if (q !== quarter) return;
       if (!passBand(r, false)) return;
       const atr = toNumber(r[atrKey]);
       const rg = canonPacingRegion(r[regionKey]);
-      if (!out[rg]) out[rg] = { atr: 0, bu: 0, n: 0 };
+      if (!out[rg]) out[rg] = empty();
       out[rg].atr += atr;
       out[rg].bu += toNumber(r[buKey]);
+      out[rg].upside += toNumber(r[upsideKey]);
+      out[rg].downside += toNumber(r[downsideKey]);
       out[rg].n += 1;
     });
     return out;
-  }, [state.data, qKey, atrKey, buKey, regionKey, quarter, band, bandKey, segKey, flag3kKey]);
+  }, [state.data, qKey, atrKey, buKey, upsideKey, downsideKey, regionKey, quarter, band, bandKey, segKey, flag3kKey]);
   const booked = useMemo(() => {
     const empty = () => ({ closedAtr: 0, openAtr: 0, cc: 0, n: 0, doneN: 0, openN: 0 });
     const out = { AMER: empty(), EMEA: empty(), APAC: empty(), LATAM: empty(), Other: empty() };
@@ -9591,7 +9611,7 @@ function PacingTab() {
 
   const quarterCompletePct = parsed.fy ? elapsed * 100 : null;
   const allRows = PACING_REGIONS.map((rg) => {
-    const p = pending[rg] || { atr: 0, bu: 0, n: 0 };
+    const p = pending[rg] || { atr: 0, bu: 0, upside: 0, downside: 0, n: 0 };
     const b = booked[rg] || { closedAtr: 0, openAtr: 0, cc: 0, n: 0, doneN: 0, openN: 0 };
     const pendingAtr = p.atr || 0;
     const closedAtr = b.closedAtr || 0;
@@ -9599,16 +9619,24 @@ function PacingTab() {
     const bookAtr = closedAtr + openAtr;
     const bookClosedPct = bookAtr > 0 ? closedAtr / bookAtr * 100 : null;
     const remaining = p.bu || 0;
+    const remainingBest = remaining + (p.upside || 0);
+    const remainingWorst = remaining + (p.downside || 0);
     const bookedCC = b.cc || 0;
     const expected = bookedCC + remaining;
+    const expectedBest = bookedCC + remainingBest;
+    const expectedWorst = bookedCC + remainingWorst;
     const targetRaw = targetsByQ[rg];
     const target = targetRaw != null && targetRaw !== "" && isFinite(Number(targetRaw)) ? Number(targetRaw) : null;
     const gapFull = target != null ? expected - target : null;
+    const gapBest = target != null ? expectedBest - target : null;
+    const gapWorst = target != null ? expectedWorst - target : null;
     const budgetConsumedPct = target != null && target > 0 ? bookedCC / target * 100 : null;
     const projectedPct = target != null && target > 0 ? expected / target * 100 : null;
+    const projectedBest = target != null && target > 0 ? expectedBest / target * 100 : null;
+    const projectedWorst = target != null && target > 0 ? expectedWorst / target * 100 : null;
     const leftoverBudget = target != null ? target - bookedCC : null;
     const pacingGapPp = budgetConsumedPct != null && quarterCompletePct != null && elapsed > 0 ? budgetConsumedPct - quarterCompletePct : null;
-    return { region: rg, pendingAtr, closedAtr, openAtr, bookAtr, bookClosedPct, pendingN: p.n, closedN: b.doneN || 0, openN: b.openN || 0, remaining, bookedCC, expected, target, gapFull, budgetConsumedPct, projectedPct, leftoverBudget, pacingGapPp };
+    return { region: rg, pendingAtr, closedAtr, openAtr, bookAtr, bookClosedPct, pendingN: p.n, closedN: b.doneN || 0, openN: b.openN || 0, remaining, remainingBest, remainingWorst, bookedCC, expected, expectedBest, expectedWorst, target, gapFull, gapBest, gapWorst, budgetConsumedPct, projectedPct, projectedBest, projectedWorst, leftoverBudget, pacingGapPp };
   });
   const rows = allRows.filter((r) => activeRegions.indexOf(r.region) >= 0);
   const targeted = rows.filter((r) => r.target != null);
@@ -9620,18 +9648,28 @@ function PacingTab() {
     pendingN: s.pendingN + r.pendingN,
     closedN: s.closedN + r.closedN,
     remaining: s.remaining + r.remaining,
+    remainingBest: s.remainingBest + r.remainingBest,
+    remainingWorst: s.remainingWorst + r.remainingWorst,
     bookedCC: s.bookedCC + r.bookedCC,
-    expected: s.expected + r.expected
-  }), { pendingAtr: 0, closedAtr: 0, openAtr: 0, pendingN: 0, closedN: 0, remaining: 0, bookedCC: 0, expected: 0 });
+    expected: s.expected + r.expected,
+    expectedBest: s.expectedBest + r.expectedBest,
+    expectedWorst: s.expectedWorst + r.expectedWorst
+  }), { pendingAtr: 0, closedAtr: 0, openAtr: 0, pendingN: 0, closedN: 0, remaining: 0, remainingBest: 0, remainingWorst: 0, bookedCC: 0, expected: 0, expectedBest: 0, expectedWorst: 0 });
   total.bookAtr = total.closedAtr + total.openAtr;
   total.bookClosedPct = total.bookAtr > 0 ? total.closedAtr / total.bookAtr * 100 : null;
   total.target = targeted.length ? targeted.reduce((s, r) => s + r.target, 0) : null;
   total.expectedTgt = targeted.length ? targeted.reduce((s, r) => s + r.expected, 0) : null;
+  total.expectedBestTgt = targeted.length ? targeted.reduce((s, r) => s + r.expectedBest, 0) : null;
+  total.expectedWorstTgt = targeted.length ? targeted.reduce((s, r) => s + r.expectedWorst, 0) : null;
   total.bookedTgt = targeted.length ? targeted.reduce((s, r) => s + r.bookedCC, 0) : null;
   total.remainingTgt = targeted.length ? targeted.reduce((s, r) => s + r.remaining, 0) : null;
   total.gapFull = total.target != null ? total.expectedTgt - total.target : null;
+  total.gapBest = total.target != null ? total.expectedBestTgt - total.target : null;
+  total.gapWorst = total.target != null ? total.expectedWorstTgt - total.target : null;
   total.budgetConsumedPct = total.target != null && total.target > 0 ? total.bookedTgt / total.target * 100 : null;
   total.projectedPct = total.target != null && total.target > 0 ? total.expectedTgt / total.target * 100 : null;
+  total.projectedBest = total.target != null && total.target > 0 ? total.expectedBestTgt / total.target * 100 : null;
+  total.projectedWorst = total.target != null && total.target > 0 ? total.expectedWorstTgt / total.target * 100 : null;
   total.leftoverBudget = total.target != null ? total.target - total.bookedTgt : null;
   total.pacingGapPp = total.budgetConsumedPct != null && quarterCompletePct != null && elapsed > 0 ? total.budgetConsumedPct - quarterCompletePct : null;
   const landingStatus = (r) => {
@@ -9680,6 +9718,16 @@ function PacingTab() {
     /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-value", style: { color: accent || "#0ea5e9" } }, value),
     sub ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub", style: { color: typeof sub === "object" ? sub.color : undefined } }, typeof sub === "object" ? sub.txt : sub) : null);
   const totStatus = landingStatus(total);
+  const vsCapSub = (gap) => gap == null ? { txt: "Set a target", color: "#64748b" } : gap > 0 ? { txt: "Over cap", color: "#ef4444" } : gap < 0 ? { txt: "Under cap", color: "#16a34a" } : { txt: "At cap", color: "#64748b" };
+  const lossBudgetSub = targeted.length ? targeted.length + " of " + rows.length + " regions" : "Set region targets";
+  const pendingSub = total.pendingN.toLocaleString() + " pending";
+  const projectedLandingRow = (title, landing, remaining, remainingLabel, gap, projectedPct, expectedTip, vsCapTip, statusSub) => /* @__PURE__ */ React.createElement("div", null,
+    /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold uppercase tracking-wider text-gray-500 mb-1.5 inline-flex items-center gap-1" }, title, infoIcon(title, expectedTip)),
+    /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2" },
+      kpiCard("Expected C/C", fmtC(landing), remainingLabel + " " + fmtC(remaining) + " \u00b7 " + pendingSub, "#0ea5e9", expectedTip),
+      kpiCard("Projected consumption", fmtPct0(projectedPct), total.target == null ? "Set region targets" : "Expected \u00f7 loss budget", projectedColor(projectedPct), TIPS.projected),
+      kpiCard("Loss budget", total.target == null ? "\u2014" : fmtC(total.target), targeted.length ? lossBudgetSub : "Set region targets", "#8b5cf6", TIPS.fullTarget),
+      kpiCard("vs cap", gap == null ? "\u2014" : signed(gap), statusSub, gapColor(gap), vsCapTip)));
   const cell = (txt, cls) => /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 " + (cls || "") }, txt);
   const th = (txt, cls, info) => /* @__PURE__ */ React.createElement("th", { className: "px-2 py-1.5 text-left font-semibold uppercase tracking-wider text-[9px] text-gray-500 " + (cls || ""), title: info || undefined }, info ? /* @__PURE__ */ React.createElement("span", { className: "inline-flex items-center gap-0.5" }, txt, infoIcon(txt, info)) : txt);
   const otherN = ((pending.Other && pending.Other.n) || 0) + ((booked.Other && booked.Other.n) || 0);
@@ -9687,13 +9735,13 @@ function PacingTab() {
   const regionScopeLabel = activeRegions.length === PACING_REGIONS.length ? "All regions" : activeRegions.join(", ");
   const bookClosedSub = total.bookClosedPct == null ? "No ATR in scope" : fmtC(total.closedAtr) + " done \u00b7 " + fmtC(total.openAtr) + " open";
   const leftoverStory = total.leftoverBudget != null && total.remainingTgt != null ? "Leftover BU " + fmtC(total.remainingTgt) + " vs leftover budget " + fmtC(total.leftoverBudget) + (total.gapFull == null ? "" : " \u2192 " + signed(total.gapFull) + " vs cap") : null;
-  const storyBanner = leftoverStory ? /* @__PURE__ */ React.createElement("div", { className: "rounded-lg px-3 py-2 text-[11px]", style: { background: total.gapFull > 0 ? "rgba(217,119,6,0.08)" : "rgba(22,163,74,0.08)", color: total.gapFull > 0 ? "#b45309" : "#15803d" } }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, totStatus.txt, ". "), leftoverStory, ".", total.bookClosedPct != null ? " " + fmtPct0(total.bookClosedPct) + " of the book is closed." : "") : null;
+  const storyBanner = leftoverStory ? /* @__PURE__ */ React.createElement("div", { className: "rounded-lg px-3 py-2 text-[11px]", style: { background: total.gapFull > 0 ? "rgba(217,119,6,0.08)" : "rgba(22,163,74,0.08)", color: total.gapFull > 0 ? "#b45309" : "#15803d" } }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, totStatus.txt, ". "), leftoverStory, ".", total.bookClosedPct != null ? " " + fmtPct0(total.bookClosedPct) + " closed renewal." : "") : null;
   const projectedColor = (pct) => pct == null ? "#64748b" : pct > 100 ? "#ef4444" : pct > 95 ? "#d97706" : "#16a34a";
   return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" },
     /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3 flex flex-wrap items-end gap-3" },
       /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-[220px]" },
         /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold inline-flex items-center gap-1" }, "C/C pacing \u00b7 ", bandLabel, infoIcon("Scope", TIPS.scope)),
-        /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500 mt-0.5" }, "Landing vs cap is the constraint. Realized pace and % of book closed show how much of that landing is still a forecast.")),
+        /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500 mt-0.5" }, "Landing vs cap is the constraint. Realized pace and % closed renewal show how much of that landing is still a forecast.")),
       /* @__PURE__ */ React.createElement("div", null,
         /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold mb-1" }, "Quarter"),
         /* @__PURE__ */ React.createElement("select", { className: "filter-input text-xs", value: quarter, onChange: (e) => setQuarter(e.target.value) },
@@ -9711,16 +9759,14 @@ function PacingTab() {
         /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold uppercase tracking-wider text-gray-500 mb-1.5 inline-flex items-center gap-1" }, "Realized (closed only)", infoIcon("Realized", TIPS.bookClosed)),
         /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2" },
           kpiCard("Budget consumed", fmtPct0(total.budgetConsumedPct), total.target == null ? "Set region targets" : fmtC(total.bookedCC) + " of " + fmtC(total.target) + " budget", budgetConsumedColor(total.budgetConsumedPct), TIPS.budgetConsumed),
-          kpiCard("Book closed", fmtPct0(total.bookClosedPct), bookClosedSub, "#0ea5e9", TIPS.bookClosed),
+          kpiCard("Closed renewal", fmtPct0(total.bookClosedPct), bookClosedSub, "#0ea5e9", TIPS.bookClosed),
           kpiCard("Quarter complete", fmtPct0(quarterCompletePct), regionScopeLabel, "#64748b", TIPS.quarterComplete),
           kpiCard("Pacing gap", signedPp(total.pacingGapPp), { txt: totStatus.txt, color: totStatus.color }, paceGapColor(total.pacingGapPp), TIPS.pacingGap))),
-      /* @__PURE__ */ React.createElement("div", null,
-        /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold uppercase tracking-wider text-gray-500 mb-1.5 inline-flex items-center gap-1" }, "Projected landing (closed + pending BU)", infoIcon("Projected landing", TIPS.projected)),
-        /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2" },
-          kpiCard("Expected C/C", fmtC(total.expected), "Remaining BU " + fmtC(total.remaining) + " \u00b7 " + total.pendingN.toLocaleString() + " pending", "#0ea5e9", TIPS.expected),
-          kpiCard("Projected consumption", fmtPct0(total.projectedPct), total.target == null ? "Set region targets" : "Expected \u00f7 loss budget", projectedColor(total.projectedPct), TIPS.projected),
-          kpiCard("Loss budget", total.target == null ? "\u2014" : fmtC(total.target), targeted.length ? targeted.length + " of " + rows.length + " regions" : "Set region targets", "#8b5cf6", TIPS.fullTarget),
-          kpiCard("vs cap", total.gapFull == null ? "\u2014" : signed(total.gapFull), totStatus, gapColor(total.gapFull), TIPS.vsCap))),
+      /* @__PURE__ */ React.createElement("div", { className: "space-y-3" },
+        /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold uppercase tracking-wider text-gray-500 inline-flex items-center gap-1" }, "Projected landing (closed + pending)", infoIcon("Projected landing", TIPS.projectedLanding)),
+        projectedLandingRow("Best Case", total.expectedBest, total.remainingBest, "Remaining Best", total.gapBest, total.projectedBest, TIPS.bestExpected, TIPS.vsCapBest, vsCapSub(total.gapBest)),
+        projectedLandingRow("BU FC", total.expected, total.remaining, "Remaining BU", total.gapFull, total.projectedPct, TIPS.expected, TIPS.vsCap, totStatus),
+        projectedLandingRow("Worst Case", total.expectedWorst, total.remainingWorst, "Remaining Worst", total.gapWorst, total.projectedWorst, TIPS.worstExpected, TIPS.vsCapWorst, vsCapSub(total.gapWorst))),
       leftoverStory ? /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500 inline-flex items-center gap-1" }, infoIcon("Leftover budget vs leftover BU", TIPS.leftover), leftoverStory) : null),
     (missingNote || otherN > 0) && /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500 space-y-0.5" },
       missingNote ? /* @__PURE__ */ React.createElement("div", null, missingNote) : null,
@@ -9733,12 +9779,13 @@ function PacingTab() {
           th("Loss budget $", "text-right", TIPS.target),
           th("Booked C/C", "text-right", TIPS.booked),
           th("Consumed", "text-right", TIPS.budgetConsumed),
-          th("Book closed", "text-right", TIPS.bookClosed),
+          th("Closed renewal", "text-right", TIPS.bookClosed),
           th("Qtr complete", "text-right", TIPS.quarterComplete),
           th("Pacing gap", "text-right", TIPS.pacingGap),
           th("Status", "", TIPS.status),
-          th("Projected", "text-right", TIPS.projected),
-          th("Expected", "text-right", TIPS.expected),
+          th("Best Case", "text-right", TIPS.bestExpected),
+          th("BU FC", "text-right", TIPS.expected),
+          th("Worst Case", "text-right", TIPS.worstExpected),
           th("vs cap", "text-right", TIPS.vsCap),
           th("Remaining BU", "text-right", TIPS.remaining))),
         /* @__PURE__ */ React.createElement("tbody", null,
@@ -9753,8 +9800,9 @@ function PacingTab() {
               cell(fmtPct0(quarterCompletePct), "text-right tabular-nums text-gray-500"),
               /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: paceGapColor(r.pacingGapPp) } }, signedPp(r.pacingGapPp)),
               /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5", style: { color: st.color } }, st.txt),
-              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums font-semibold", style: { color: projectedColor(r.projectedPct) } }, fmtPct0(r.projectedPct)),
+              cell(fmtC(r.expectedBest), "text-right tabular-nums"),
               cell(fmtC(r.expected), "text-right tabular-nums"),
+              cell(fmtC(r.expectedWorst), "text-right tabular-nums"),
               /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: gapColor(r.gapFull) } }, r.gapFull == null ? "\u2014" : signed(r.gapFull)),
               cell(fmtC(r.remaining), "text-right tabular-nums"));
           }),
@@ -9767,11 +9815,12 @@ function PacingTab() {
             cell(fmtPct0(quarterCompletePct), "text-right tabular-nums text-gray-500"),
             /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: paceGapColor(total.pacingGapPp) } }, signedPp(total.pacingGapPp)),
             /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5", style: { color: totStatus.color } }, totStatus.txt),
-            /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: projectedColor(total.projectedPct) } }, fmtPct0(total.projectedPct)),
+            cell(fmtC(total.expectedBest), "text-right tabular-nums"),
             cell(fmtC(total.expected), "text-right tabular-nums"),
+            cell(fmtC(total.expectedWorst), "text-right tabular-nums"),
             /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: gapColor(total.gapFull) } }, total.gapFull == null ? "\u2014" : signed(total.gapFull)),
             cell(fmtC(total.remaining), "text-right tabular-nums")))))),
-    /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500" }, "Three clocks: budget consumed (C/C $), book closed (ATR), quarter complete (calendar). Landing = Expected \u00f7 budget. Favorable only when leftover BU is also under leftover budget. Zendesk FY ends 31 Jan."),
+    /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500" }, "Three clocks: budget consumed (C/C $), closed renewal (ATR), quarter complete (calendar). Landing = booked + remaining. Best Case = BU + UPSIDE, Worst Case = BU + DOWNSIDE (blank = 0). Favorable only when leftover BU is also under leftover budget. Zendesk FY ends 31 Jan."),
     floatTip ? ReactDOM.createPortal(/* @__PURE__ */ React.createElement("div", { className: "pacing-float-tip", style: { left: floatTip.left, top: floatTip.top, transform: floatTip.placeUp ? "translateY(-100%)" : undefined } }, floatTip.text), document.body) : null
   );
 }
