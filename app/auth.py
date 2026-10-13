@@ -5,7 +5,8 @@ The proxy strips any client copies before forwarding.
 
 Roles:
   * guest    — ephemeral, read-only (STRICT_AUTH + no identity header)
-  * standard — auto-provisioned signed-in user; can edit notes/forecasts
+  * standard — auto-provisioned signed-in user; view-only (no data writes)
+  * update   — can edit notes, calls, and planning data
   * admin    — user management, DB diagnostics, account history lookup
   * owner    — CSV uploads, snapshot history, notes import, raw note edit
                (super-user; seeded via BOOTSTRAP_OWNERS)
@@ -78,7 +79,7 @@ class Identity:
 class ResolvedUser:
     email: str
     display_name: str
-    role: str  # guest | standard | admin | owner
+    role: str  # guest | standard | update | admin | owner
     source: str
     ephemeral: bool = False
 
@@ -96,7 +97,11 @@ class ResolvedUser:
 
     @property
     def is_signed_in(self) -> bool:
-        return self.role in ("standard", "admin", "owner")
+        return self.role in ("standard", "update", "admin", "owner")
+
+    @property
+    def can_update(self) -> bool:
+        return self.role in ("update", "admin", "owner")
 
     def to_dict(self) -> dict:
         return {
@@ -363,6 +368,23 @@ def require_signed_in(user: ResolvedUser = Depends(get_current_user)) -> Resolve
         raise HTTPException(
             status_code=401,
             detail={"error": "sign_in_required", "detail": "Authentication required."},
+        )
+    return user
+
+
+def require_updater(user: ResolvedUser = Depends(get_current_user)) -> ResolvedUser:
+    if user.is_guest:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "sign_in_required", "detail": "Authentication required."},
+        )
+    if not user.can_update:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "update_required",
+                "detail": "Update role required to change notes or other saved data.",
+            },
         )
     return user
 

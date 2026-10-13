@@ -17,7 +17,8 @@ Each "Run now" executes the unified query with its self-dynamic DEFAULT bind
 params (so output tracks the current quarter automatically), serialises the
 result to CSV bytes whose header names match what ingest already expects, and
 feeds those bytes through the existing ingest pipeline via
-``Database.persist_source_csv`` (uploaded_by='snowflake:run-now').
+``Database.persist_source_csv`` (uploaded_by='snowflake:run-now', or
+'snowflake:auto' when a page visit triggered it).
 
 Security:
   * The OAuth token is the per-request user token from the
@@ -85,6 +86,29 @@ DEFAULT_QUERY_PARAMS: dict[str, Any] = {
 }
 QUERY_PARAM_ORDER = ("n_past", "n_future", "min_arr", "band_cutoff")
 _QUERY_INT_FIELDS = {"n_past", "n_future"}
+
+# Per run kind: (uploaded_by, snapshot note, filename prefix). uploaded_by is
+# listed by the ungated /snapshots endpoint, so it never carries an email.
+_RUN_LABELS: dict[str, tuple[str, str, str]] = {
+    "manual": ("snowflake:run-now", "Snowflake Run-now", "Snowflake Run-Now"),
+    "auto": ("snowflake:auto", "Snowflake auto-refresh", "Snowflake Auto-Refresh"),
+}
+
+
+class SnowflakeConnectError(RuntimeError):
+    """Login failed before any query ran (token, user mapping, network policy)."""
+
+
+class RowGuardError(RuntimeError):
+    """The pull was too small to replace the current snapshot."""
+
+
+def error_kind(exc: BaseException) -> str:
+    if isinstance(exc, SnowflakeConnectError):
+        return "connect"
+    if isinstance(exc, RowGuardError):
+        return "row_guard"
+    return "error"
 
 
 def coerce_query_value(key: str, value: Any):
@@ -216,7 +240,10 @@ def run_query_file(
     _mapped_user = _user_from_token(token)
     if _mapped_user:
         conn_kwargs["user"] = _mapped_user
-    conn = snowflake.connector.connect(**conn_kwargs)
+    try:
+        conn = snowflake.connector.connect(**conn_kwargs)
+    except Exception as exc:  # noqa: BLE001 — connector errors never carry the token
+        raise SnowflakeConnectError(f"{type(exc).__name__}: {exc}") from exc
     try:
         cur = conn.cursor()
         try:
@@ -269,17 +296,22 @@ async def refresh_all(
     token: Optional[str],
     settings: Settings,
     *,
-    uploaded_by: str = "snowflake:run-now",
+    kind: str = "manual",
     overrides: Optional[dict] = None,
+    min_rows: Optional[int] = None,
 ) -> dict:
     """Run BOTH slots: fetch -> serialise to CSV bytes -> persist through the
     existing ingest/upsert path. Records success/failure per slot.
+
+    ``min_rows`` rejects a pull smaller than that before anything is written,
+    so the current snapshot keeps serving.
 
     Returns a result dict suitable for the status endpoint. Never raises for
     a single-slot failure — the other slot still runs and the error is
     captured per slot.
     """
     simulated = effective_simulated(token, settings)
+    uploaded_by, note_label, file_prefix = _RUN_LABELS.get(kind, _RUN_LABELS["manual"])
     result: dict[str, Any] = {
         "mode": "simulated" if simulated else "real",
         "slots": {},
@@ -293,15 +325,18 @@ async def refresh_all(
             columns, rows = await run_in_threadpool(
                 fetch_slot, slot, token, settings, simulated=simulated, overrides=overrides
             )
+            if min_rows and len(rows) < min_rows:
+                raise RowGuardError(
+                    f"Snowflake returned {len(rows):,} rows, below the "
+                    f"{min_rows:,} floor set by the current snapshot; "
+                    "the current snapshot was kept"
+                )
             content = rows_to_csv_bytes(columns, rows)
-            note = (
-                "Snowflake Run-now"
-                + (" (simulated)" if simulated else "")
-            )
+            note = note_label + (" (simulated)" if simulated else "")
             # Timestamped, sortable UTC filename for traceability in the
             # snapshot history, e.g. "Snowflake Run-Now_20260813_1206Z.csv".
             run_ts = datetime.now(timezone.utc)
-            filename = f"Snowflake Run-Now_{run_ts:%Y%m%d_%H%M}Z.csv"
+            filename = f"{file_prefix}_{run_ts:%Y%m%d_%H%M}Z.csv"
             persisted = await db.persist_source_csv(
                 slot=slot,
                 filename=filename,
@@ -327,10 +362,18 @@ async def refresh_all(
             )
         except Exception as exc:  # noqa: BLE001 — capture per slot, never leak token
             slot_res["error"] = f"{type(exc).__name__}: {exc}"
-            logger.exception("snowflake refresh failed slot=%s", slot)
+            slot_res["error_kind"] = error_kind(exc)
+            if isinstance(exc, RowGuardError):
+                logger.warning("snowflake refresh rejected slot=%s: %s", slot, exc)
+            else:
+                logger.exception("snowflake refresh failed slot=%s", slot)
         result["slots"][slot] = slot_res
 
     result["ok"] = bool(result["slots"]) and all(
         s.get("ok") for s in result["slots"].values()
+    )
+    result["error_kind"] = next(
+        (s["error_kind"] for s in result["slots"].values() if s.get("error_kind")),
+        None,
     )
     return result

@@ -36,13 +36,15 @@ import logging
 import math
 import re
 import zipfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
+from asyncpg.exceptions import QueryCanceledError, UndefinedColumnError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from starlette.requests import ClientDisconnect
 
-from app.auth import require_admin, require_owner, require_signed_in, get_current_user, ResolvedUser
+from app.auth import require_admin, require_owner, require_signed_in, require_updater, get_current_user, ResolvedUser
 from app.call_keys import build_call_key, parse_call_key
 from app.database import DatabaseUnavailable
 from app.ingest import resolve_effective_date
@@ -161,7 +163,7 @@ async def get_notes(request: Request) -> dict:
 @router.put("/notes")
 async def put_notes(
     request: Request,
-    user: ResolvedUser = Depends(require_signed_in),
+    user: ResolvedUser = Depends(require_updater),
 ) -> dict:
     db = _db(request)
     body = await request.json()
@@ -1272,7 +1274,7 @@ async def get_account_forecast(
 async def upsert_account_forecast(
     request: Request,
     account_id: str,
-    user: ResolvedUser = Depends(require_signed_in),
+    user: ResolvedUser = Depends(require_updater),
 ):
     """Append a call commit for one renewal row (account + quarter + ATR)."""
     db = _db(request)
@@ -1352,7 +1354,7 @@ async def delete_account_forecast(
     year_quarter: Optional[str] = Query(default=None),
     rounded_atr: Optional[int] = Query(default=None),
     call_key: Optional[str] = Query(default=None),
-    user: ResolvedUser = Depends(require_signed_in),
+    user: ResolvedUser = Depends(require_updater),
 ) -> dict:
     """Clear calls for one renewal row (append null event for audit trail)."""
     db = _db(request)
@@ -1471,6 +1473,7 @@ def _default_tab_access_matrix() -> dict[str, list[str]]:
         "owner": list(ALL_DASHBOARD_TABS),
         "admin": ["region", "partner", "accounts", "notes", "historical", "targets", "weekly", "pacing"],
         "standard": ["region", "partner", "accounts", "notes", "targets", "weekly", "pacing"],
+        "update": ["region", "partner", "accounts", "notes", "targets", "weekly", "pacing"],
     }
 
 
@@ -1500,10 +1503,12 @@ async def _load_tab_access_matrix(conn) -> dict[str, list[str]]:
         return base
     if not isinstance(raw, dict):
         return base
-    for role in ("owner", "admin", "standard"):
+    for role in ("owner", "admin", "update", "standard"):
         cleaned = _sanitize_tab_list(raw.get(role))
         if cleaned:
             base[role] = cleaned
+    if not raw.get("update") and base.get("standard"):
+        base["update"] = list(base["standard"])
     return base
 
 
@@ -1513,7 +1518,7 @@ async def tab_access_for_user(
     user: ResolvedUser = Depends(get_current_user),
 ) -> dict:
     """Tabs the signed-in user may open."""
-    role = user.role if user.role in ("owner", "admin", "standard") else "standard"
+    role = user.role if user.role in ("owner", "admin", "update", "standard") else "standard"
     db = _db(request)
     async with db.acquire() as conn:
         matrix = await _load_tab_access_matrix(conn)
@@ -1551,7 +1556,7 @@ async def tab_access_config_put(
     if not isinstance(matrix_in, dict):
         raise HTTPException(status_code=400, detail="matrix object required")
     matrix = _default_tab_access_matrix()
-    for role in ("owner", "admin", "standard"):
+    for role in ("owner", "admin", "update", "standard"):
         matrix[role] = _sanitize_tab_list(matrix_in.get(role)) or matrix[role]
     db = _db(request)
     async with db.acquire() as conn:
@@ -1633,9 +1638,9 @@ async def get_planning_data(request: Request) -> dict:
 @router.put("/planning-data")
 async def put_planning_data(
     request: Request,
-    user: ResolvedUser = Depends(require_signed_in),
+    user: ResolvedUser = Depends(require_updater),
 ) -> dict:
-    """Persist Targets-tab planning fields. Signed-in users only."""
+    """Persist Targets-tab planning fields. Update role or above."""
     db = _db(request)
     body = await request.json()
     if not isinstance(body, dict):
@@ -1806,65 +1811,61 @@ async def delete_quarter_call(
 
 @router.get("/snapshots")
 async def list_snapshots(request: Request, limit: int = 50) -> dict:
-    """List every CSV upload with a row count for its parsed rows.
+    """List CSV uploads for /admin Snapshot History.
 
-    Sorted newest-first. Used by the /admin Snapshot History viewer and
-    eventually by any WoW / MoM reporting view."""
+    Reads only ``csv_uploads`` cached snapshot stats. Never ``COUNT(*)`` /
+    ``SUM(atr)`` across ``account_snapshots`` — a single 279k-row upload
+    times out the admin page if we aggregate live.
+    """
     db = _db(request)
     limit = max(1, min(int(limit), 500))
-    async with db.acquire() as conn:
-        rows = await conn.fetch(
+    sql_full = """
+            SELECT id, slot, filename, size_bytes, uploaded_at, uploaded_by, note,
+                   COALESCE(snapshot_row_count, 0) AS row_count,
+                   snapshot_distinct_accounts AS distinct_accounts,
+                   snapshot_atr_total AS atr_total,
+                   COALESCE(snapshot_effective_date, uploaded_at) AS effective_date
+            FROM csv_uploads
+            ORDER BY COALESCE(snapshot_effective_date, uploaded_at) DESC,
+                     uploaded_at DESC
+            LIMIT $1
             """
-            WITH recent AS (
-                SELECT id, slot, filename, size_bytes, uploaded_at,
-                       uploaded_by, note
-                FROM csv_uploads
-                ORDER BY uploaded_at DESC
-                LIMIT $1
-            )
-            SELECT
-                r.id,
-                r.slot,
-                r.filename,
-                r.size_bytes,
-                r.uploaded_at,
-                r.uploaded_by,
-                r.note,
-                COALESCE(s.row_count, 0) AS row_count,
-                s.distinct_accounts,
-                s.atr_total,
-                s.effective_date
-            FROM recent r
-            LEFT JOIN (
-                SELECT
-                    csv_upload_id,
-                    COUNT(*) AS row_count,
-                    COUNT(DISTINCT account_id) AS distinct_accounts,
-                    SUM(atr) AS atr_total,
-                    MAX(effective_date) AS effective_date
-                FROM account_snapshots
-                WHERE csv_upload_id IN (SELECT id FROM recent)
-                GROUP BY csv_upload_id
-            ) s ON s.csv_upload_id = r.id
-            ORDER BY COALESCE(s.effective_date, r.uploaded_at) DESC
-            """,
-            limit,
-        )
+    sql_base = """
+            SELECT id, slot, filename, size_bytes, uploaded_at, uploaded_by, note,
+                   COALESCE(snapshot_row_count, 0) AS row_count,
+                   NULL::int AS distinct_accounts,
+                   NULL::numeric AS atr_total,
+                   COALESCE(snapshot_effective_date, uploaded_at) AS effective_date
+            FROM csv_uploads
+            ORDER BY COALESCE(snapshot_effective_date, uploaded_at) DESC,
+                     uploaded_at DESC
+            LIMIT $1
+            """
+    async with db.acquire() as conn:
+        try:
+            rows = await conn.fetch(sql_full, limit, timeout=15.0)
+        except UndefinedColumnError:
+            rows = await conn.fetch(sql_base, limit, timeout=15.0)
+    def _iso(val, fallback=None):
+        src = val or fallback
+        if src is None:
+            return None
+        return src.isoformat() if hasattr(src, "isoformat") else str(src)
+
     items = [
         {
             "id": r["id"],
             "slot": r["slot"],
             "filename": r["filename"],
             "size_bytes": r["size_bytes"],
-            "uploaded_at": r["uploaded_at"].isoformat(),
-            "effective_date": (
-                r["effective_date"].isoformat()
-                if r.get("effective_date") else r["uploaded_at"].isoformat()
-            ),
+            "uploaded_at": _iso(r["uploaded_at"]),
+            "effective_date": _iso(r["effective_date"], r["uploaded_at"]),
             "uploaded_by": r["uploaded_by"],
             "note": r["note"],
-            "row_count": int(r["row_count"]),
-            "distinct_accounts": int(r["distinct_accounts"] or 0),
+            "row_count": int(r["row_count"] or 0),
+            "distinct_accounts": (
+                int(r["distinct_accounts"]) if r["distinct_accounts"] is not None else None
+            ),
             "atr_total": float(r["atr_total"]) if r["atr_total"] is not None else None,
         }
         for r in rows
@@ -2094,816 +2095,7 @@ async def trending_metrics(
     }
 
 
-# ---------------------------------------------------------------------------
-# Weekly 100K+ Regional Brief — CCO-requested week-over-week (WoW) bottoms-up
-# forecast movement report.
-#
-# Compares the latest active-slot snapshot vs a prior one (default: the
-# immediately-preceding snapshot; a specific pair can be pinned via
-# ?current=<id>&prior=<id>). Scope is FROZEN to the 100K+ band for the
-# current quarter, broken out by region.
-#
-# Sign convention (mirrors the dashboard): BU_FC is the forecasted amount of
-# churn/contraction (a positive loss number). CC% = BU_FC / ATR. Therefore
-# "worse WoW" == BU_FC INCREASED (more expected churn/contraction). The
-# adverse swing for an account is (current BU_FC - prior BU_FC) when > 0.
-#
-# All queries are bounded: every per-snapshot read is filtered to band +
-# quarter in SQL (~hundreds of rows), and we only extract the single UPSIDE
-# key out of raw_row (never the whole JSONB blob), heeding the DB-timeout
-# lessons for ~50k-row snapshots.
-# ---------------------------------------------------------------------------
-
-WEEKLY_BRIEF_BAND_DEFAULT = "100k+"
-WEEKLY_BRIEF_LARGE_SWING_DEFAULT = 50000.0  # tunable "large mover" threshold ($)
-WEEKLY_BRIEF_TREND_LIMIT = 12               # snapshots in the "over time" series
-WEEKLY_BRIEF_LIST_CAP = 100                 # max rows returned per mover list
-_EXPLANATION_MAX_CHARS = 600
-
-
-def _wb_to_number(x) -> float:
-    """Mirror the dashboard's toNumber(): strip $ , ( ) % and whitespace.
-
-    Note the client removes parentheses rather than treating them as a
-    negative sign, so we match that exactly for UPSIDE parity."""
-    if x is None:
-        return 0.0
-    if isinstance(x, (int, float)):
-        return float(x) if math.isfinite(x) else 0.0
-    s = re.sub(r"[$,()%\s]", "", str(x)).replace("--", "")
-    if not s:
-        return 0.0
-    try:
-        return float(s)
-    except ValueError:
-        return 0.0
-
-
-def _wb_normalize_quarter(label) -> Optional[tuple]:
-    """Return (fy_two_digit, quarter_num) for a well-formed quarter label.
-
-    Accepts the known spellings (anchored, whole-string match):
-      'Q3`27', "Q3'27", 'Q3 27', 'Q3-27', 'FY27Q3', 'FY27-Q3', '2027Q3', '27Q3'.
-
-    Anchoring (``fullmatch``) is deliberate: the previous unanchored
-    ``re.search`` was over-eager and would treat a malformed value like
-    'QQ3`27' as Q3 by matching a substring, silently conflating labels. We
-    still collapse a single leading duplicate 'Q' (a common CSV artifact,
-    e.g. 'QQ3`27' -> 'Q3`27') so genuine Q3 rows aren't dropped, but random
-    garbage no longer matches."""
-    if not label:
-        return None
-    s = str(label).strip().upper()
-    # Collapse a redundant leading 'Q' immediately followed by 'Q<1-4>'.
-    s = re.sub(r"^Q(?=Q[1-4])", "", s)
-    m = re.fullmatch(r"FY(\d{2})[- ]?Q([1-4])", s)
-    if m:
-        return (int(m.group(1)), int(m.group(2)))
-    m = re.fullmatch(r"(\d{2,4})Q([1-4])", s)
-    if m:
-        return (int(m.group(1)) % 100, int(m.group(2)))
-    m = re.fullmatch(r"Q([1-4])[`'\-\s]?(\d{2,4})", s)
-    if m:
-        return (int(m.group(2)) % 100, int(m.group(1)))
-    return None
-
-
-def _wb_current_fiscal_quarter(dt: datetime) -> tuple:
-    """Zendesk fiscal quarter for a date (FY ends Jan; FY27 = Feb26-Jan27).
-
-    Mirrors mapFiscal() in the bundled dashboard so the auto-detected
-    'current quarter' matches what a user would pick in the UI."""
-    y = dt.year
-    m0 = dt.month - 1
-    if y == 2026 and m0 == 0:
-        return (26, 1)
-    fy_num = y if m0 == 0 else y + 1
-    offset = (m0 + 11) % 12
-    q = offset // 3 + 1
-    return (fy_num % 100, q)
-
-
-# Reusable band predicate. Mirrors the client's matchesBand("100k_official"):
-# uppercase, strip spaces/$/commas, then substring-match the band token.
-_WB_BAND_PREDICATE = (
-    "UPPER(REGEXP_REPLACE(COALESCE(s.band, ''), '[ $,]', '', 'g')) "
-    "LIKE '%' || UPPER($BAND$) || '%'"
-)
-
-# Canonical region expression — blank/NULL collapses to 'Unknown' so the SQL
-# filter, the available-region list, and the Python-side region label all
-# agree (a user can select "Unknown" and match rows with no region).
-_WB_REGION_EXPR = "COALESCE(NULLIF(TRIM(s.region), ''), 'Unknown')"
-
-# Shared filter dimensions the Weekly Brief supports beyond band + quarter.
-# Each maps a filter key -> the canonical SQL expression on account_snapshots.
-# Blank/NULL collapses to 'Unknown' so the equality filter, the available-*
-# option list, and the label the user sees all agree. These mirror the
-# dimensions the rest of the dashboard filters on (region / sub-region / CS
-# manager / segment / owner) so the brief uses the same mechanism.
-_WB_FILTER_EXPRS = {
-    "region": _WB_REGION_EXPR,
-    "sub_region": "COALESCE(NULLIF(TRIM(s.subregion), ''), 'Unknown')",
-    "cs_manager": "COALESCE(NULLIF(TRIM(s.csm_manager), ''), 'Unknown')",
-    "segment": "COALESCE(NULLIF(TRIM(s.market_segment), ''), 'Unknown')",
-    "owner": "COALESCE(NULLIF(TRIM(s.csm_owner), ''), 'Unknown')",
-}
-
-# Call events are matched to snapshot accounts on the SAME identity the
-# call_key encodes — account_id + rounded_atr + quarter — but on the
-# *components* rather than the composite string. This is deliberate: the
-# call_key stored in account_call_events encodes the quarter in the app's
-# canonical spelling (e.g. 'FY27Q4'), while the CSV/snapshot year_quarter
-# column uses a different spelling for the same quarter (e.g. 'Q4`27' or
-# 'QQ4`27'). Matching on a NORMALIZED quarter avoids that format mismatch
-# silently dropping every call. account_call_events always carries a real
-# account_id, so name-only snapshot rows (which never have calls) simply
-# don't match. ROUND() rounds half away from zero, matching the client's
-# Math.round on positive ATR values.
-def _wb_qnorm(expr: str) -> str:
-    """Canonical 'YYQ<n>' token for a quarter label, format-agnostic.
-
-    Strategy: the quarter digit is always the digit right after a 'Q'; the
-    year is the remaining digit run (last two digits). Handles 'FY27Q4',
-    'Q4`27', 'QQ4`27', '2027Q4', '27Q4', etc. — all -> '27Q4'."""
-    up = f"upper({expr})"
-    year2 = (
-        "right(regexp_replace(regexp_replace(" + up + ", 'Q[1-4]', '', 'g'), "
-        "'[^0-9]', '', 'g'), 2)"
-    )
-    qnum = f"substring({up} from 'Q([1-4])')"
-    return f"({year2} || 'Q' || {qnum})"
-
-
-def _wb_filter_sql(filters: dict, start_index: int) -> tuple[str, list]:
-    """Build the shared-filter WHERE fragment (and its bound params) starting
-    at ``$start_index``. Mirrors the region-filter pattern (``expr = $N``) for
-    each active dimension, plus an optional ATR (ARR) numeric range. An empty
-    or '__ALL__' value means "don't filter this dimension"."""
-    clauses: list[str] = []
-    params: list = []
-    idx = start_index
-    for key, expr in _WB_FILTER_EXPRS.items():
-        val = (filters.get(key) or "").strip() if filters.get(key) is not None else ""
-        if val and val != "__ALL__":
-            clauses.append(f" AND {expr} = ${idx}")
-            params.append(val)
-            idx += 1
-    arr_min = filters.get("arr_min")
-    if arr_min is not None:
-        clauses.append(f" AND COALESCE(s.atr, 0) >= ${idx}")
-        params.append(float(arr_min))
-        idx += 1
-    arr_max = filters.get("arr_max")
-    if arr_max is not None:
-        clauses.append(f" AND COALESCE(s.atr, 0) <= ${idx}")
-        params.append(float(arr_max))
-        idx += 1
-    return ("".join(clauses), params)
-
-
-def _wb_meta_dict(row) -> Optional[dict]:
-    if row is None:
-        return None
-    eff = row["eff"]
-    return {
-        "id": int(row["id"]),
-        "slot": row["slot"],
-        "filename": row["filename"],
-        "uploaded_at": row["uploaded_at"].isoformat(),
-        "effective_date": eff.isoformat() if hasattr(eff, "isoformat") else str(eff),
-        "row_count": int(row["rc"] or 0),
-    }
-
-
-async def _wb_snapshot_meta(conn, upload_id: int) -> Optional[dict]:
-    row = await conn.fetchrow(
-        """
-        SELECT u.id, u.slot, u.filename, u.uploaded_at,
-               COALESCE(MAX(s.effective_date), u.uploaded_at) AS eff,
-               COUNT(s.id) AS rc
-        FROM csv_uploads u
-        LEFT JOIN account_snapshots s ON s.csv_upload_id = u.id
-        WHERE u.id = $1
-        GROUP BY u.id
-        """,
-        upload_id,
-    )
-    return _wb_meta_dict(row)
-
-
-async def _wb_recent_snapshots(conn, slot: str, limit: int) -> list[dict]:
-    """Recent uploads for a slot that actually have parsed snapshot rows,
-    newest-first by effective_date. Feeds the week selector + trend."""
-    rows = await conn.fetch(
-        """
-        SELECT u.id, u.slot, u.filename, u.uploaded_at,
-               MAX(s.effective_date) AS eff,
-               COUNT(s.id) AS rc
-        FROM csv_uploads u
-        INNER JOIN account_snapshots s ON s.csv_upload_id = u.id
-        WHERE u.slot = $1
-        GROUP BY u.id
-        ORDER BY MAX(s.effective_date) DESC, u.uploaded_at DESC
-        LIMIT $2
-        """,
-        slot,
-        limit,
-    )
-    return [_wb_meta_dict(r) for r in rows]
-
-
-async def _wb_prior_snapshot(conn, slot: str, current_id: int,
-                             current_eff: datetime) -> Optional[dict]:
-    """Most recent snapshot (with rows) strictly older than the current one."""
-    row = await conn.fetchrow(
-        """
-        SELECT u.id, u.slot, u.filename, u.uploaded_at,
-               MAX(s.effective_date) AS eff,
-               COUNT(s.id) AS rc
-        FROM csv_uploads u
-        INNER JOIN account_snapshots s ON s.csv_upload_id = u.id
-        WHERE u.slot = $1 AND u.id <> $2
-        GROUP BY u.id
-        HAVING MAX(s.effective_date) < $3
-        ORDER BY MAX(s.effective_date) DESC, u.uploaded_at DESC
-        LIMIT 1
-        """,
-        slot,
-        current_id,
-        current_eff,
-    )
-    return _wb_meta_dict(row)
-
-
-def _wb_band_query(sql: str, band_param_index: int) -> str:
-    """Inject the band predicate, binding it to the given $N placeholder."""
-    return sql.replace(_WB_BAND_PREDICATE,
-                       _WB_BAND_PREDICATE.replace("$BAND$", f"${band_param_index}"))
-
-
-async def _wb_load_accounts(conn, upload_id: int, band: str,
-                            quarter_labels: list[str],
-                            filters: Optional[dict] = None) -> dict:
-    """One aggregated record per account for a snapshot, scoped to band +
-    quarter (+ the shared filters). Uses the structured bu_fc/forecast_summary
-    columns and extracts only the UPSIDE / DOWNSIDE keys from raw_row (bounded,
-    no blob transfer). An empty ``filters`` means all rows (the rollup)."""
-    filter_sql, filter_params = _wb_filter_sql(filters or {}, 4)
-    sql = _wb_band_query(
-        """
-        SELECT s.account_id, s.account_name, s.region, s.bu_fc,
-               s.forecast_summary, s.raw_row->>'UPSIDE' AS upside_raw,
-               s.raw_row->>'DOWNSIDE' AS downside_raw
-        FROM account_snapshots s
-        WHERE s.csv_upload_id = $1
-          AND s.year_quarter = ANY($2::text[])
-          AND {band}
-        """.format(band=_WB_BAND_PREDICATE) + filter_sql,
-        3,
-    )
-    rows = await conn.fetch(sql, upload_id, quarter_labels, band, *filter_params)
-    out: dict = {}
-    for r in rows:
-        acct_id = (r["account_id"] or "").strip()
-        name = (r["account_name"] or "").strip()
-        key = acct_id or ("name:" + name.lower())
-        if not key or key == "name:":
-            continue
-        entry = out.get(key)
-        if entry is None:
-            entry = {
-                "key": key,
-                "account_id": acct_id or None,
-                "account_name": name or acct_id or "(unknown)",
-                "region": (r["region"] or "").strip() or "Unknown",
-                "bu_fc": 0.0,
-                "upside": 0.0,
-                "downside": 0.0,
-                "forecast_summary": None,
-            }
-            out[key] = entry
-        entry["bu_fc"] += float(r["bu_fc"] or 0)
-        entry["upside"] += _wb_to_number(r["upside_raw"])
-        entry["downside"] += _wb_to_number(r["downside_raw"])
-        fs = (r["forecast_summary"] or "").strip()
-        if fs and not entry["forecast_summary"]:
-            entry["forecast_summary"] = fs[:_EXPLANATION_MAX_CHARS]
-    return out
-
-
-def _wb_delta_pct(current: float, prior: float):
-    if prior == 0:
-        return None
-    return (current - prior) / abs(prior) * 100.0
-
-
-@router.get("/weekly-brief")
-async def weekly_brief(
-    request: Request,
-    slot: str = Query(default="active"),
-    current: Optional[int] = Query(default=None),
-    prior: Optional[int] = Query(default=None),
-    quarter: str = Query(default=""),
-    band: str = Query(default=WEEKLY_BRIEF_BAND_DEFAULT),
-    threshold: float = Query(default=WEEKLY_BRIEF_LARGE_SWING_DEFAULT),
-    region: str = Query(default=""),
-    sub_region: str = Query(default=""),
-    cs_manager: str = Query(default=""),
-    segment: str = Query(default=""),
-    owner: str = Query(default=""),
-    arr_min: Optional[float] = Query(default=None),
-    arr_max: Optional[float] = Query(default=None),
-) -> dict:
-    """Weekly 100K+ Regional Brief: WoW bottoms-up forecast movement.
-
-    Returns structured JSON for four sections:
-      1. BU forecast movement per region + overall rollup + trend series
-         (both the system BU total and the calls-adjusted / ELT total).
-      2. Accounts that worsened WoW (BU_FC increased), ranked by adverse
-         swing; movers >= threshold carry an auto-pulled explanation.
-      3. New in-quarter forecast ($0 BU_FC prior -> forecast now).
-      4. Upside movement (total + WoW delta) with top-5 up/down drivers.
-
-    The shared filters (region, sub_region, cs_manager, segment, owner, ARR
-    range) plus band + quarter scope EVERY section (including BOTH trend
-    series) server-side, so the whole brief is uniformly filtered. An empty /
-    '__ALL__' value for a dimension means "all" for that dimension.
-    """
-    normalised_slot = (slot or "active").strip().lower()
-    if normalised_slot not in ("active", "historical"):
-        raise HTTPException(status_code=400, detail="slot must be active or historical")
-
-    # Band bucket vs ARR range: an explicit band='all'/'__ALL__' disables the
-    # coarse band bucket (band_param='' => the LIKE predicate matches every
-    # row), so the ARR range (arr_min/arr_max on s.atr) governs inclusion
-    # instead. Any other value keeps the precomputed band bucket ('100k+').
-    _raw_band = (band or "").strip()
-    if _raw_band.lower() in ("all", "__all__"):
-        band_param = ""
-    else:
-        band_param = _raw_band or WEEKLY_BRIEF_BAND_DEFAULT
-
-    def _clean(v: str) -> str:
-        v = (v or "").strip()
-        return "" if v == "__ALL__" else v
-
-    filters = {
-        "region": _clean(region),
-        "sub_region": _clean(sub_region),
-        "cs_manager": _clean(cs_manager),
-        "segment": _clean(segment),
-        "owner": _clean(owner),
-        "arr_min": arr_min,
-        "arr_max": arr_max,
-    }
-    region_f = filters["region"]
-    try:
-        threshold_val = float(threshold)
-    except (TypeError, ValueError):
-        threshold_val = WEEKLY_BRIEF_LARGE_SWING_DEFAULT
-
-    db = _db(request)
-    async with db.acquire() as conn:
-        recent = await _wb_recent_snapshots(conn, normalised_slot, WEEKLY_BRIEF_TREND_LIMIT)
-
-        # ---- resolve the current + prior snapshot pair --------------------
-        if current is not None:
-            current_meta = await _wb_snapshot_meta(conn, int(current))
-        else:
-            current_meta = recent[0] if recent else None
-
-        if current_meta is None or current_meta["row_count"] == 0:
-            return {
-                "ok": True,
-                "slot": normalised_slot,
-                "band": band_param,
-                "threshold": threshold_val,
-                "current": current_meta,
-                "prior": None,
-                "quarter": None,
-                "warning": "No snapshots with parsed rows are available yet.",
-                "snapshots": recent,
-                "sections": None,
-            }
-
-        current_id = current_meta["id"]
-        current_eff = datetime.fromisoformat(current_meta["effective_date"])
-
-        if prior is not None:
-            prior_meta = await _wb_snapshot_meta(conn, int(prior))
-        else:
-            prior_meta = await _wb_prior_snapshot(
-                conn, normalised_slot, current_id, current_eff
-            )
-
-        warning = None
-        if prior_meta is None:
-            warning = (
-                "Only one snapshot is available — WoW comparison needs at "
-                "least two. Showing current values with no prior baseline."
-            )
-
-        # ---- resolve the current quarter ----------------------------------
-        band_qs = _wb_band_query(
-            "SELECT s.year_quarter AS yq, COUNT(*) AS n "
-            "FROM account_snapshots s "
-            "WHERE s.csv_upload_id = $1 AND s.year_quarter IS NOT NULL "
-            "AND s.year_quarter <> '' AND " + _WB_BAND_PREDICATE + " "
-            "GROUP BY s.year_quarter",
-            2,
-        )
-        q_rows = await conn.fetch(band_qs, current_id, band_param)
-        quarter_counts = {r["yq"]: int(r["n"]) for r in q_rows}
-
-        target_norm = None
-        if quarter.strip():
-            target_norm = _wb_normalize_quarter(quarter.strip())
-        if target_norm is None:
-            target_norm = _wb_current_fiscal_quarter(datetime.now(timezone.utc))
-
-        resolved_quarter = None
-        for label in quarter_counts:
-            if _wb_normalize_quarter(label) == target_norm:
-                resolved_quarter = label
-                break
-        quarter_auto = False
-        if resolved_quarter is None:
-            quarter_auto = True
-            if quarter.strip():
-                resolved_quarter = quarter.strip()
-            elif quarter_counts:
-                # Fallback: the most-populated quarter in the band.
-                resolved_quarter = max(quarter_counts.items(), key=lambda kv: kv[1])[0]
-
-        if not resolved_quarter:
-            return {
-                "ok": True,
-                "slot": normalised_slot,
-                "band": band_param,
-                "threshold": threshold_val,
-                "current": current_meta,
-                "prior": prior_meta,
-                "quarter": None,
-                "warning": "No rows match the requested band for any quarter.",
-                "snapshots": recent,
-                "sections": None,
-            }
-
-        # Every stored label (across the trend window) that maps to the same
-        # fiscal quarter — makes the comparison resilient to format drift.
-        trend_ids = [s["id"] for s in recent]
-        for _id in (current_id, prior_meta["id"] if prior_meta else None):
-            if _id is not None and _id not in trend_ids:
-                trend_ids.append(_id)
-        resolved_pair = _wb_normalize_quarter(resolved_quarter)
-        label_qs = _wb_band_query(
-            "SELECT DISTINCT s.year_quarter AS yq FROM account_snapshots s "
-            "WHERE s.csv_upload_id = ANY($1::bigint[]) "
-            "AND s.year_quarter IS NOT NULL AND s.year_quarter <> '' "
-            "AND " + _WB_BAND_PREDICATE,
-            2,
-        )
-        all_label_rows = await conn.fetch(label_qs, trend_ids, band_param)
-        quarter_labels = sorted({
-            r["yq"] for r in all_label_rows
-            if _wb_normalize_quarter(r["yq"]) == resolved_pair
-        }) or [resolved_quarter]
-
-        # ---- available filter options (UNfiltered by the selected filters so
-        #      every selector stays fully populated even while a value is
-        #      active). One round-trip via UNION ALL, scoped only to
-        #      band + quarter on the current snapshot. ----------------------
-        opt_scope = (
-            "FROM account_snapshots s "
-            "WHERE s.csv_upload_id = $1 AND s.year_quarter = ANY($2::text[]) "
-            "AND " + _WB_BAND_PREDICATE + " "
-        )
-        opt_sql = _wb_band_query(
-            "SELECT DISTINCT dim, val FROM ("
-            + " UNION ALL ".join(
-                f"SELECT '{dim}' AS dim, {expr} AS val " + opt_scope
-                for dim, expr in _WB_FILTER_EXPRS.items()
-            )
-            + ") t",
-            3,
-        )
-        opt_rows = await conn.fetch(opt_sql, current_id, quarter_labels, band_param)
-        available: dict[str, list] = {dim: [] for dim in _WB_FILTER_EXPRS}
-        for r in opt_rows:
-            available.setdefault(r["dim"], []).append(r["val"])
-        for dim in available:
-            available[dim] = sorted(v for v in available[dim] if v)
-        available_regions = available["region"]
-
-        # ---- load both snapshots (bounded, filter-scoped) -----------------
-        current_map = await _wb_load_accounts(
-            conn, current_id, band_param, quarter_labels, filters
-        )
-        prior_map = (
-            await _wb_load_accounts(
-                conn, prior_meta["id"], band_param, quarter_labels, filters
-            )
-            if prior_meta else {}
-        )
-
-        # ---- notes fallback for explanations ------------------------------
-        acct_ids = sorted({
-            e["account_id"] for e in current_map.values() if e["account_id"]
-        })
-        note_map: dict = {}
-        if acct_ids:
-            note_rows = await conn.fetch(
-                """
-                SELECT DISTINCT ON (account_id) account_id, note_text
-                FROM notes
-                WHERE account_id = ANY($1::text[])
-                  AND archived = FALSE AND COALESCE(note_text, '') <> ''
-                ORDER BY account_id, updated_at DESC
-                """,
-                acct_ids,
-            )
-            note_map = {r["account_id"]: (r["note_text"] or "").strip() for r in note_rows}
-
-        # ---- trend series (one aggregate query across the window) ---------
-        # Two totals per snapshot, filter-scoped identically to every other
-        # section:
-        #   total_bu  = SUM(BU_FC)                      (system bottoms-up)
-        #   total_adj = SUM(ELT-as-of-that-snapshot)    (calls-adjusted)
-        # The adjusted total applies, per account, the latest call
-        # (cs_forecast + renewals_forecast) whose effective_date <= the
-        # snapshot's own effective_date, else falls back to BU_FC. The
-        # per-account LATERAL uses the (call_key, effective_date DESC) index
-        # and the account set is already band+quarter+filter-scoped to a few
-        # hundred rows across a handful of snapshots, so this stays bounded.
-        trend_filter_sql, trend_filter_params = _wb_filter_sql(filters, 4)
-        trend_qs = _wb_band_query(
-            "SELECT s.csv_upload_id AS uid, MAX(s.effective_date) AS eff, "
-            "       COALESCE(SUM(s.bu_fc), 0) AS total_bu, "
-            "       COALESCE(SUM(COALESCE(c.elt, s.bu_fc)), 0) AS total_adj "
-            "FROM account_snapshots s "
-            "LEFT JOIN LATERAL ("
-            "    SELECT (COALESCE(e.cs_forecast, 0) "
-            "            + COALESCE(e.renewals_forecast, 0)) AS elt "
-            "    FROM account_call_events e "
-            "    WHERE e.account_id = s.account_id "
-            "      AND e.rounded_atr = ROUND(COALESCE(s.atr, 0))::int "
-            "      AND " + _wb_qnorm("e.year_quarter") + " = "
-            + _wb_qnorm("s.year_quarter") + " "
-            "      AND e.effective_date <= s.effective_date "
-            "    ORDER BY e.effective_date DESC, e.id DESC "
-            "    LIMIT 1"
-            ") c ON TRUE "
-            "WHERE s.csv_upload_id = ANY($1::bigint[]) "
-            "AND s.year_quarter = ANY($2::text[]) "
-            "AND " + _WB_BAND_PREDICATE + " "
-            + trend_filter_sql
-            + " GROUP BY s.csv_upload_id",
-            3,
-        )
-        trend_rows = await conn.fetch(
-            trend_qs, trend_ids, quarter_labels, band_param, *trend_filter_params
-        )
-
-    # ---- build the four sections (in-memory, bounded sets) ----------------
-    def _explain(entry: dict):
-        # Legacy single-source fallback, kept for back-compat on the
-        # explanation/explanation_source fields (UI now uses the pair below).
-        fs = entry.get("forecast_summary")
-        if fs:
-            return fs, "forecast_summary"
-        note = note_map.get(entry["account_id"]) if entry.get("account_id") else None
-        if note:
-            return note[:_EXPLANATION_MAX_CHARS], "note"
-        return None, None
-
-    def _explain_fields(entry: dict):
-        # Two separate, clearly-labeled sources for the "what happened" area.
-        # Each is nullable (present only when it has content) and truncated to
-        # _EXPLANATION_MAX_CHARS. forecast_summary is already truncated on the
-        # entry when it was loaded; the note is truncated here.
-        fs = entry.get("forecast_summary") or None
-        note = note_map.get(entry["account_id"]) if entry.get("account_id") else None
-        note = note[:_EXPLANATION_MAX_CHARS] if note else None
-        return fs, note
-
-    all_keys = set(current_map) | set(prior_map)
-
-    # Section 1 — BU movement per region + rollup
-    region_agg: dict = {}
-    for key in all_keys:
-        cur = current_map.get(key)
-        pri = prior_map.get(key)
-        base = cur or pri
-        region = base["region"]
-        c_bu = cur["bu_fc"] if cur else 0.0
-        p_bu = pri["bu_fc"] if pri else 0.0
-        rg = region_agg.setdefault(
-            region, {"region": region, "current": 0.0, "prior": 0.0, "accounts": 0}
-        )
-        rg["current"] += c_bu
-        rg["prior"] += p_bu
-        rg["accounts"] += 1
-    regions_out = []
-    for rg in region_agg.values():
-        delta = rg["current"] - rg["prior"]
-        regions_out.append({
-            "region": rg["region"],
-            "current": round(rg["current"], 2),
-            "prior": round(rg["prior"], 2),
-            "delta": round(delta, 2),
-            "delta_pct": _wb_delta_pct(rg["current"], rg["prior"]),
-            "accounts": rg["accounts"],
-        })
-    regions_out.sort(key=lambda r: r["current"], reverse=True)
-    roll_cur = sum(r["current"] for r in regions_out)
-    roll_pri = sum(r["prior"] for r in regions_out)
-    rollup = {
-        "current": round(roll_cur, 2),
-        "prior": round(roll_pri, 2),
-        "delta": round(roll_cur - roll_pri, 2),
-        "delta_pct": _wb_delta_pct(roll_cur, roll_pri),
-        "accounts": sum(r["accounts"] for r in regions_out),
-    }
-    trend_by_uid = {int(r["uid"]): r for r in trend_rows}
-    trend_series = []
-    for s in sorted(recent, key=lambda x: x["effective_date"]):
-        tr = trend_by_uid.get(s["id"])
-        if tr is None:
-            continue
-        bu_total = round(float(tr["total_bu"] or 0), 2)
-        adj_total = round(float(tr["total_adj"] or 0), 2)
-        trend_series.append({
-            "upload_id": s["id"],
-            "effective_date": s["effective_date"],
-            "filename": s["filename"],
-            "total_bu_fc": bu_total,
-            "total_adjusted_fc": adj_total,
-            "gap": round(adj_total - bu_total, 2),
-        })
-
-    # Section 2 — worsened WoW (BU_FC increased == more churn/contraction)
-    worsened = []
-    for key in all_keys:
-        cur = current_map.get(key)
-        pri = prior_map.get(key)
-        base = cur or pri
-        c_bu = cur["bu_fc"] if cur else 0.0
-        p_bu = pri["bu_fc"] if pri else 0.0
-        swing = c_bu - p_bu
-        # Require a real PRIOR forecast (p_bu > 0). Brand-new forecasts
-        # ($0 prior -> FC now) are reported only in the "New $0->FC" section,
-        # so the two lists are mutually exclusive (no double-listing).
-        if p_bu > 0 and swing > 0:
-            rec = {
-                "account_id": base["account_id"],
-                "account_name": base["account_name"],
-                "region": base["region"],
-                "current_bu_fc": round(c_bu, 2),
-                "prior_bu_fc": round(p_bu, 2),
-                "swing": round(swing, 2),
-                "is_large": swing >= threshold_val,
-            }
-            if rec["is_large"]:
-                exp, src = _explain(base)
-                rec["explanation"] = exp
-                rec["explanation_source"] = src
-                fs, note = _explain_fields(base)
-                rec["forecast_summary"] = fs
-                rec["renewals_studio_note"] = note
-            worsened.append(rec)
-    worsened.sort(key=lambda r: r["swing"], reverse=True)
-    # True totals BEFORE truncation, so the KPI tiles show the real count
-    # (not the 100-row list cap). The table still returns only the top N.
-    worsened_total = len(worsened)
-    worsened_large_total = sum(1 for r in worsened if r["is_large"])
-    worsened = worsened[:WEEKLY_BRIEF_LIST_CAP]
-
-    # Section 3 — new in-quarter forecast ($0 prior -> forecast now)
-    new_forecast = []
-    for key in all_keys:
-        cur = current_map.get(key)
-        pri = prior_map.get(key)
-        p_bu = pri["bu_fc"] if pri else 0.0
-        c_bu = cur["bu_fc"] if cur else 0.0
-        if p_bu == 0 and c_bu > 0 and cur is not None:
-            rec = {
-                "account_id": cur["account_id"],
-                "account_name": cur["account_name"],
-                "region": cur["region"],
-                "current_bu_fc": round(c_bu, 2),
-                "prior_bu_fc": round(p_bu, 2),
-                "is_large": c_bu >= threshold_val,
-            }
-            if rec["is_large"]:
-                exp, src = _explain(cur)
-                rec["explanation"] = exp
-                rec["explanation_source"] = src
-                fs, note = _explain_fields(cur)
-                rec["forecast_summary"] = fs
-                rec["renewals_studio_note"] = note
-            new_forecast.append(rec)
-    new_forecast.sort(key=lambda r: r["current_bu_fc"], reverse=True)
-    new_forecast_total = len(new_forecast)
-    new_forecast_large_total = sum(1 for r in new_forecast if r["is_large"])
-    new_forecast = new_forecast[:WEEKLY_BRIEF_LIST_CAP]
-
-    # Section 4 — Best Case / Worst Case movement + top-5 up/down drivers.
-    # These are absolute forecasted-C/C totals matching the app's existing
-    # Best/Worst Case columns:
-    #   best_case  = bu_fc + UPSIDE   (UPSIDE arrives negative -> least churn)
-    #   worst_case = bu_fc + DOWNSIDE (DOWNSIDE arrives positive -> most churn)
-    # so best_case <= bu <= worst_case. value_fn maps an account entry to its
-    # per-account value; movers rank by per-account WoW change in that value.
-    def _movement_section(value_fn) -> dict:
-        cur_total = sum(value_fn(e) for e in current_map.values())
-        pri_total = sum(value_fn(e) for e in prior_map.values())
-        movers = []
-        for key in all_keys:
-            cur = current_map.get(key)
-            pri = prior_map.get(key)
-            base = cur or pri
-            c_v = value_fn(cur) if cur else 0.0
-            p_v = value_fn(pri) if pri else 0.0
-            d = c_v - p_v
-            if d == 0:
-                continue
-            movers.append({
-                "account_id": base["account_id"],
-                "account_name": base["account_name"],
-                "region": base["region"],
-                "current_value": round(c_v, 2),
-                "prior_value": round(p_v, 2),
-                "delta": round(d, 2),
-            })
-        top_increase = sorted(
-            [m for m in movers if m["delta"] > 0],
-            key=lambda m: m["delta"], reverse=True,
-        )[:5]
-        top_decrease = sorted(
-            [m for m in movers if m["delta"] < 0],
-            key=lambda m: m["delta"],
-        )[:5]
-        return {
-            "current_total": round(cur_total, 2),
-            "prior_total": round(pri_total, 2),
-            "delta": round(cur_total - pri_total, 2),
-            "delta_pct": _wb_delta_pct(cur_total, pri_total),
-            "top_increase": top_increase,
-            "top_decrease": top_decrease,
-        }
-
-    best_case_section = _movement_section(
-        lambda e: (e["bu_fc"] or 0.0) + (e["upside"] or 0.0)
-    )
-    worst_case_section = _movement_section(
-        lambda e: (e["bu_fc"] or 0.0) + (e["downside"] or 0.0)
-    )
-
-    return {
-        "ok": True,
-        "slot": normalised_slot,
-        "band": band_param,
-        "threshold": threshold_val,
-        "region": region_f or "__ALL__",
-        "filters": {
-            "region": filters["region"] or "__ALL__",
-            "sub_region": filters["sub_region"] or "__ALL__",
-            "cs_manager": filters["cs_manager"] or "__ALL__",
-            "segment": filters["segment"] or "__ALL__",
-            "owner": filters["owner"] or "__ALL__",
-            "arr_min": filters["arr_min"],
-            "arr_max": filters["arr_max"],
-        },
-        "available_regions": available_regions,
-        "available_sub_regions": available["sub_region"],
-        "available_cs_managers": available["cs_manager"],
-        "available_segments": available["segment"],
-        "available_owners": available["owner"],
-        "quarter": resolved_quarter,
-        "quarter_auto_selected": quarter_auto,
-        "quarter_labels": quarter_labels,
-        "current": current_meta,
-        "prior": prior_meta,
-        "warning": warning,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "snapshots": recent,
-        "sections": {
-            "bu_movement": {
-                "regions": regions_out,
-                "rollup": rollup,
-                "trend": trend_series,
-            },
-            "worsened": worsened,
-            "worsened_total": worsened_total,
-            "worsened_large_total": worsened_large_total,
-            "new_forecast": new_forecast,
-            "new_forecast_total": new_forecast_total,
-            "new_forecast_large_total": new_forecast_large_total,
-            "best_case": best_case_section,
-            "worst_case": worst_case_section,
-        },
-    }
+# Weekly Brief lives in app/routes/weekly_brief.py (included from main.py).
 
 
 @router.get("/notes/export")

@@ -22,13 +22,13 @@ def _db(request: Request):
 
 
 class RoleUpdateBody(BaseModel):
-    role: Literal["standard", "admin", "owner"]
+    role: Literal["standard", "update", "admin", "owner"]
 
 
 class ManualUserBody(BaseModel):
     email: str = Field(min_length=3)
     display_name: str = ""
-    role: Literal["standard", "admin"] = "standard"
+    role: Literal["standard", "update", "admin"] = "standard"
 
 
 @router.get("/whoami")
@@ -168,7 +168,7 @@ async def users_update_role(
 ) -> dict:
     target = email.strip().lower()
     # Only an OWNER may grant the owner role (privilege-escalation guard).
-    # Admins can still promote/demote between standard and admin.
+    # Admins can promote/demote among standard, update, and admin.
     if body.role == "owner" and admin.role != "owner":
         raise HTTPException(
             status_code=403,

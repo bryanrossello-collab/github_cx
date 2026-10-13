@@ -6,15 +6,34 @@ Authentication: signed-in user with ``role=admin`` from header-based SSO
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import FileResponse
 
 from app.auth import require_admin, require_owner
 from app.config import get_settings
 from app.database import DatabaseUnavailable
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+_PUBLIC_DIR = Path(__file__).resolve().parent.parent.parent / "public"
+_ADMIN_HTML = _PUBLIC_DIR / "admin.html"
+
+
+@router.get("", include_in_schema=False)
+@router.get("/", include_in_schema=False)
+async def admin_page() -> FileResponse:
+    """Serve the admin UI at /admin and /admin/.
+
+    Lives on this router (not only app.main) so a deploy that copies
+    ``app/routes/admin.py`` still gets the HTML page. FastAPI's JSON
+    ``{"detail":"Not Found"}`` is what you see when this route is missing.
+    """
+    if not _ADMIN_HTML.is_file():
+        raise HTTPException(status_code=404, detail="admin.html is not in this image")
+    return FileResponse(_ADMIN_HTML, media_type="text/html")
 
 
 # ---------------------------------------------------------------------------

@@ -75,6 +75,7 @@
     input:focus, select:focus, textarea:focus {
       border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79,70,229,.12);
     }
+    select.role-select { width: auto; min-width: 168px; padding: 5px 8px; font-size: 13px; }
     textarea { min-height: 60px; resize: vertical; }
 
     .btn {
@@ -214,6 +215,15 @@
           The run happens in the background (~2&nbsp;min in real mode); keep this tab
           open — polling keeps the instance warm until it finishes.
           <br />
+          <strong>Automatic refresh:</strong> when someone opens the dashboard and the newest
+          snapshot is older than the cadence below, the app runs the same pull in the
+          background with that person's sign-in. They keep seeing the current data and get
+          a Reload prompt when the new snapshot lands.
+          <br />
+          <strong>Retention:</strong> after each successful refresh, snapshots older than
+          30&nbsp;days are thinned to one per week, and snapshots older than 52&nbsp;weeks
+          are deleted. The newest snapshot is never deleted.
+          <br />
           <strong>Manual CSV upload below remains fully available</strong> as a fallback.
         </p>
         <div id="snowflake-settings" class="status-grid" style="margin:12px 0;"></div>
@@ -235,6 +245,11 @@
             <div><label for="sf-min-arr">Min prior-qtr ARR floor</label><input id="sf-min-arr" type="number" min="0" step="1000" placeholder="10000" /></div>
             <div><label for="sf-band-cutoff">100k band cutoff</label><input id="sf-band-cutoff" type="number" min="0" step="1000" placeholder="100000" /></div>
           </div>
+          <p class="muted" style="margin:16px 0 4px;font-weight:600;color:#334155;">Automatic refresh</p>
+          <p class="muted" style="margin:0 0 8px;">Pull a new snapshot when someone opens the dashboard and the newest one is older than this many hours. <strong>0</strong> turns it off.</p>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;">
+            <div><label for="sf-auto-hours">Refresh when older than (hours)</label><input id="sf-auto-hours" type="number" min="0" step="1" placeholder="48" /></div>
+          </div>
           <div style="display:flex;gap:8px;align-items:center;margin-top:10px;">
             <button class="btn btn-sm" id="sf-save-btn" type="button">Save settings</button>
             <span id="sf-save-state" class="muted"></span>
@@ -244,6 +259,7 @@
           <button class="btn btn-primary" id="snowflake-run-now">Run now</button>
           <span id="snowflake-run-state" class="muted"></span>
         </div>
+        <div id="snowflake-auto-state" class="muted" style="margin-top:8px;"></div>
         <div id="snowflake-run-result" style="margin-top:12px;"></div>
       </section>
 
@@ -327,8 +343,8 @@
         <h2>User access</h2>
         <p class="muted">
           Provision colleagues before their first SSO sign-in. <strong>Admin</strong> users can
-          open this panel and manage users; <strong>Standard</strong> users edit notes on the dashboard.
-          <strong>Owner</strong> (platform super-user) controls CSV uploads and notes import.
+          open this panel and manage users; <strong>Update</strong> users can edit notes, calls, and planning.
+          <strong>Standard</strong> is view-only. <strong>Owner</strong> controls CSV uploads and notes import.
         </p>
         <form id="user-add-form" style="margin-top:12px;display:grid;grid-template-columns:1.4fr 1fr 140px auto;gap:8px;align-items:end;">
           <div>
@@ -342,7 +358,8 @@
           <div>
             <label for="user-role">Role</label>
             <select id="user-role">
-              <option value="standard">Standard</option>
+              <option value="standard">Standard (view only)</option>
+              <option value="update">Update</option>
               <option value="admin">Admin</option>
             </select>
           </div>
@@ -427,7 +444,7 @@
         <p class="muted">
           Control which dashboard tabs each role can see. Owners always have access to
           all tabs regardless of this matrix — use this to hide work-in-progress tabs
-          (e.g. Trending) from admins and standard users.
+          (e.g. Trending) from admins, update, and standard users.
         </p>
         <div id="tab-access-matrix" style="margin-top:12px;overflow-x:auto;"></div>
         <div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end;">
@@ -566,6 +583,8 @@
     function roleBadge(role) {
       if (role === 'owner') return ' <span class="owner-badge">Owner</span>';
       if (role === 'admin') return ' <span class="admin-badge">Admin</span>';
+      if (role === 'update') return ' <span class="pill pill-ok">Update</span>';
+      if (role === 'standard') return ' <span class="pill">Standard</span>';
       return '';
     }
 
@@ -634,6 +653,7 @@
       return {
         owner: ['region', 'trending', 'partner', 'accounts', 'notes', 'historical', 'targets', 'weekly', 'pacing'],
         admin: ['region', 'partner', 'accounts', 'notes', 'historical', 'targets', 'weekly', 'pacing'],
+        update: ['region', 'partner', 'accounts', 'notes', 'targets', 'weekly', 'pacing'],
         standard: ['region', 'partner', 'accounts', 'notes', 'targets', 'weekly', 'pacing'],
       };
     }
@@ -641,7 +661,7 @@
     function renderTabAccessMatrix() {
       const host = $('tab-access-matrix');
       if (!host || !_tabAccessMatrix) return;
-      const roles = ['admin', 'standard'];
+      const roles = ['admin', 'update', 'standard'];
       const tabs = _tabAccessAllTabs.length ? _tabAccessAllTabs : Object.keys(TAB_LABELS);
       let html = '<table><thead><tr><th>Tab</th>';
       roles.forEach(function (role) {
@@ -677,7 +697,7 @@
     async function saveTabAccessConfig() {
       const resultEl = $('tab-access-result');
       const matrix = { owner: _tabAccessAllTabs.slice() };
-      ['admin', 'standard'].forEach(function (role) {
+      ['admin', 'update', 'standard'].forEach(function (role) {
         matrix[role] = [];
         document.querySelectorAll('input[data-tab-role="' + role + '"]:checked').forEach(function (cb) {
           matrix[role].push(cb.getAttribute('data-tab-id'));
@@ -827,8 +847,13 @@
       const tbody = $('uploads-tbody');
       tbody.innerHTML = '<tr><td colspan="10" class="muted" style="text-align:center;padding:24px;">Loading…</td></tr>';
       try {
-        // Use the new /api/renewals/snapshots which adds row_count + atr_total
-        const data = await api('/api/renewals/snapshots?limit=100');
+        // Cached csv_uploads stats only — never live COUNT/SUM on 279k snapshot rows.
+        let data;
+        try {
+          data = await api('/api/renewals/snapshots?limit=100');
+        } catch (snapErr) {
+          data = await api('/admin/csv-uploads?limit=100');
+        }
         let items = data.items || [];
         const slot = $('filter-slot').value;
         if (slot) items = items.filter(it => it.slot === slot);
@@ -842,7 +867,7 @@
             <td><span class="pill pill-${it.slot}">${slotLabel(it.slot)}</span></td>
             <td title="${it.filename}">${it.filename}</td>
             <td class="num">${(it.row_count || 0).toLocaleString()}</td>
-            <td class="num">${(it.distinct_accounts || 0).toLocaleString()}</td>
+            <td class="num">${it.distinct_accounts ? Number(it.distinct_accounts).toLocaleString() : '—'}</td>
             <td class="num">${fmtCurrency(it.atr_total)}</td>
             <td class="num muted">${fmtBytes(it.size_bytes)}</td>
             <td class="muted">${it.uploaded_by || '—'}</td>
@@ -880,44 +905,53 @@
         tbody.innerHTML = users.map(function (u) {
           const email = u.email || '';
           const safeEmail = email.replace(/"/g, '&quot;');
-          const role = u.role === 'owner' ? 'owner' : (u.role === 'admin' ? 'admin' : 'standard');
+          const role = u.role || 'standard';
           const isSelf = currentUser && currentUser.email && currentUser.email.toLowerCase() === email.toLowerCase();
           const isOwnerViewer = currentUser && currentUser.role === 'owner';
-          const rolePill = role === 'owner' ? 'owner-badge' : (role === 'admin' ? 'pill-ok' : '');
-          // Build the action buttons. Only an owner sees "Make owner".
-          const actions = [];
-          if (role === 'owner') {
-            actions.push('<span class="muted">Owner</span>');
-          } else if (role === 'admin') {
-            if (isSelf) actions.push('<span class="muted">You</span>');
-            else actions.push('<button class="btn btn-sm" data-demote="' + safeEmail + '">Make standard</button>');
-            if (isOwnerViewer && !isSelf) actions.push('<button class="btn btn-sm" data-owner="' + safeEmail + '">Make owner</button>');
+          const locked = role === 'owner' || (isSelf && (role === 'admin' || role === 'owner'));
+          let roleCell;
+          if (locked) {
+            roleCell = '<span class="pill ' + (role === 'owner' ? 'owner-badge' : 'pill-ok') + '">' + role + '</span>';
           } else {
-            actions.push('<button class="btn btn-sm btn-primary" data-promote="' + safeEmail + '">Make admin</button>');
-            if (isOwnerViewer) actions.push('<button class="btn btn-sm" data-owner="' + safeEmail + '">Make owner</button>');
+            const opts = [
+              ['standard', 'Standard (view only)'],
+              ['update', 'Update'],
+              ['admin', 'Admin']
+            ];
+            if (isOwnerViewer) opts.push(['owner', 'Owner']);
+            roleCell = '<select class="role-select" data-role-select="' + safeEmail + '">' +
+              opts.map(function (o) {
+                return '<option value="' + o[0] + '"' + (o[0] === role ? ' selected' : '') + '>' + o[1] + '</option>';
+              }).join('') +
+              '</select>';
+          }
+          const actions = [];
+          if (!locked) {
+            actions.push('<button class="btn btn-sm btn-primary" data-role-save="' + safeEmail + '">Update</button>');
+          } else if (isSelf) {
+            actions.push('<span class="muted">You</span>');
+          } else {
+            actions.push('<span class="muted">Owner</span>');
           }
           if (!isSelf && role !== 'owner') actions.push('<button class="btn btn-sm btn-danger" data-remove-user="' + safeEmail + '">Remove</button>');
           return '<tr data-user-email="' + safeEmail + '">' +
             '<td><code>' + email + '</code></td>' +
             '<td>' + (u.displayName || '—') + '</td>' +
-            '<td><span class="pill ' + rolePill + '">' + role + '</span></td>' +
+            '<td>' + roleCell + '</td>' +
             '<td class="muted">' + (u.lastSeenAt ? fmtDate(u.lastSeenAt) : '—') + '</td>' +
             '<td class="muted">' + (u.updatedAt ? fmtDate(u.updatedAt) : '—') + '</td>' +
             '<td style="white-space:nowrap">' + actions.join(' ') + '</td>' +
           '</tr>';
         }).join('');
-        tbody.querySelectorAll('[data-promote]').forEach(function (btn) {
-          btn.addEventListener('click', function () { changeUserRole(btn.dataset.promote, 'admin'); });
-        });
-        tbody.querySelectorAll('[data-owner]').forEach(function (btn) {
+        tbody.querySelectorAll('[data-role-save]').forEach(function (btn) {
           btn.addEventListener('click', function () {
-            if (confirm('Promote ' + btn.dataset.owner + ' to OWNER? Owners have full control, including managing other owners.')) {
-              changeUserRole(btn.dataset.owner, 'owner');
-            }
+            const email = btn.dataset.roleSave;
+            const sel = tbody.querySelector('select[data-role-select="' + email.replace(/"/g, '\\"') + '"]');
+            const next = sel ? sel.value : '';
+            if (!next) return;
+            if (next === 'owner' && !confirm('Promote ' + email + ' to OWNER? Owners have full control, including managing other owners.')) return;
+            changeUserRole(email, next);
           });
-        });
-        tbody.querySelectorAll('[data-demote]').forEach(function (btn) {
-          btn.addEventListener('click', function () { changeUserRole(btn.dataset.demote, 'standard'); });
         });
         tbody.querySelectorAll('[data-remove-user]').forEach(function (btn) {
           btn.addEventListener('click', function () { removeUser(btn.dataset.removeUser); });
@@ -1192,6 +1226,7 @@
 
     // ---- Snowflake source (Run now) ----
     let _snowflakePollTimer = null;
+    let _autoPrivate = null;
 
     function renderSnowflakeSettings(s) {
       const host = $('snowflake-settings');
@@ -1209,6 +1244,8 @@
         ['Forward (qtrs)', (s.n_future === null || s.n_future === undefined) ? '—' : s.n_future],
         ['Min ARR floor', num(s.min_arr)],
         ['Band cutoff', num(s.band_cutoff)],
+        ['Auto-refresh', s.mode !== 'real' ? 'Off (simulated)'
+          : (Number(s.auto_refresh_hours) > 0 ? 'Every ' + s.auto_refresh_hours + 'h' : 'Off')],
       ];
       host.innerHTML = items.map(function (row) {
         const label = row[0], value = row[1], pill = row[2];
@@ -1232,7 +1269,45 @@
         set('sf-n-future', q.n_future);
         set('sf-min-arr', q.min_arr);
         set('sf-band-cutoff', q.band_cutoff);
+        set('sf-auto-hours', data.auto ? data.auto.hours : '');
+        _autoPrivate = (data && data.auto) || null;
+        renderAutoState(_autoPrivate);
       } catch (e) { /* non-owner or not ready — ignore */ }
+    }
+
+    // Owner-only detail (who triggered the last automatic run, its error,
+    // skipped visitors), without touching unsaved form edits.
+    async function refreshAutoPrivate() {
+      try {
+        const data = await api('/api/renewals/snowflake-config');
+        _autoPrivate = (data && data.auto) || null;
+        renderAutoState(_autoPrivate);
+      } catch (e) { /* non-owner or not ready — ignore */ }
+    }
+
+    function renderAutoState(auto) {
+      const el = $('snowflake-auto-state');
+      if (!el || !auto) return;
+      const priv = _autoPrivate || {};
+      const parts = [];
+      if (!auto.enabled) {
+        parts.push(auto.hours > 0 ? 'Automatic refresh is off in simulated mode' : 'Automatic refresh is off');
+      } else {
+        parts.push('Automatic refresh every ' + auto.hours + 'h');
+        if (auto.due_at) parts.push('next run on the first visit after ' + fmtDate(auto.due_at));
+      }
+      if (auto.last_attempt_at) {
+        let last = 'last automatic run ' + fmtDate(auto.last_attempt_at) + ': ' + (auto.last_result || '—');
+        if (priv.last_attempt_by) last += ' (' + priv.last_attempt_by + ')';
+        if (priv.last_error && auto.last_result !== 'done' && auto.last_result !== 'running') last += ' — ' + priv.last_error;
+        parts.push(last);
+      }
+      if (auto.cooldown_until && new Date(auto.cooldown_until) > new Date()) {
+        parts.push('paused until ' + fmtDate(auto.cooldown_until));
+      }
+      const skipped = Object.keys(priv.skipped_users || {});
+      if (skipped.length) parts.push('not using ' + skipped.join(', ') + ' for now');
+      el.textContent = parts.join(' · ');
     }
 
     async function saveSnowflakeConfig() {
@@ -1247,7 +1322,8 @@
       };
       // Query params: include only when non-empty (blank keeps the code default).
       [['sf-n-past', 'n_past'], ['sf-n-future', 'n_future'],
-       ['sf-min-arr', 'min_arr'], ['sf-band-cutoff', 'band_cutoff']].forEach(function (pair) {
+       ['sf-min-arr', 'min_arr'], ['sf-band-cutoff', 'band_cutoff'],
+       ['sf-auto-hours', 'auto_refresh_hours']].forEach(function (pair) {
         const raw = val(pair[0]);
         if (raw !== '') { const n = Number(raw); if (!Number.isNaN(n)) body[pair[1]] = n; }
       });
@@ -1310,6 +1386,7 @@
         const data = await api('/api/renewals/refresh-status');
         renderSnowflakeSettings(data.settings);
         renderRefreshResult(data);
+        if (data.auto) renderAutoState(Object.assign({}, _autoPrivate || {}, data.auto));
         return data;
       } catch (err) {
         return null;
@@ -1335,6 +1412,7 @@
           else if (data && data.status === 'error') showToast('Snowflake refresh finished with errors', 'error');
           refreshList();
           refreshStatus();
+          refreshAutoPrivate();
         }
       }, 5000);
     }

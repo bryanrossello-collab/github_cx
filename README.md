@@ -14,7 +14,7 @@ The **Renewals Intelligence Studio** dashboard packaged for **Google Cloud Run**
 | --- | --- | --- |
 | Backend | Node.js + Express | **Python 3.12 + FastAPI + asyncpg** (Signal CX pattern) |
 | Persistence | `data/notes.json` + filesystem CSVs | **Cloud SQL Postgres** — notes, tombstones, raw CSV blobs, **and parsed `account_snapshots`** |
-| Upload model | One-at-a-time, overwrote on disk | **Every upload is an immutable snapshot.** The dashboard reads the latest; history is retained for WoW / MoM analysis |
+| Upload model | One-at-a-time, overwrote on disk | **Every upload is an immutable snapshot.** The dashboard reads the latest; history is kept for WoW / MoM analysis (30 days in full, then weekly for a year) |
 | Admin entry point | None | **Admin tab** in the dashboard top-strip → `/admin` (password: `signal`) |
 | Notes import | macOS dialog | **`/admin` page** — drop a notes JSON file, password-gated |
 | CSV import button | Settings menu | **Removed from dashboard topbar** — all imports live behind the Admin tab |
@@ -29,9 +29,10 @@ The **Renewals Intelligence Studio** dashboard packaged for **Google Cloud Run**
 
 1. **Admin uploads the initial CSV** via the Admin tab (password `signal`).
 2. Server stores the raw bytes in `csv_uploads` (BYTEA) **and** parses each row into `account_snapshots` (~50K rows for a typical F1 Sheet).
-3. **Subsequent uploads** (weekly / a few times a week) → each becomes a new snapshot with its own `effective_date`.
-4. **Dashboard reporting** reads the newest snapshot per slot — always the latest book.
+3. **New snapshots come from Snowflake** — Run-now on `/admin`, or automatically: when someone opens the dashboard and the newest snapshot is older than the cadence (48 hours by default, editable on `/admin`), the app pulls a fresh one in the background using that visitor's sign-in. CSV uploads still work. Each becomes a new snapshot with its own `effective_date`.
+4. **Dashboard reporting** reads the newest snapshot per slot — always the latest book. It never waits on Snowflake; when a background pull lands, a "Fresh Snowflake data is ready" prompt offers a reload.
 5. **WoW / MoM analysis** queries `account_snapshots` ordered by `effective_date`. The /admin "Account history" lookup demonstrates this: type any account ID, see its full timeline of health / ATR / forecast changes.
+6. **Retention** — after each successful Snowflake refresh, active snapshots are kept in full for 30 days, then one per week for 52 weeks; older ones are deleted. The newest snapshot is never deleted.
 
 ---
 
@@ -196,9 +197,14 @@ Without a database the app still boots and serves `/`, `/admin`, `/healthz`, and
 | `GET`  | `/api/renewals/data-source/file?match=<sub>` | none | Stream that CSV |
 | `POST` | `/api/renewals/upload-csv` | password | Upload a new CSV (creates a new snapshot in `csv_uploads` + parses rows into `account_snapshots`) |
 | `POST` | `/api/renewals/notes/import` | password | Bulk import notes from a JSON payload (same shape as `Export Notes` output) |
-| `GET`  | `/api/renewals/snapshots` | none | List CSV upload history with parsed-row counts |
+| `GET`  | `/api/renewals/snapshots` | none | List CSV upload history from cached `csv_uploads` stats (no live 279k scan) |
 | `GET`  | `/api/renewals/snapshots/{id}/summary` | none | One snapshot's totals + health / region breakdown |
 | `GET`  | `/api/renewals/account-history/{account_id}` | none | One account's timeline across every snapshot |
+| `GET`  | `/api/renewals/weekly-brief` | none | Weekly 100K+ brief: latest snapshot vs about a week earlier, weekly trend (see AGENTS.md §5.10) |
+| `POST` | `/api/renewals/refresh` | owner | Snowflake Run-now in the background; 409 while any instance is refreshing |
+| `POST` | `/api/renewals/refresh/auto` | signed in | Stale-while-revalidate trigger: starts a background Snowflake pull with the caller's token when the newest snapshot is older than the cadence, else answers `fresh` (AGENTS.md §5.11) |
+| `GET`  | `/api/renewals/refresh-status` | none | Current or last refresh job, effective settings, and the automatic-refresh summary |
+| `GET` / `PUT` | `/api/renewals/snowflake-config` | owner | Connection overrides, query parameters, and `auto_refresh_hours` (0 = off) |
 | `POST` | `/api/renewals/reveal` | none | `501` — macOS only |
 
 ---

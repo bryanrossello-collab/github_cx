@@ -175,6 +175,11 @@ function persistNotesDeleted(deletesObj) {
   } catch {
   }
 }
+function canUpdateData() {
+  if (typeof window !== "undefined" && typeof window.__renewalsCanUpdate === "boolean") return window.__renewalsCanUpdate;
+  const u = typeof window !== "undefined" ? window.__renewalsCurrentUser : null;
+  return !!(u && (u.role === "update" || u.role === "admin" || u.role === "owner"));
+}
 const FIELD_KEYS = {
   YEAR_QUARTER: ["YEAR_QUARTER", "YEAR_QUARTER_YYYYQQ", "YEAR-QUARTER", "YR_QTR", "QTR", "YEARQTR"],
   FISCAL_QUARTER: ["FISCAL_QUARTER", "FISCAL QUARTER", "FQ"],
@@ -194,6 +199,7 @@ const FIELD_KEYS = {
   NEXT_RENEWAL_DATE: ["NEXT_RENEWAL_DATE", "RENEWAL_DATE", "RENEW_DATE"],
   LARGEST_RENEWAL_DATE: ["LARGEST_RENEWAL_DATE", "LARGEST RENEWAL DATE"],
   FORECAST_SUMMARY: ["FORECAST_SUMMARY", "FORECAST", "FC_SUMMARY"],
+  LAST_CSM_RENEWAL_NOTES: ["LAST_CSM_RENEWAL_NOTES", "LAST_CSM_RENEWAL_NOTES_GC"],
   DICTATED_BY: ["DICTATED_BY", "RENEWAL_DICTATED_BY", "DICTATED BY"],
   OWNER: ["CRM_SUCCESS_OWNER_NAME", "SUCCESS_OWNER", "OWNER", "CSM"],
   PARTNER: ["PARTNER"],
@@ -372,6 +378,7 @@ function buildHeaderMap(headers) {
   map.NEXT_RENEWAL_DATE = find(FIELD_KEYS.NEXT_RENEWAL_DATE);
   map.LARGEST_RENEWAL_DATE = find(FIELD_KEYS.LARGEST_RENEWAL_DATE);
   map.FORECAST_SUMMARY = find(FIELD_KEYS.FORECAST_SUMMARY);
+  map.LAST_CSM_RENEWAL_NOTES = find(FIELD_KEYS.LAST_CSM_RENEWAL_NOTES) || "LAST_CSM_RENEWAL_NOTES";
   map.OWNER = find(FIELD_KEYS.OWNER) || "CRM_SUCCESS_OWNER_NAME";
   map.DICTATED_BY = find(FIELD_KEYS.DICTATED_BY) || "DICTATED_BY";
   map.PARTNER = find(FIELD_KEYS.PARTNER);
@@ -500,6 +507,49 @@ function mapFiscal(dt) {
   const fqNum = Math.floor(offset / 3) + 1;
   const fy = `FY${String(fyNum).slice(-2)}`;
   return { fy, fq: `${fy}Q${fqNum}` };
+}
+// Zendesk FY (ends January): FY27 = Feb 2026–Jan 2027. Jan 2026 = FY26Q1.
+// Used by the Filters bar so quarter membership follows NEXT_RENEWAL_DATE,
+// not the raw CSV YEAR_QUARTER label (those two often disagree).
+function zendeskFiscalQuarter(y, m0) {
+  if (!(y > 0) || m0 == null || m0 < 0 || m0 > 11) return "";
+  if (y === 2026 && m0 === 0) return "FY26Q1";
+  const fyNum = m0 === 0 ? y : y + 1;
+  const offset = (m0 + 11) % 12;
+  const fqNum = Math.floor(offset / 3) + 1;
+  return "FY" + String(fyNum).slice(-2) + "Q" + fqNum;
+}
+function calendarYMD(x) {
+  if (x == null || x === "") return null;
+  const s = String(x).trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (m) return { y: Number(m[1]), m0: Number(m[2]) - 1 };
+  const dt = parseDate(x);
+  if (!dt) return null;
+  return { y: dt.getFullYear(), m0: dt.getMonth() };
+}
+function fiscalQuarterFromRenewal(dateRaw) {
+  const p = calendarYMD(dateRaw);
+  return p ? zendeskFiscalQuarter(p.y, p.m0) : "";
+}
+function rowFilterQuarter(row, headerMap) {
+  const dateKey = (headerMap && (headerMap.NEXT_RENEWAL_DATE || headerMap.RENEWAL_DATE)) || "NEXT_RENEWAL_DATE";
+  const fromDate = fiscalQuarterFromRenewal(row && row[dateKey]);
+  if (fromDate) return fromDate;
+  const qKey = (headerMap && (headerMap.FISCAL_QUARTER || headerMap.YEAR_QUARTER)) || "YEAR_QUARTER";
+  const raw = safeString(row && (row[qKey] || row.FISCAL_QUARTER || row.YEAR_QUARTER));
+  return deriveFiscalFromQuarterLabel(raw).fq || raw;
+}
+function quarterInFilter(rowFq, selected) {
+  if (!selected || !selected.length) return true;
+  if (selected.includes(rowFq)) return true;
+  const norm = deriveFiscalFromQuarterLabel(rowFq).fq;
+  if (norm && selected.includes(norm)) return true;
+  for (let i = 0; i < selected.length; i++) {
+    const sn = deriveFiscalFromQuarterLabel(selected[i]).fq || selected[i];
+    if (sn === rowFq || (norm && sn === norm)) return true;
+  }
+  return false;
 }
 function normalizeAccountName(name) {
   return safeString(name).toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
@@ -870,7 +920,7 @@ function makeRowMatcher(headerMap, filters, settings, notes, opts) {
     const segment = safeString(r[segmentKey]);
     const industry = safeString(r[industryKey]);
     const health = safeString(r[healthKey]);
-    const quarter = safeString(r[quarterKey]);
+    const quarter = rowFilterQuarter(r, headerMap);
     const owner = safeString(r[ownerKey]);
     const partner = safeString(r[partnerKey]);
     const partnerType = safeString(r[partnerTypeKey]);
@@ -880,10 +930,16 @@ function makeRowMatcher(headerMap, filters, settings, notes, opts) {
     if (skipKey !== "segments" && filters.segments.length && !filters.segments.includes(segment)) return false;
     if (skipKey !== "industries" && filters.industries && filters.industries.length && !filters.industries.includes(industry)) return false;
     if (skipKey !== "healths" && filters.healths.length && !filters.healths.includes(health)) return false;
-    if (skipKey !== "quarters" && !ignoreQuarters && filters.quarters.length && !filters.quarters.includes(quarter)) return false;
+    if (skipKey !== "quarters" && !ignoreQuarters && filters.quarters.length && !quarterInFilter(quarter, filters.quarters)) return false;
     if (skipKey !== "owners" && filters.owners.length && !filters.owners.includes(owner)) return false;
     if (skipKey !== "partners" && filters.partners.length && !filters.partners.includes(partner)) return false;
     if (skipKey !== "partnerTypes" && filters.partnerTypes.length && !filters.partnerTypes.includes(partnerType)) return false;
+    const subregionKey = headerMap.SUBREGION || get("SUBREGION") || "PRO_FORMA_SUBREGION";
+    const csManagerKey = headerMap.MANAGER_SUCCESS || get("MANAGER_SUCCESS") || "MANAGER_SUCCESS";
+    const subregion = safeString(r[subregionKey]);
+    const csManager = safeString(r[csManagerKey]);
+    if (skipKey !== "subregions" && (filters.subregions || []).length && !filters.subregions.includes(subregion)) return false;
+    if (skipKey !== "csManagers" && (filters.csManagers || []).length && !filters.csManagers.includes(csManager)) return false;
     if (from && (!dt || dt < from)) return false;
     if (to && (!dt || dt > to)) return false;
     const atrVal = getAtrValue(r, headerMap, settings);
@@ -940,12 +996,12 @@ function makeRowMatcher(headerMap, filters, settings, notes, opts) {
 // Faceted DISTINCT-ACCOUNT counts for a filter dimension. For each option
 // value of `valueKey` it counts the unique accounts that would match if that
 // dimension were selected, honoring every other active filter (skipKey).
-function facetAccountCounts(rows, headerMap, match, valueKey, skipKey) {
+function facetAccountCounts(rows, headerMap, match, valueKey, skipKey, valueFn) {
   const idKey = headerMap.ACCOUNT_ID || "CRM_ACCOUNT_ID";
   const nameKey = headerMap.ACCOUNT_NAME || "CRM_ACCOUNT_NAME";
   const map = /* @__PURE__ */ new Map();
   for (const r of rows) {
-    const value = safeString(r[valueKey]);
+    const value = valueFn ? safeString(valueFn(r)) : safeString(r[valueKey]);
     let entry = map.get(value);
     if (!entry) {
       entry = { value, label: value || "(Blank)", set: /* @__PURE__ */ new Set() };
@@ -1075,11 +1131,9 @@ const BAND_OPTIONS = [
 ];
 const VALID_TABS = ["region", "partner", "accounts", "notes", "historical", "targets", "weekly", "pacing"];
 const DEFAULT_QUARTERS = ["FY25Q4", "FY26Q1", "FY27Q1", "FY27Q2", "FY27Q3", "FY27Q4"];
-const initialState = {
-  data: [],
-  headers: [],
-  headerMap: {},
-  filters: {
+const FILTER_LIST_KEYS = ["regions", "countries", "segments", "industries", "healths", "quarters", "owners", "partners", "partnerTypes", "subregions", "csManagers"];
+function emptyFilters() {
+  return {
     regions: [],
     countries: [],
     segments: [],
@@ -1089,12 +1143,44 @@ const initialState = {
     owners: [],
     partners: [],
     partnerTypes: [],
+    subregions: [],
+    csManagers: [],
     search: "",
     dateFrom: "",
     dateTo: "",
     band: "all",
-    hasNotes: false
-  },
+    hasNotes: false,
+    arrRanges: [],
+    arrMin: null,
+    arrMax: null
+  };
+}
+function isDefaultQuarters(q) {
+  const d = DEFAULT_QUARTERS;
+  return Array.isArray(q) && q.length === d.length && q.every((x, i) => x === d[i]);
+}
+function countActiveFilters(filters) {
+  const f = filters || {};
+  let total = 0;
+  FILTER_LIST_KEYS.forEach((k) => {
+    const arr = f[k] || [];
+    if (k === "quarters" && isDefaultQuarters(arr)) return;
+    total += arr.length;
+  });
+  if (f.search) total += 1;
+  if (f.dateFrom || f.dateTo) total += 1;
+  if (f.band && f.band !== "all") total += 1;
+  if (f.hasNotes) total += 1;
+  const ranges = Array.isArray(f.arrRanges) ? f.arrRanges : [];
+  if (ranges.length) total += 1;
+  else if (f.arrMin != null && f.arrMin !== "" || f.arrMax != null && f.arrMax !== "") total += 1;
+  return total;
+}
+const initialState = {
+  data: [],
+  headers: [],
+  headerMap: {},
+  filters: emptyFilters(),
   settings: { sortBy: "NEXT_RENEWAL_DATE", sortDir: "asc", pageSize: 50, useRemainingArr: false },
   ui: { activeTab: "region", showExplain: false, showColumns: false },
   meta: { uploadedAt: null },
@@ -1528,6 +1614,7 @@ function AppProvider({ children }) {
   }, [serverInfo, serverNotesLoaded, idbReady]);
   useEffect(() => {
     if (!serverInfo?.ok || !serverNotesLoaded) return;
+    if (!canUpdateData()) return;
     const payload = { notes: state.notes || {}, noteDeletes: state.noteDeletes || {} };
     let serialized;
     try {
@@ -2070,6 +2157,7 @@ function AppProvider({ children }) {
       });
     },
     setNote: (noteKey, notePayload) => setState((s) => {
+      if (!canUpdateData()) return s;
       if (!noteKey) return s;
       const existing = s.notes || {};
       const deletes = s.noteDeletes || {};
@@ -2113,6 +2201,7 @@ function AppProvider({ children }) {
       };
     }),
     importNotes: (notesObj) => setState((s) => {
+      if (!canUpdateData()) return s;
       const next = { ...s.notes || {} };
       const nextDeletes = { ...s.noteDeletes || {} };
       const now = Date.now();
@@ -2997,7 +3086,7 @@ ${sourceText}`;
   if (headless) {
     return /* @__PURE__ */ React.createElement(React.Fragment, null, exportReviewModal && ReactDOM.createPortal(exportReviewModal, document.body), reportModal && ReactDOM.createPortal(reportModal, document.body), autoMatchModal && ReactDOM.createPortal(autoMatchModal, document.body));
   }
-  return /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("input", { ref: inputRef, type: "file", accept: ".json,application/json", className: "hidden", onChange: onImportFile }), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-violet", onClick: onImportClick, title: "Import personal notes JSON" }, "Import Notes"), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-amber", onClick: onExport, title: "Review and export notes JSON" }, `Export Notes (${totalNotes.toLocaleString()})`), exportReviewModal && ReactDOM.createPortal(exportReviewModal, document.body), reportModal && ReactDOM.createPortal(reportModal, document.body), autoMatchModal && ReactDOM.createPortal(autoMatchModal, document.body));
+  return /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, canUpdateData() ? /* @__PURE__ */ React.createElement("input", { ref: inputRef, type: "file", accept: ".json,application/json", className: "hidden", onChange: onImportFile }) : null, canUpdateData() ? /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-violet", onClick: onImportClick, title: "Import personal notes JSON" }, "Import Notes") : null, /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-amber", onClick: onExport, title: "Review and export notes JSON" }, `Export Notes (${totalNotes.toLocaleString()})`), exportReviewModal && ReactDOM.createPortal(exportReviewModal, document.body), reportModal && ReactDOM.createPortal(reportModal, document.body), autoMatchModal && ReactDOM.createPortal(autoMatchModal, document.body));
 }
 function NoteReportItem({ entry, onDelete, onArchive, onMatch, accountOptions }) {
   const [editing, setEditing] = useState(false);
@@ -4116,7 +4205,7 @@ function FullPictureSection({ activeRows, activeQuarters, activeAtrKey, activeBu
   ].map((c, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: "glass-kpi px-3 py-2" }, /* @__PURE__ */ React.createElement("div", { className: "text-[9px] uppercase tracking-wider text-gray-400 dark:text-gray-500 font-semibold" }, c.label), /* @__PURE__ */ React.createElement("div", { className: `text-lg font-bold tabular-nums mt-0.5 ${c.accent === "emerald" ? "text-emerald-600 dark:text-emerald-400" : c.accent === "red" ? "text-red-500 dark:text-red-400" : c.accent === "blue" ? "text-blue-600 dark:text-blue-400" : c.accent === "amber" ? "text-amber-600 dark:text-amber-400" : ""}` }, c.value), c.sub && /* @__PURE__ */ React.createElement("div", { className: "text-[9px] text-gray-500 dark:text-gray-400 mt-0.5" }, c.sub)))), /* @__PURE__ */ React.createElement("div", { className: "card p-0 overflow-hidden" }, /* @__PURE__ */ React.createElement("div", { className: "px-4 py-2.5 border-b border-gray-100 dark:border-gray-800" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs font-semibold text-gray-700 dark:text-gray-200" }, "Combined Quarter Performance"), /* @__PURE__ */ React.createElement("span", { className: "text-[9px] text-gray-400 ml-2" }, "Blended = hist. CC + active BU FC \xB7 Historical = CC only \xB7 Projected = BU FC only")), /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[10px]" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead text-[9px] uppercase tracking-wider text-gray-500" }, /* @__PURE__ */ React.createElement("th", { className: "px-3 py-2 text-left font-semibold" }, "Quarter"), /* @__PURE__ */ React.createElement("th", { className: "px-3 py-2 text-left font-semibold" }, "Source"), /* @__PURE__ */ React.createElement("th", { className: "px-3 py-2 text-right font-semibold" }, "ATR"), /* @__PURE__ */ React.createElement("th", { className: "px-3 py-2 text-right font-semibold" }, "Actual CC"), /* @__PURE__ */ React.createElement("th", { className: "px-3 py-2 text-right font-semibold" }, "BU FC"), /* @__PURE__ */ React.createElement("th", { className: "px-3 py-2 text-right font-semibold" }, "Expected C/C"), /* @__PURE__ */ React.createElement("th", { className: "px-3 py-2 text-right font-semibold" }, "Renewal Rate"), /* @__PURE__ */ React.createElement("th", { className: "px-3 py-2 text-right font-semibold" }, "Target"), /* @__PURE__ */ React.createElement("th", { className: "px-3 py-2 text-right font-semibold" }, "Attainment"), /* @__PURE__ */ React.createElement("th", { className: "px-3 py-2 text-right font-semibold" }, "Payout"))), /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-gray-100 dark:divide-gray-800/60" }, combinedRows.map((r, i) => /* @__PURE__ */ React.createElement("tr", { key: r.q, className: "glass-row-accent" }, /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 font-semibold text-gray-700 dark:text-gray-200" }, r.q), /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5" }, r.source === "historical" ? /* @__PURE__ */ React.createElement("span", { className: "inline-block px-1.5 py-0.5 rounded text-[9px] font-medium bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300" }, "Actual") : r.source === "blended" ? /* @__PURE__ */ React.createElement("span", { className: "inline-block px-1.5 py-0.5 rounded text-[9px] font-medium bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300" }, "Blended") : /* @__PURE__ */ React.createElement("span", { className: "inline-block px-1.5 py-0.5 rounded text-[9px] font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300" }, "Projected")), /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 text-right tabular-nums" }, fmtC(r.atr)), /* @__PURE__ */ React.createElement("td", { className: `px-3 py-1.5 text-right tabular-nums ${r.cc > 0 ? "text-red-500" : "text-gray-400"}` }, r.cc > 0 ? fmtC(r.cc) : "\u2014"), /* @__PURE__ */ React.createElement("td", { className: `px-3 py-1.5 text-right tabular-nums ${r.bu > 0 ? "text-amber-600 dark:text-amber-400" : "text-gray-400"}` }, r.bu > 0 ? fmtC(r.bu) : "\u2014"), /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 text-right tabular-nums font-semibold" }, r.loss > 0 ? fmtC(r.loss) : "\u2014"), /* @__PURE__ */ React.createElement("td", { className: `px-3 py-1.5 text-right tabular-nums font-semibold ${r.rate != null ? r.rate >= 90 ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-400" : "text-gray-400"}` }, r.rate != null ? (r.source !== "historical" ? "~" : "") + fmtPct(r.rate) : "\u2014"), /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 text-right tabular-nums text-gray-500" }, fmtPct(r.target)), /* @__PURE__ */ React.createElement("td", { className: `px-3 py-1.5 text-right tabular-nums font-semibold ${r.attain == null ? "text-gray-400" : r.attain >= 100 ? "text-emerald-600 dark:text-emerald-400" : r.attain >= 90 ? "text-amber-600" : "text-red-500"}` }, r.attain != null ? r.attain.toFixed(1) + "%" : "\u2014"), /* @__PURE__ */ React.createElement("td", { className: `px-3 py-1.5 text-right tabular-nums font-bold ${payoutColor(r.payout)}` }, r.payout != null ? r.payout + "%" : "\u2014"))), /* @__PURE__ */ React.createElement("tr", { className: "bg-indigo-50/60 dark:bg-indigo-900/15 border-t-2 border-indigo-200/60 dark:border-indigo-700/40" }, /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 font-bold text-indigo-700 dark:text-indigo-300" }, "Overall"), /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5" }, /* @__PURE__ */ React.createElement("span", { className: "text-[9px] text-indigo-500" }, [totals.histCount && `${totals.histCount}A`, totals.blendedCount && `${totals.blendedCount}B`, totals.projCount && `${totals.projCount}P`].filter(Boolean).join("+"))), /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 text-right tabular-nums font-bold text-indigo-700 dark:text-indigo-300" }, fmtC(totals.atr)), /* @__PURE__ */ React.createElement("td", { colSpan: "3", className: "px-3 py-1.5 text-right tabular-nums font-bold text-indigo-500" }, fmtC(totals.totalLoss), " expected"), /* @__PURE__ */ React.createElement("td", { className: `px-3 py-1.5 text-right tabular-nums font-bold ${totals.rate != null ? totals.rate >= 90 ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600" : "text-gray-400"}` }, fmtPct(totals.rate)), /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 text-right tabular-nums text-indigo-500" }, fmtPct(totals.wtdTarget)), /* @__PURE__ */ React.createElement("td", { className: `px-3 py-1.5 text-right tabular-nums font-bold ${totals.overallAttain == null ? "text-gray-400" : totals.overallAttain >= 100 ? "text-emerald-600" : "text-amber-600"}` }, fmtPct(totals.overallAttain)), /* @__PURE__ */ React.createElement("td", { className: `px-3 py-1.5 text-right tabular-nums font-bold ${payoutColor(totals.overallPayout)}` }, totals.overallPayout != null ? totals.overallPayout + "%" : "\u2014"))))))));
 }
 function HistoricalTab() {
-  const { state } = useApp();
+  const { state, actions } = useApp();
   const histData = state.historicalData || [];
   const hm = state.historicalHeaderMap || {};
   const qKey = hm.FISCAL_QUARTER || hm.YEAR_QUARTER || "FISCAL_QUARTER";
@@ -4136,10 +4225,58 @@ function HistoricalTab() {
   const segKey = hm.SEGMENT || "PRO_FORMA_MARKET_SEGMENT";
   const partnerKey = hm.PARTNER || "PARTNER_NAME";
   const subregionKey = hm.SUBREGION || "PRO_FORMA_SUBREGION";
-  const [selectedFQ, setSelectedFQ] = useState(null);
-  const [selectedBand, setSelectedBand] = useState("all");
-  const [selectedSubregion, setSelectedSubregion] = useState("__ALL_SUB__");
-  const [selectedCsManager, setSelectedCsManager] = useState("__ALL_CSM__");
+  const gq = Array.isArray(state.filters?.quarters) ? state.filters.quarters : [];
+  const selectedFQ = gq.length === 1 ? gq[0] : "__ALL__";
+  const histQuarterKey = gq.join("\0");
+  const histQuarterSet = useMemo(() => {
+    return gq.length > 1 && !isDefaultQuarters(gq) ? new Set(gq) : null;
+  }, [histQuarterKey]);
+  const selectedBand = state.filters?.band || "all";
+  const selectedSubregions = Array.isArray(state.filters?.subregions) ? state.filters.subregions : [];
+  const selectedSubregion = selectedSubregions.length === 1 ? selectedSubregions[0] : selectedSubregions.length === 0 ? "__ALL_SUB__" : "__MULTI__";
+  const selectedCsManagers = Array.isArray(state.filters?.csManagers) ? state.filters.csManagers : [];
+  const selectedCsManager = selectedCsManagers.length === 1 ? selectedCsManagers[0] : selectedCsManagers.length === 0 ? "__ALL_CSM__" : "__MULTI__";
+  const setSelectedFQ = (v) => {
+    const desired = !v || v === "__ALL__" ? [...DEFAULT_QUARTERS] : [v];
+    actions.setFilters((prev) => {
+      const cur = Array.isArray(prev.quarters) ? prev.quarters : [];
+      if (cur.length === desired.length && cur.every((q, i) => q === desired[i])) return prev;
+      return { ...prev, quarters: desired };
+    });
+  };
+  const setSelectedBand = (v) => {
+    const desired = v || "all";
+    actions.setFilters((prev) => (prev.band || "all") === desired ? prev : { ...prev, band: desired });
+  };
+  const setSelectedSubregion = (v) => {
+    const arr = !v || v === "__ALL_SUB__" ? [] : [v];
+    actions.setFilters((prev) => {
+      const cur = Array.isArray(prev.subregions) ? prev.subregions : [];
+      if (cur.length === arr.length && cur.every((x, i) => x === arr[i])) return prev;
+      return { ...prev, subregions: arr };
+    });
+  };
+  const setSelectedCsManager = (v) => {
+    const arr = !v || v === "__ALL_CSM__" ? [] : [v];
+    actions.setFilters((prev) => {
+      const cur = Array.isArray(prev.csManagers) ? prev.csManagers : [];
+      if (cur.length === arr.length && cur.every((x, i) => x === arr[i])) return prev;
+      return { ...prev, csManagers: arr };
+    });
+  };
+  const matchHistSub = (r) => !selectedSubregions.length || selectedSubregions.includes(safeString(r[subregionKey]));
+  const matchHistCsm = (r) => !selectedCsManagers.length || selectedCsManagers.includes(safeString(r[csManagerKey]));
+  const histRowFq = (r) => rowFilterQuarter(r, hm);
+  const matchHistQ = (r) => {
+    const fq = histRowFq(r);
+    if (selectedFQ && selectedFQ !== "__ALL__") return quarterInFilter(fq, [selectedFQ]);
+    if (histQuarterSet) return quarterInFilter(fq, gq);
+    return true;
+  };
+  const histGlobalMatcher = useMemo(
+    () => makeRowMatcher(hm, state.filters || emptyFilters(), state.settings, state.notes, { ignoreQuarters: true, ignoreBand: true }),
+    [hm, state.filters, state.settings, state.notes]
+  );
   const [detailSort, setDetailSort] = useState({ key: "atr", dir: "desc" });
   const [detailLimit, setDetailLimit] = useState(50);
   const [bandOpen, setBandOpen] = useState(false);
@@ -4151,7 +4288,7 @@ function HistoricalTab() {
   const flag3kKey = hm.FLAG_TOP3K || "FLAG_3K";
   const matchesBandHist = (r, band) => matchesBand(r, band, atrKey, segKey, flag3kKey, bandKey);
   const allQuarters = useMemo(() => {
-    const qs = new Set(histData.map((r) => safeString(r[qKey])).filter((q) => q && parseFiscalLabel(q).fy > 0 && isHistoricalQuarter(q)));
+    const qs = new Set(histData.map((r) => histRowFq(r)).filter((q) => q && parseFiscalLabel(q).fy > 0 && isHistoricalQuarter(q)));
     return [...qs].sort((a, b) => {
       const pa = parseFiscalLabel(a), pb = parseFiscalLabel(b);
       return pa.fy !== pb.fy ? pa.fy - pb.fy : pa.fq - pb.fq;
@@ -4160,15 +4297,16 @@ function HistoricalTab() {
   const qtrStats = useMemo(() => {
     const m = /* @__PURE__ */ new Map();
     histData.forEach((r) => {
-      const q = safeString(r[qKey]);
+      const q = histRowFq(r);
       if (!q || parseFiscalLabel(q).fy === 0 || !isHistoricalQuarter(q)) return;
       const atr = toNumber(r[atrKey]);
       const cc = toNumber(r[ccKey]);
       const exp = toNumber(r[expKey]);
       if (atr <= 0 && cc <= 0 && exp <= 0) return;
+      if (!histGlobalMatcher(r)) return;
       if (selectedBand && selectedBand !== "all" && !matchesBandHist(r, selectedBand)) return;
-      if (selectedSubregion && selectedSubregion !== "__ALL_SUB__" && safeString(r[subregionKey]) !== selectedSubregion) return;
-      if (selectedCsManager && selectedCsManager !== "__ALL_CSM__" && safeString(r[csManagerKey]) !== selectedCsManager) return;
+      if (!matchHistSub(r)) return;
+      if (!matchHistCsm(r)) return;
       if (!m.has(q)) m.set(q, { fq: q, atr: 0, bu: 0, cc: 0, ccOff: 0, exp: 0, count: 0, done: 0, open: 0 });
       const s = m.get(q);
       s.atr += atr;
@@ -4182,41 +4320,39 @@ function HistoricalTab() {
       else s.open++;
     });
     return m;
-  }, [histData, qKey, atrKey, buKey, ccKey, ccOffKey, expKey, doneKey, ltgKey, selectedBand, selectedSubregion, subregionKey, selectedCsManager, csManagerKey]);
+  }, [histData, qKey, atrKey, buKey, ccKey, ccOffKey, expKey, doneKey, ltgKey, selectedBand, selectedSubregions, selectedCsManagers, histGlobalMatcher]);
   const rowsView = useMemo(
     () => allQuarters.map((q) => qtrStats.get(q)).filter(Boolean),
     [allQuarters, qtrStats]
   );
   useEffect(() => {
-    if (!selectedFQ && rowsView.length) {
-      setSelectedFQ(rowsView[rowsView.length - 1].fq);
-    }
     setDetailLimit(50);
   }, [rowsView.length, selectedFQ]);
   const focusRows = useMemo(() => {
     let pool = histData.filter((r) => {
-      const q = safeString(r[qKey]);
+      const q = histRowFq(r);
       if (!q || parseFiscalLabel(q).fy === 0 || !isHistoricalQuarter(q)) return false;
       if (toNumber(r[atrKey]) <= 0 && toNumber(r[ccKey]) <= 0 && toNumber(r[expKey]) <= 0) return false;
-      if (selectedFQ && selectedFQ !== "__ALL__" && q !== selectedFQ) return false;
+      if (!histGlobalMatcher(r)) return false;
+      if (!matchHistQ(r)) return false;
       return true;
     });
     if (selectedBand && selectedBand !== "all") pool = pool.filter((r) => matchesBandHist(r, selectedBand));
-    if (selectedSubregion && selectedSubregion !== "__ALL_SUB__") pool = pool.filter((r) => safeString(r[subregionKey]) === selectedSubregion);
-    if (selectedCsManager && selectedCsManager !== "__ALL_CSM__") pool = pool.filter((r) => safeString(r[csManagerKey]) === selectedCsManager);
+    if (selectedSubregions.length) pool = pool.filter(matchHistSub);
+    if (selectedCsManagers.length) pool = pool.filter(matchHistCsm);
     return pool;
-  }, [histData, qKey, atrKey, selectedFQ, selectedBand, selectedSubregion, subregionKey, segKey, selectedCsManager, csManagerKey]);
+  }, [histData, qKey, atrKey, selectedFQ, histQuarterSet, selectedBand, selectedSubregions, selectedCsManagers, histGlobalMatcher]);
   const quarterPool = useMemo(() => {
-    if (!selectedFQ) return [];
     return histData.filter((r) => {
-      const fq = safeString(r[qKey]);
-      if (selectedFQ !== "__ALL__" && fq !== selectedFQ) return false;
+      const fq = histRowFq(r);
+      if (!matchHistQ(r)) return false;
       if (toNumber(r[atrKey]) <= 0 && toNumber(r[ccKey]) <= 0 && toNumber(r[expKey]) <= 0 || parseFiscalLabel(fq).fy === 0 || !isHistoricalQuarter(fq)) return false;
-      if (selectedSubregion && selectedSubregion !== "__ALL_SUB__" && safeString(r[subregionKey]) !== selectedSubregion) return false;
-      if (selectedCsManager && selectedCsManager !== "__ALL_CSM__" && safeString(r[csManagerKey]) !== selectedCsManager) return false;
+      if (!histGlobalMatcher(r)) return false;
+      if (!matchHistSub(r)) return false;
+      if (!matchHistCsm(r)) return false;
       return true;
     });
-  }, [histData, selectedFQ, qKey, atrKey, selectedSubregion, subregionKey, selectedCsManager, csManagerKey]);
+  }, [histData, selectedFQ, histQuarterSet, qKey, atrKey, selectedSubregions, selectedCsManagers, histGlobalMatcher]);
   const bandRows = useMemo(() => {
     return BAND_OPTIONS.map((opt) => {
       const filtered = quarterPool.filter((r) => matchesBandHist(r, opt.value));
@@ -4239,16 +4375,17 @@ function HistoricalTab() {
   }, [focusRows, subregionKey, atrKey, acctIdKey, acctKey]);
   const csManagerPool = useMemo(() => {
     let pool = histData.filter((r) => {
-      const q = safeString(r[qKey]);
+      const q = histRowFq(r);
       if (!q || parseFiscalLabel(q).fy === 0 || !isHistoricalQuarter(q)) return false;
       if (toNumber(r[atrKey]) <= 0 && toNumber(r[ccKey]) <= 0 && toNumber(r[expKey]) <= 0) return false;
-      if (selectedFQ && selectedFQ !== "__ALL__" && q !== selectedFQ) return false;
+      if (!histGlobalMatcher(r)) return false;
+      if (!matchHistQ(r)) return false;
       return true;
     });
     if (selectedBand && selectedBand !== "all") pool = pool.filter((r) => matchesBandHist(r, selectedBand));
-    if (selectedSubregion && selectedSubregion !== "__ALL_SUB__") pool = pool.filter((r) => safeString(r[subregionKey]) === selectedSubregion);
+    if (selectedSubregions.length) pool = pool.filter(matchHistSub);
     return pool;
-  }, [histData, qKey, atrKey, ccKey, expKey, selectedFQ, selectedBand, selectedSubregion, subregionKey, segKey]);
+  }, [histData, qKey, atrKey, ccKey, expKey, selectedFQ, histQuarterSet, selectedBand, selectedSubregions, histGlobalMatcher]);
   const csManagerRows = useMemo(() => {
     const map = /* @__PURE__ */ new Map();
     csManagerPool.forEach((r) => {
@@ -4361,10 +4498,7 @@ function HistoricalTab() {
       {
         key: r.fq,
         onClick: () => React.startTransition(() => {
-          setSelectedFQ(active ? null : r.fq);
-          setSelectedBand("all");
-          setSelectedSubregion("__ALL_SUB__");
-          setSelectedCsManager("__ALL_CSM__");
+          setSelectedFQ(active ? "__ALL__" : r.fq);
           setDetailLimit(50);
         }),
         className: [
@@ -4382,9 +4516,6 @@ function HistoricalTab() {
     {
       onClick: () => React.startTransition(() => {
         setSelectedFQ("__ALL__");
-        setSelectedBand("all");
-        setSelectedSubregion("__ALL_SUB__");
-        setSelectedCsManager("__ALL_CSM__");
       }),
       className: [
         "w-full text-left rounded-lg px-2.5 py-1.5 transition border text-xs font-semibold",
@@ -4547,15 +4678,7 @@ function Header() {
   const notesHeadlessEl = React.useMemo(() => /* @__PURE__ */ React.createElement(NotesIO, { headless: true }), []);
   const hasData = state?.data?.length > 0;
   const filters = state.filters;
-  const activeFilters = (() => {
-    const keys = ["regions", "countries", "segments", "industries", "healths", "quarters", "owners", "partners", "partnerTypes"];
-    let total = keys.reduce((acc, k) => acc + (filters[k]?.length || 0), 0);
-    if (filters.search) total += 1;
-    if (filters.dateFrom || filters.dateTo) total += 1;
-    if (filters.band && filters.band !== "all") total += 1;
-    if (filters.hasNotes) total += 1;
-    return total;
-  })();
+  const activeFilters = countActiveFilters(filters);
   const toggleTheme = () => actions.setTheme(theme === "dark" ? "light" : "dark");
   const [showActions, setShowActions] = useState(false);
   const actionsModal = showActions ? ReactDOM.createPortal(
@@ -4648,6 +4771,8 @@ function Filters() {
   const ownerKey = headerMap.OWNER || "CRM_SUCCESS_OWNER_NAME";
   const partnerKey = get("PARTNER");
   const partnerTypeKey = get("PARTNER_TYPE");
+  const subregionKey = headerMap.SUBREGION || get("SUBREGION") || "PRO_FORMA_SUBREGION";
+  const csManagerKey = headerMap.MANAGER_SUCCESS || get("MANAGER_SUCCESS") || "MANAGER_SUCCESS";
   const bandOptions = BAND_OPTIONS;
   const buildOptions = (key) => key ? valueCounts(data, (row) => row[key]) : [];
   // Rows the counts are drawn from (dedupe to latest renewal when the app is
@@ -4671,19 +4796,18 @@ function Filters() {
   const segmentOptions = useMemo(() => facet(segmentKey, "segments"), [filterOpen, sourceRows, headerMap, match, segmentKey, data]);
   const industryOptions = useMemo(() => facet(industryKey, "industries"), [filterOpen, sourceRows, headerMap, match, industryKey, data]);
   const healthOptions = useMemo(() => facet(healthKey, "healths"), [filterOpen, sourceRows, headerMap, match, healthKey, data]);
-  const quarterOptions = useMemo(() => facet(quarterKey, "quarters").filter((o) => o.value && parseFiscalLabel(o.value).fy > 0), [filterOpen, sourceRows, headerMap, match, quarterKey, data]);
+  const quarterOptions = useMemo(() => {
+    const raw = filterOpen
+      ? facetAccountCounts(sourceRows, headerMap, match, quarterKey, "quarters", (r) => rowFilterQuarter(r, headerMap))
+      : valueCounts(sourceRows, (row) => rowFilterQuarter(row, headerMap));
+    return raw.filter((o) => o.value && parseFiscalLabel(o.value).fy > 0);
+  }, [filterOpen, sourceRows, headerMap, match, quarterKey, data]);
   const ownerOptions = useMemo(() => facet(ownerKey, "owners"), [filterOpen, sourceRows, headerMap, match, ownerKey, data]);
   const partnerOptions = useMemo(() => facet(partnerKey, "partners"), [filterOpen, sourceRows, headerMap, match, partnerKey, data]);
   const partnerTypeOptions = useMemo(() => facet(partnerTypeKey, "partnerTypes"), [filterOpen, sourceRows, headerMap, match, partnerTypeKey, data]);
-  const activeCount = useMemo(() => {
-    const keys = ["regions", "countries", "segments", "industries", "healths", "quarters", "owners", "partners", "partnerTypes"];
-    let total = keys.reduce((acc, k) => acc + (filters[k]?.length || 0), 0);
-    if (filters.search) total += 1;
-    if (filters.dateFrom || filters.dateTo) total += 1;
-    if (filters.band && filters.band !== "all") total += 1;
-    if (filters.hasNotes) total += 1;
-    return total;
-  }, [filters]);
+  const subregionOptions = useMemo(() => facet(subregionKey, "subregions"), [filterOpen, sourceRows, headerMap, match, subregionKey, data]);
+  const csManagerOptions = useMemo(() => facet(csManagerKey, "csManagers"), [filterOpen, sourceRows, headerMap, match, csManagerKey, data]);
+  const activeCount = useMemo(() => countActiveFilters(filters), [filters]);
   useEffect(() => {
     if (!filterOpen) return;
     const onKey = (event) => {
@@ -4701,22 +4825,35 @@ function Filters() {
     });
   };
   const clearType = (type) => actions.setFilters((prev) => ({ ...prev, [type]: [] }));
-  const clearAll = () => actions.setFilters({
-    regions: [],
-    countries: [],
-    segments: [],
-    industries: [],
-    healths: [],
-    quarters: [],
-    owners: [],
-    partners: [],
-    partnerTypes: [],
-    search: "",
-    dateFrom: "",
-    dateTo: "",
-    band: "all",
-    hasNotes: false
+  const clearAll = () => {
+    actions.setFilters(emptyFilters());
+    if (typeof window !== "undefined" && typeof window.__renewalsResetArrFilter === "function") {
+      window.__renewalsResetArrFilter();
+    }
+  };
+  const chipLabel = (type, val) => {
+    if (type === "band") return (BAND_OPTIONS.find((b) => b.value === val) || {}).label || val;
+    return val;
+  };
+  const filterChips = [];
+  FILTER_LIST_KEYS.forEach((type) => {
+    const arr = filters[type] || [];
+    if (type === "quarters" && isDefaultQuarters(arr)) return;
+    const title = ({ regions: "Region", countries: "Country", segments: "Segment", industries: "Industry", healths: "Health", quarters: "Quarter", owners: "CSM", partners: "Partner", partnerTypes: "Partner type", subregions: "Sub-region", csManagers: "CSM Manager" })[type] || type;
+    arr.forEach((val) => filterChips.push({ key: type + ":" + val, label: title + ": " + val, onClear: () => toggleValue(type, val) }));
   });
+  if (filters.band && filters.band !== "all") filterChips.push({ key: "band", label: "Band: " + chipLabel("band", filters.band), onClear: () => actions.setFilters((p) => ({ ...p, band: "all" })) });
+  if (filters.dateFrom || filters.dateTo) filterChips.push({ key: "dates", label: "Dates " + (filters.dateFrom || "…") + " – " + (filters.dateTo || "…"), onClear: () => actions.setFilters((p) => ({ ...p, dateFrom: "", dateTo: "" })) });
+  if (filters.hasNotes) filterChips.push({ key: "notes", label: "Has notes", onClear: () => actions.setFilters((p) => ({ ...p, hasNotes: false })) });
+  const _arrR = Array.isArray(filters.arrRanges) ? filters.arrRanges : [];
+  if (_arrR.length || filters.arrMin != null && filters.arrMin !== "" || filters.arrMax != null && filters.arrMax !== "") {
+    const money = (v) => v != null && v !== "" ? formatCurrencyUSD(Number(v)) : "Any";
+    const arrTxt = _arrR.length === 1 ? money(_arrR[0].min) + " – " + money(_arrR[0].max) : _arrR.length > 1 ? _arrR.length + " ARR ranges" : money(filters.arrMin) + " – " + money(filters.arrMax);
+    filterChips.push({ key: "arr", label: "ARR: " + arrTxt, onClear: () => {
+      if (typeof window !== "undefined" && typeof window.__renewalsResetArrFilter === "function") window.__renewalsResetArrFilter();
+      else actions.setFilters((p) => ({ ...p, arrRanges: [], arrMin: null, arrMax: null }));
+    } });
+  }
   return /* @__PURE__ */ React.createElement("div", { className: "filter-panel" }, /* @__PURE__ */ React.createElement("div", { className: "filter-inline" }, /* @__PURE__ */ React.createElement(
     "button",
     {
@@ -4748,8 +4885,8 @@ function Filters() {
       style: { marginLeft: "auto" }
     },
     "Clear filters"
-  )), filterOpen && ReactDOM.createPortal(
-    /* @__PURE__ */ React.createElement("div", { className: "filter-modal", onClick: () => setFilterOpen(false) }, /* @__PURE__ */ React.createElement("div", { className: "card filter-sheet", onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { className: "filter-sheet-head" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "filter-sheet-title" }, "Filters"), /* @__PURE__ */ React.createElement("div", { className: "filter-sheet-sub" }, activeCount ? `${activeCount} active` : "All data visible")), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-slate", onClick: () => setFilterOpen(false) }, "Close")), /* @__PURE__ */ React.createElement("div", { className: "filter-sheet-grid" }, /* @__PURE__ */ React.createElement(MultiSelect, { label: "Region", options: regionOptions, selected: filters.regions, onToggle: (v) => toggleValue("regions", v), onClear: () => clearType("regions") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Country", options: countryOptions, selected: filters.countries, onToggle: (v) => toggleValue("countries", v), onClear: () => clearType("countries") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Segment", options: segmentOptions, selected: filters.segments, onToggle: (v) => toggleValue("segments", v), onClear: () => clearType("segments") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Industry", options: industryOptions, selected: filters.industries, onToggle: (v) => toggleValue("industries", v), onClear: () => clearType("industries") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Health", options: healthOptions, selected: filters.healths, onToggle: (v) => toggleValue("healths", v), onClear: () => clearType("healths") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Quarter", options: quarterOptions, selected: filters.quarters, onToggle: (v) => toggleValue("quarters", v), onClear: () => clearType("quarters") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Owner", options: ownerOptions, selected: filters.owners, onToggle: (v) => toggleValue("owners", v), onClear: () => clearType("owners") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Partner", options: partnerOptions, selected: filters.partners, onToggle: (v) => toggleValue("partners", v), onClear: () => clearType("partners") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Partner Type", options: partnerTypeOptions, selected: filters.partnerTypes, onToggle: (v) => toggleValue("partnerTypes", v), onClear: () => clearType("partnerTypes") })), /* @__PURE__ */ React.createElement("div", { className: "filter-sheet-fields" }, /* @__PURE__ */ React.createElement("label", { className: "filter-field" }, /* @__PURE__ */ React.createElement("span", { className: "filter-label" }, "Renewal date from"), /* @__PURE__ */ React.createElement(
+  )), filterChips.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "filter-active-chips" }, filterChips.map((c) => /* @__PURE__ */ React.createElement("span", { key: c.key, className: "region-filter-chip region-filter-chip-removable" }, /* @__PURE__ */ React.createElement("span", { className: "region-filter-chip-label" }, c.label), /* @__PURE__ */ React.createElement("button", { type: "button", className: "region-filter-chip-x", "aria-label": "Remove " + c.label, onClick: c.onClear }, "\u00D7")))), filterOpen && ReactDOM.createPortal(
+    /* @__PURE__ */ React.createElement("div", { className: "filter-modal", onClick: () => setFilterOpen(false) }, /* @__PURE__ */ React.createElement("div", { className: "card filter-sheet", onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { className: "filter-sheet-head" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "filter-sheet-title" }, "Filters"), /* @__PURE__ */ React.createElement("div", { className: "filter-sheet-sub" }, activeCount ? `${activeCount} active` : "All data visible")), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-slate", onClick: () => setFilterOpen(false) }, "Close")), /* @__PURE__ */ React.createElement("div", { className: "filter-sheet-grid" }, /* @__PURE__ */ React.createElement(MultiSelect, { label: "Region", options: regionOptions, selected: filters.regions, onToggle: (v) => toggleValue("regions", v), onClear: () => clearType("regions") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Country", options: countryOptions, selected: filters.countries, onToggle: (v) => toggleValue("countries", v), onClear: () => clearType("countries") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Segment", options: segmentOptions, selected: filters.segments, onToggle: (v) => toggleValue("segments", v), onClear: () => clearType("segments") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Industry", options: industryOptions, selected: filters.industries, onToggle: (v) => toggleValue("industries", v), onClear: () => clearType("industries") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Health", options: healthOptions, selected: filters.healths, onToggle: (v) => toggleValue("healths", v), onClear: () => clearType("healths") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Quarter", options: quarterOptions, selected: filters.quarters, onToggle: (v) => toggleValue("quarters", v), onClear: () => clearType("quarters") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "CSM", options: ownerOptions, selected: filters.owners, onToggle: (v) => toggleValue("owners", v), onClear: () => clearType("owners") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "CSM Manager", options: csManagerOptions, selected: filters.csManagers || [], onToggle: (v) => toggleValue("csManagers", v), onClear: () => clearType("csManagers") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Partner", options: partnerOptions, selected: filters.partners, onToggle: (v) => toggleValue("partners", v), onClear: () => clearType("partners") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Partner Type", options: partnerTypeOptions, selected: filters.partnerTypes, onToggle: (v) => toggleValue("partnerTypes", v), onClear: () => clearType("partnerTypes") }), /* @__PURE__ */ React.createElement(MultiSelect, { label: "Sub-region", options: subregionOptions, selected: filters.subregions || [], onToggle: (v) => toggleValue("subregions", v), onClear: () => clearType("subregions") })), /* @__PURE__ */ React.createElement("div", { className: "filter-sheet-fields" }, /* @__PURE__ */ React.createElement("label", { className: "filter-field" }, /* @__PURE__ */ React.createElement("span", { className: "filter-label" }, "Renewal date from"), /* @__PURE__ */ React.createElement(
       "input",
       {
         type: "date",
@@ -7057,6 +7194,12 @@ function RegionQuarterTable() {
     const val = typeof v === "function" ? v(_regionTabCache.selectedSubregions) : v;
     _setSelectedSubregions(val);
     _regionTabCache.selectedSubregions = val;
+    const arr = Array.from(val || []);
+    actions.setFilters((prev) => {
+      const cur = Array.isArray(prev.subregions) ? prev.subregions : [];
+      if (cur.length === arr.length && cur.every((x, i) => x === arr[i])) return prev;
+      return { ...prev, subregions: arr };
+    });
   };
   const setSelectedBand = (v) => {
     _setSelectedBandRaw(v);
@@ -7065,6 +7208,12 @@ function RegionQuarterTable() {
   const setSelectedCsManager = (v) => {
     _setSelectedCsManager(v);
     _regionTabCache.selectedCsManager = v;
+    const arr = !v || v === "__ALL_CSM__" ? [] : [v];
+    actions.setFilters((prev) => {
+      const cur = Array.isArray(prev.csManagers) ? prev.csManagers : [];
+      if (cur.length === arr.length && cur.every((x, i) => x === arr[i])) return prev;
+      return { ...prev, csManagers: arr };
+    });
   };
   const setDetailSort = (v) => {
     const val = typeof v === "function" ? v(_regionTabCache.detailSort) : v;
@@ -7077,7 +7226,7 @@ function RegionQuarterTable() {
   const [subregionOpen, setSubregionOpen] = useState(false);
   const [csManagerOpen, setCsManagerOpen] = useState(false);
   const [fqOpen, setFqOpen] = useState(false);
-  const [filtersCollapsed, setFiltersCollapsed] = useState(true);
+  const [filtersCollapsed, setFiltersCollapsed] = useState(false);
   const toggleSubregion = (sub) => {
     setSelectedSubregions((prev) => {
       const next = new Set(prev);
@@ -7086,11 +7235,13 @@ function RegionQuarterTable() {
       return next;
     });
   };
+  const regionRowFq = (r) => rowFilterQuarter(r, hm);
+  const regionHistFq = (r) => rowFilterQuarter(r, histHM);
   const validRows = useMemo(() => rows.filter((r) => isValidRenewal(r, hm, state.settings)), [rows, hm, state.settings]);
   const rowsView = useMemo(() => {
     const sm = /* @__PURE__ */ new Map();
     validRows.forEach((r) => {
-      const fq = safeString(r[qKey]);
+      const fq = regionRowFq(r);
       if (!fq || parseFiscalLabel(fq).fy === 0) return;
       const atr = toNumber(r[atrKey]);
       const bu = toNumber(r[buKey]);
@@ -7111,7 +7262,19 @@ function RegionQuarterTable() {
     if (desiredFQ !== selectedFQ) _setSelectedFQRaw(desiredFQ);
     const gb = state.filters?.band || "all";
     if (gb !== selectedBand) _setSelectedBandRaw(gb);
-  }, [state.filters?.quarters, state.filters?.band, selectedFQ, selectedBand]);
+    const gs = Array.isArray(state.filters?.subregions) ? state.filters.subregions : [];
+    const nextSet = new Set(gs);
+    if (nextSet.size !== selectedSubregions.size || ![...nextSet].every((x) => selectedSubregions.has(x))) {
+      _setSelectedSubregions(nextSet);
+      _regionTabCache.selectedSubregions = nextSet;
+    }
+    const gm = Array.isArray(state.filters?.csManagers) ? state.filters.csManagers : [];
+    const desiredCsm = gm.length === 1 ? gm[0] : "__ALL_CSM__";
+    if (desiredCsm !== selectedCsManager) {
+      _setSelectedCsManager(desiredCsm);
+      _regionTabCache.selectedCsManager = desiredCsm;
+    }
+  }, [state.filters?.quarters, state.filters?.band, state.filters?.subregions, state.filters?.csManagers, selectedFQ, selectedBand, selectedSubregions, selectedCsManager]);
   useEffect(() => {
     setSelectedAccountRow(null);
   }, [rowsView.length, selectedFQ, selectedSubregions, selectedBand]);
@@ -7120,7 +7283,7 @@ function RegionQuarterTable() {
   const matchesBand_ = (r, band) => matchesBand(r, band, atrKey, segKey, _flag3kKey, _bandKey);
   const qtrBandPool = useMemo(() => {
     let pool = validRows;
-    if (selectedFQ && selectedFQ !== "__ALL_FQ__") pool = pool.filter((r) => safeString(r[qKey]) === selectedFQ);
+    if (selectedFQ && selectedFQ !== "__ALL_FQ__") pool = pool.filter((r) => quarterInFilter(regionRowFq(r), [selectedFQ]));
     if (selectedBand && selectedBand !== "all") pool = pool.filter((r) => matchesBand_(r, selectedBand));
     if (selectedCsManager && selectedCsManager !== "__ALL_CSM__") pool = pool.filter((r) => safeString(r[csManagerKey]) === selectedCsManager);
     return pool;
@@ -7165,10 +7328,10 @@ function RegionQuarterTable() {
     let pool = histData.filter((r) => toNumber(r[histAtrKey]) > 0 || toNumber(r[histCcKey]) > 0);
     pool = pool.filter((r) => histGlobalMatcher(r, null));
     if (selectedFQ && selectedFQ !== "__ALL_FQ__") {
-      pool = pool.filter((r) => safeString(r[histQKey]) === selectedFQ);
+      pool = pool.filter((r) => quarterInFilter(regionHistFq(r), [selectedFQ]));
     } else if (selectedFQ === "__ALL_FQ__") {
       const validQs = new Set(rowsView.map((r) => r.fq));
-      pool = pool.filter((r) => validQs.has(safeString(r[histQKey])));
+      pool = pool.filter((r) => validQs.has(regionHistFq(r)));
     } else {
       return [];
     }
@@ -7189,7 +7352,7 @@ function RegionQuarterTable() {
   const quarterPool = useMemo(() => {
     if (!selectedFQ) return [];
     if (selectedFQ === "__ALL_FQ__") return validRows;
-    return validRows.filter((r) => safeString(r[qKey]) === selectedFQ);
+    return validRows.filter((r) => quarterInFilter(regionRowFq(r), [selectedFQ]));
   }, [validRows, selectedFQ, qKey]);
   const bandRows = useMemo(() => {
     return BAND_OPTIONS.map((opt) => {
@@ -7213,7 +7376,7 @@ function RegionQuarterTable() {
   }, [qtrBandPool, subregionKey, atrKey, acctIdKey, acctKey]);
   const csManagerPool = useMemo(() => {
     let pool = validRows;
-    if (selectedFQ && selectedFQ !== "__ALL_FQ__") pool = pool.filter((r) => safeString(r[qKey]) === selectedFQ);
+    if (selectedFQ && selectedFQ !== "__ALL_FQ__") pool = pool.filter((r) => quarterInFilter(regionRowFq(r), [selectedFQ]));
     if (selectedBand && selectedBand !== "all") pool = pool.filter((r) => matchesBand_(r, selectedBand));
     if (selectedSubregions.size > 0) pool = pool.filter((r) => selectedSubregions.has(safeString(r[subregionKey])));
     return pool;
@@ -7359,13 +7522,13 @@ function RegionQuarterTable() {
       if (h === "red" || h === "churning") atRisk += atr;
       if (h === "churning") churnAtr += atr;
     }
-    const activeQuarters = new Set(focusRows.map((r) => safeString(r[qKey])));
+    const activeQuarters = new Set(focusRows.map((r) => regionRowFq(r)));
     let bookedCC = 0, histAtr = 0, histCount = 0;
     for (let i = 0, len = histRowsFiltered.length; i < len; i++) {
       const r = histRowsFiltered[i];
       bookedCC += toNumber(r[histCcKey]);
       histCount++;
-      if (!activeQuarters.has(safeString(r[histQKey]))) histAtr += toNumber(r[histAtrKey]);
+      if (!activeQuarters.has(regionHistFq(r))) histAtr += toNumber(r[histAtrKey]);
     }
     const remainingCC = buTotal;
     const expectedCC = bookedCC + remainingCC;
@@ -7428,7 +7591,7 @@ function RegionQuarterTable() {
       onRemove();
     } }, "\u00D7")
   );
-  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-bar" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-bar-head glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "region-filter-bar-toggle", onClick: () => setFiltersCollapsed((p) => !p), "aria-expanded": !filtersCollapsed }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${filtersCollapsed ? "" : "is-open"}` }, "\u25BC"), /* @__PURE__ */ React.createElement("svg", { className: "region-filter-bar-icon", width: "13", height: "13", viewBox: "0 0 24 24", "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("path", { fill: "currentColor", d: "M3 5h18l-7 8v5l-4 2v-7z" })), /* @__PURE__ */ React.createElement("span", { className: "region-filter-bar-title" }, "Quick Filters")), /* @__PURE__ */ React.createElement("div", { className: "region-filter-summary" }, _fqActive ? _mkChip("fq", selectedFQ, () => React.startTransition(() => setSelectedFQ("__ALL_FQ__"))) : /* @__PURE__ */ React.createElement("span", { key: "fq", className: "region-filter-chip region-filter-chip-muted" }, _mobileFqLabel), _bandActive && _mkChip("band", BAND_OPTIONS.find((b) => b.value === selectedBand)?.label || selectedBand, () => React.startTransition(() => {
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-bar" }, /* @__PURE__ */ React.createElement("div", { className: "region-filter-bar-head glass-card-surface" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "region-filter-bar-toggle", onClick: () => setFiltersCollapsed((p) => !p), "aria-expanded": !filtersCollapsed }, /* @__PURE__ */ React.createElement("span", { className: `region-filter-chevron ${filtersCollapsed ? "" : "is-open"}` }, "\u25BC"), /* @__PURE__ */ React.createElement("svg", { className: "region-filter-bar-icon", width: "13", height: "13", viewBox: "0 0 24 24", "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("path", { fill: "currentColor", d: "M3 5h18l-7 8v5l-4 2v-7z" })), /* @__PURE__ */ React.createElement("span", { className: "region-filter-bar-title" }, "Quarter, band & team")), /* @__PURE__ */ React.createElement("div", { className: "region-filter-summary" }, _fqActive ? _mkChip("fq", selectedFQ, () => React.startTransition(() => setSelectedFQ("__ALL_FQ__"))) : /* @__PURE__ */ React.createElement("span", { key: "fq", className: "region-filter-chip region-filter-chip-muted" }, _mobileFqLabel), _bandActive && _mkChip("band", BAND_OPTIONS.find((b) => b.value === selectedBand)?.label || selectedBand, () => React.startTransition(() => {
     setSelectedBand("all");
     setSelectedSubregions(/* @__PURE__ */ new Set());
   }), "region-filter-chip-emerald"), _subActive && _mkChip("sub", selectedSubregions.size === 1 ? Array.from(selectedSubregions)[0] : selectedSubregions.size + " sub-regions", () => React.startTransition(() => setSelectedSubregions(/* @__PURE__ */ new Set()))), _csmActive && _mkChip("csm", selectedCsManager, () => React.startTransition(() => setSelectedCsManager("__ALL_CSM__"))), _arrActive && _mkChip("arr", _arrLabel, clearArrFilter), focusRows.length > 0 && /* @__PURE__ */ React.createElement("span", { key: "cnt", className: "region-filter-chip region-filter-chip-muted" }, focusRows.length.toLocaleString(), " accounts"), _anyFilterActive && /* @__PURE__ */ React.createElement("button", { key: "reset", type: "button", className: "region-filter-reset", onClick: (e) => {
@@ -7784,6 +7947,7 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
   const countryKey = headerMap.BILLING_COUNTRY || headerMap.COUNTRY || "COUNTRY";
   const segmentKey = headerMap.SEGMENT || "PRO_FORMA_MARKET_SEGMENT";
   const summaryKey = headerMap.FORECAST_SUMMARY || "FORECAST_SUMMARY";
+  const csmNotesKey = headerMap.LAST_CSM_RENEWAL_NOTES || "LAST_CSM_RENEWAL_NOTES";
   const touchKey = headerMap.DAYS_SINCE_TOUCH || "DAYS_SINCE_LAST_CS_TOUCH";
   const upsideKey = headerMap.UPSIDE || "UPSIDE";
   const downsideKey = headerMap.DOWNSIDE || "DOWNSIDE";
@@ -7834,6 +7998,7 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
   const [newEntry, setNewEntry] = React.useState("");
   const [showRaw, setShowRaw] = React.useState(false);
   const [showForecast, setShowForecast] = React.useState(false);
+  const [showCsmNotes, setShowCsmNotes] = React.useState(true);
   const _rowFq = deriveFiscalFromQuarterLabel(row[qKey] || row.FISCAL_QUARTER || row.YEAR_QUARTER).fq;
   const _cfNow = getCurrentFiscal();
   const _currentQNow = "FY" + String(_cfNow.fy).padStart(2, "0") + "Q" + _cfNow.fq;
@@ -7864,6 +8029,7 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
   const accountArr = roll?.maxNetArr != null ? roll.maxNetArr : toNumber(row[headerMap.NET_ARR_PRIOR || "NET_ARR_USD_PRIOR_QTR_END"]);
   const largest = roll?.largest || null;
   const summaryText = safeString(row[summaryKey]);
+  const csmNotesText = safeString(row[csmNotesKey]);
   const healthColor = /green/.test(healthRaw) ? "text-emerald-600 dark:text-emerald-400" : /red/.test(healthRaw) ? "text-red-500 dark:text-red-400" : /amber|yellow|orange/.test(healthRaw) ? "text-amber-600 dark:text-amber-400" : "text-gray-500";
   const entries = React.useMemo(() => parseNoteEntries(noteDraft), [noteDraft]);
   const callUpdates = React.useMemo(() => {
@@ -7891,6 +8057,7 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
     return out;
   }, [callHistory]);
   const handleAddEntry = () => {
+    if (!canUpdateData()) return;
     const text = ((newEntry || "").trim() || (inputRef.current ? String(inputRef.current.value || "").trim() : ""));
     if (!text) return;
     setNoteDraft((prev) => prependNoteEntry(prev, text));
@@ -7905,6 +8072,10 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
     }
   };
   const handleSave = () => {
+    if (!canUpdateData()) {
+      onClose();
+      return;
+    }
     if (!nk) {
       alert("Missing stable key");
       return;
@@ -8090,7 +8261,7 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
       },
       onFocus: () => setDjDraft(normDj(djDraft))
     }
-  ), !_hasCall && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-indigo", onClick: () => setDjDraft(fmtCurr(bu)) }, "= BU FC"), !_hasCall && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-emerald", onClick: () => setDjDraft("$0") }, "Flat"), !_hasCall && djDraft && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-slate", onClick: () => setDjDraft("") }, "Clear"), _hasCall && /* @__PURE__ */ React.createElement("span", { className: "text-[10px] text-gray-400" }, "= CS + Renewals"))), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement(
+  ), !_hasCall && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-indigo", onClick: () => setDjDraft(fmtCurr(bu)) }, "= BU FC"), !_hasCall && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-emerald", onClick: () => setDjDraft("$0") }, "Flat"), !_hasCall && djDraft && /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-slate", onClick: () => setDjDraft("") }, "Clear"), _hasCall && /* @__PURE__ */ React.createElement("span", { className: "text-[10px] text-gray-400" }, "= CS + Renewals"))), csmNotesText && /* @__PURE__ */ React.createElement("div", { className: "mb-4 pb-3 border-b border-gray-100 dark:border-gray-700" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "flex items-center gap-1.5 w-full text-left", onClick: () => setShowCsmNotes((o) => !o), "aria-expanded": showCsmNotes }, /* @__PURE__ */ React.createElement("svg", { className: `w-3 h-3 shrink-0 transition-transform ${showCsmNotes ? "rotate-90" : ""}`, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor" }, /* @__PURE__ */ React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: 2, d: "M9 5l7 7-7 7" })), /* @__PURE__ */ React.createElement("span", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Last CSM Renewal Notes")), showCsmNotes && /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-[12px] text-gray-700 dark:text-gray-200 leading-relaxed whitespace-pre-wrap" }, csmNotesText)), /* @__PURE__ */ React.createElement("div", { className: "mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement(
     "input",
     {
       ref: inputRef,
@@ -8101,7 +8272,7 @@ function AccountNoteModal({ row, notes, headerMap, settings, touchByAccount, rol
       onChange: (e) => setNewEntry(e.target.value),
       onKeyDown: handleKeyDown
     }
-  ), /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-indigo text-[11px] px-4", onMouseDown: (e) => e.preventDefault(), onClick: handleAddEntry }, "Add")), /* @__PURE__ */ React.createElement("div", { className: "text-[9px] text-gray-400 mt-1" }, "Enter to add entry \xB7 Cmd+S to save")), /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-2" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Updates"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-slate", onClick: () => setShowRaw(!showRaw) }, showRaw ? "Timeline view" : "Edit raw")), showRaw ? /* @__PURE__ */ React.createElement(
+  ), canUpdateData() ? /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-indigo text-[11px] px-4", onMouseDown: (e) => e.preventDefault(), onClick: handleAddEntry }, "Add") : null), /* @__PURE__ */ React.createElement("div", { className: "text-[9px] text-gray-400 mt-1" }, "Enter to add entry \xB7 Cmd+S to save")), /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-2" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase tracking-widest font-bold text-gray-500 dark:text-gray-400" }, "Updates"), /* @__PURE__ */ React.createElement("button", { type: "button", className: "smallbtn smallbtn-xs smallbtn-slate", onClick: () => setShowRaw(!showRaw) }, showRaw ? "Timeline view" : "Edit raw")), showRaw ? /* @__PURE__ */ React.createElement(
     "textarea",
     {
       className: "w-full rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-slate-900 text-[11px] leading-relaxed p-3 resize-y",
@@ -8906,11 +9077,17 @@ function generateWeeklyBriefHtml(brief, opts) {
   const filterBits = [];
   if (f.region && f.region !== "__ALL__") filterBits.push("Region: " + f.region);
   if (f.sub_region && f.sub_region !== "__ALL__") filterBits.push("Sub-region: " + f.sub_region);
-  if (f.cs_manager && f.cs_manager !== "__ALL__") filterBits.push("CS mgr: " + f.cs_manager);
+  if (f.cs_manager && f.cs_manager !== "__ALL__") filterBits.push("CSM Manager: " + f.cs_manager);
   if (f.segment && f.segment !== "__ALL__") filterBits.push("Segment: " + f.segment);
-  if (f.owner && f.owner !== "__ALL__") filterBits.push("Owner: " + f.owner);
+  if (f.owner && f.owner !== "__ALL__") filterBits.push("CSM: " + f.owner);
   if (f.arr_min != null) filterBits.push("ARR \u2265 " + fmtD(f.arr_min));
   if (f.arr_max != null) filterBits.push("ARR \u2264 " + fmtD(f.arr_max));
+  if (f.date_from || f.date_to) filterBits.push("Dates " + (f.date_from || "\u2026") + " \u2013 " + (f.date_to || "\u2026"));
+  if (f.search) filterBits.push("Search: " + f.search);
+  if (f.country && f.country !== "__ALL__") filterBits.push("Country: " + f.country);
+  if (f.industry && f.industry !== "__ALL__") filterBits.push("Industry: " + f.industry);
+  if (f.health && f.health !== "__ALL__") filterBits.push("Health: " + f.health);
+  if (f.partner && f.partner !== "__ALL__") filterBits.push("Partner: " + f.partner);
   const thr = opts && opts.threshold != null ? opts.threshold : brief.threshold;
   if (thr != null) filterBits.push("Large \u2265 " + fmtD(thr));
   const bandTxt = brief.band && brief.band !== "all" ? " \u00b7 Band " + esc(brief.band) : "";
@@ -8921,41 +9098,40 @@ function generateWeeklyBriefHtml(brief, opts) {
   const buDeltaColor = (n) => n > 0 ? "#ef4444" : n < 0 ? "#22c55e" : "#64748b";
   const upDeltaColor = (n) => n > 0 ? "#22c55e" : n < 0 ? "#ef4444" : "#64748b";
   const kpiCards = [
-    { label: "BU Forecast (C/C)", val: fmtD(rollup.current || 0), detail: `${signed(rollup.delta || 0)} WoW`, detailColor: buDeltaColor(rollup.delta || 0), color: "#0ea5e9" },
+    { label: "Booked C/C", val: fmtD(rollup.booked || 0), detail: `${signed(rollup.booked_delta || 0)} WoW`, detailColor: buDeltaColor(rollup.booked_delta || 0), color: "#0d9488" },
+    { label: "Remaining BU Forecast (C/C)", val: fmtD(rollup.current || 0), detail: `${signed(rollup.delta || 0)} WoW`, detailColor: buDeltaColor(rollup.delta || 0), color: "#0ea5e9" },
     { label: "New $0\u2192FC accounts", val: String(newFcTotal), detail: `${newFcLargeTotal} large`, color: "#f59e0b" },
     { label: "Worsened accounts", val: String(worsenedTotal), detail: `${worsenedLargeTotal} \u2265 threshold`, color: "#ef4444" },
-    { label: "Best Case", val: fmtD(bestCase.current_total || 0), detail: `${signed(bestCase.delta || 0)} WoW`, detailColor: buDeltaColor(bestCase.delta || 0), color: "#8b5cf6" },
-    { label: "Worst Case", val: fmtD(worstCase.current_total || 0), detail: `${signed(worstCase.delta || 0)} WoW`, detailColor: buDeltaColor(worstCase.delta || 0), color: "#0d9488" }
+    { label: "Best Case remaining", val: fmtD(bestCase.current_total || 0), detail: `${signed(bestCase.delta || 0)} WoW`, detailColor: buDeltaColor(bestCase.delta || 0), color: "#8b5cf6" },
+    { label: "Worst Case remaining", val: fmtD(worstCase.current_total || 0), detail: `${signed(worstCase.delta || 0)} WoW`, detailColor: buDeltaColor(worstCase.delta || 0), color: "#64748b" },
+    { label: "Closed this week", val: String((sec.closed_since_prior && sec.closed_since_prior.total) || 0), detail: fmtD((sec.closed_since_prior && sec.closed_since_prior.booked_cc) || 0) + " booked C/C", color: "#0d9488" },
+    { label: "Due in 7 days", val: String((sec.due_soon && sec.due_soon.total) || 0), detail: fmtD((sec.due_soon && sec.due_soon.atr) || 0) + " ATR", color: "#6366f1" }
   ];
   const regionRows = (regionFilter ? bu.regions.filter((r) => r.region === regionFilter) : bu.regions);
   const buTable = `
 <table>
-<tr><th>Region</th><th class="r">Accounts</th><th class="r">Prior BU FC</th><th class="r">Current BU FC</th><th class="r">\u0394 $</th><th class="r">\u0394 %</th></tr>
+<tr><th>Region</th><th class="r">Accounts</th><th class="r">Prior remaining</th><th class="r">Current remaining</th><th class="r">\u0394 $</th><th class="r">\u0394 %</th></tr>
 ${regionRows.map((o) => `<tr><td style="font-weight:500">${esc(o.region)}</td><td class="r">${o.accounts}</td><td class="r">${fmtDash(o.prior)}</td><td class="r">${fmtDash(o.current)}</td><td class="r" style="color:${buDeltaColor(o.delta)};font-weight:600">${signed(o.delta)}</td><td class="r" style="color:${buDeltaColor(o.delta)}">${pctS(o.delta_pct)}</td></tr>`).join("\n")}
 ${!regionFilter ? `<tr style="font-weight:700;border-top:2px solid #e5e7eb"><td>Total</td><td class="r">${rollup.accounts || 0}</td><td class="r">${fmtDash(rollup.prior)}</td><td class="r">${fmtDash(rollup.current)}</td><td class="r" style="color:${buDeltaColor(rollup.delta || 0)}">${signed(rollup.delta || 0)}</td><td class="r" style="color:${buDeltaColor(rollup.delta || 0)}">${pctS(rollup.delta_pct)}</td></tr>` : ""}
 </table>`;
   const trendHtml = bu.trend && bu.trend.length > 1 ? (() => {
-    const rows = bu.trend.map((t, i) => {
-      const v = t.total_bu_fc || 0;
-      const adj = t.total_adjusted_fc != null ? t.total_adjusted_fc : v;
-      const gap = t.gap != null ? t.gap : adj - v;
-      const prev = i > 0 ? (bu.trend[i - 1].total_bu_fc || 0) : null;
-      const d = prev == null ? null : v - prev;
-      const dp = prev == null || prev === 0 ? null : d / Math.abs(prev) * 100;
-      return { date: (t.effective_date || "").slice(0, 10), v, adj, gap, d, dp };
-    });
+    const BU_C = "#0ea5e9", CC_C = "#6366f1", CS_C = "#10b981";
+    const rows = bu.trend.map((t) => ({
+      date: (t.effective_date || "").slice(0, 10),
+      bu: t.total_bu_fc || 0,
+      cc: t.total_booked_cc || 0,
+      cs: t.total_cs_call || 0
+    }));
     const first = rows[0], last = rows[rows.length - 1];
     const regionLabel = regionFilter || "All regions";
-    const gapColor = Math.abs(last.gap) > 0.5 ? buDeltaColor(last.gap) : "#64748b";
     return `
-<h3 style="font-size:12px;font-weight:700;margin:16px 0 4px">BU vs Adjusted (ELT) Forecast Trend (over time)</h3>
-<p style="font-size:12px;margin:0 0 2px">Latest BU <strong style="color:#0369a1">${fmtDash(last.v)}</strong> &nbsp;&middot;&nbsp; Adjusted <strong style="color:#6366f1">${fmtDash(last.adj)}</strong> &nbsp;&middot;&nbsp; gap <strong style="color:${gapColor}">${signed(last.gap)}</strong></p>
-${last.d != null ? `<p class="sub" style="margin:0 0 2px;color:${buDeltaColor(last.d)};font-weight:600">BU WoW ${signed(last.d)} (${pctS(last.dp)})</p>` : ""}
+<h3 style="font-size:14px;font-weight:700;margin:16px 0 4px">Remaining BU, closed C/C, and CS call over time</h3>
+<p style="font-size:12px;margin:0 0 2px">Latest remaining BU <strong style="color:${BU_C}">${fmtDash(last.bu)}</strong> &nbsp;&middot;&nbsp; Closed / budget consumed <strong style="color:${CC_C}">${fmtDash(last.cc)}</strong> &nbsp;&middot;&nbsp; CS call <strong style="color:${CS_C}">${fmtDash(last.cs)}</strong></p>
 <p class="sub" style="margin:0 0 6px">${esc(regionLabel)} &middot; ${esc(first.date)} &rarr; ${esc(last.date)}</p>
-<p class="sub" style="margin:0 0 6px;font-size:9px">BU = system bottoms-up forecast &middot; Adjusted = ELT / calls applied as-of each snapshot (falls back to BU where no call exists) &middot; gap = Adjusted \u2212 BU.</p>
+<p class="sub" style="margin:0 0 6px;font-size:9px">Same lens as Pacing: Closed / budget consumed = QTD C/C on 100K+ Official (BAND column) for that snapshot week. Remaining BU = still-open Official bottoms-up. CS call = as-of CS Call only; accounts with no CS call contribute $0.</p>
 <table>
-<tr><th>Week (date)</th><th class="r">BU FC</th><th class="r">Adjusted FC</th><th class="r">\u0394 (Adj\u2212BU)</th></tr>
-${rows.map((r) => `<tr><td>${esc(r.date)}</td><td class="r">${fmtDash(r.v)}</td><td class="r" style="color:#6366f1;font-weight:600">${fmtDash(r.adj)}</td><td class="r" style="color:${r.gap === 0 ? "#9ca3af" : buDeltaColor(r.gap)};font-weight:600">${r.gap === 0 ? "\u2014" : signed(r.gap)}</td></tr>`).join("\n")}
+<tr><th>Week (date)</th><th class="r">Remaining BU FC</th><th class="r">Closed / budget consumed</th><th class="r">CS call (adjustment)</th></tr>
+${rows.map((r) => `<tr><td>${esc(r.date)}</td><td class="r" style="color:${BU_C};font-weight:600">${fmtDash(r.bu)}</td><td class="r" style="color:${CC_C};font-weight:600">${fmtDash(r.cc)}</td><td class="r" style="color:${CS_C};font-weight:600">${fmtDash(r.cs)}</td></tr>`).join("\n")}
 </table>`;
   })() : "";
   // "What happened" cell: two clearly-labeled source blocks (Forecast Summary
@@ -8983,22 +9159,51 @@ ${rows.map((d) => `<tr><td style="font-weight:500">${esc(d.account_name)}</td><t
   // = better (green).
   const moverTable = (up, down, deltaLabel) => `
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-<div><h3 style="font-size:12px;font-weight:700;margin:0 0 6px;color:#ef4444">Top 5 driving increase (more C/C)</h3>${up.length ? `<table><tr><th>Account</th><th>Region</th><th class="r">${esc(deltaLabel)}</th></tr>${up.map((d) => `<tr><td>${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r" style="color:#ef4444;font-weight:600">${signed(d.delta)}</td></tr>`).join("")}</table>` : `<p style="font-size:11px;color:#9ca3af">None.</p>`}</div>
-<div><h3 style="font-size:12px;font-weight:700;margin:0 0 6px;color:#22c55e">Top 5 driving decrease (less C/C)</h3>${down.length ? `<table><tr><th>Account</th><th>Region</th><th class="r">${esc(deltaLabel)}</th></tr>${down.map((d) => `<tr><td>${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r" style="color:#22c55e;font-weight:600">${signed(d.delta)}</td></tr>`).join("")}</table>` : `<p style="font-size:11px;color:#9ca3af">None.</p>`}</div>
+<div><h3 style="font-size:12px;font-weight:700;margin:0 0 6px;color:#ef4444">Worse (more C/C)</h3>${up.length ? `<table><tr><th>Account</th><th>Region</th><th class="r">${esc(deltaLabel)}</th></tr>${up.map((d) => `<tr><td>${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r" style="color:#ef4444;font-weight:600">${signed(d.delta)}</td></tr>`).join("")}</table>` : `<p style="font-size:11px;color:#9ca3af">None.</p>`}</div>
+<div><h3 style="font-size:12px;font-weight:700;margin:0 0 6px;color:#22c55e">Better (less C/C)</h3>${down.length ? `<table><tr><th>Account</th><th>Region</th><th class="r">${esc(deltaLabel)}</th></tr>${down.map((d) => `<tr><td>${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r" style="color:#22c55e;font-weight:600">${signed(d.delta)}</td></tr>`).join("")}</table>` : `<p style="font-size:11px;color:#9ca3af">None.</p>`}</div>
 </div>`;
-  const bestCaseTable = (up, down) => moverTable(up, down, "\u0394 Best Case");
-  const worstCaseTable = (up, down) => moverTable(up, down, "\u0394 Worst Case");
+  const bestCaseTable = (up, down) => moverTable(up, down, "Change");
+  const worstCaseTable = (up, down) => moverTable(up, down, "Change");
   const overallBlock = `
 <h2>Overall Rollup</h2>
 ${buTable}
 ${trendHtml}
-<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">Accounts that worsened WoW (${worsenedTotal > worsened.length ? "top " + worsened.length + " of " + worsenedTotal : worsenedTotal})</h3>
+<h3 style="font-size:14px;font-weight:700;margin:16px 0 6px">Accounts that worsened WoW (${worsenedTotal > worsened.length ? "top " + worsened.length + " of " + worsenedTotal : worsenedTotal})</h3>
 ${worsenedTable(worsened)}
-<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">New in-quarter forecast \u2014 $0 \u2192 FC (${newFcTotal > newFc.length ? "top " + newFc.length + " of " + newFcTotal : newFcTotal})</h3>
+<h3 style="font-size:14px;font-weight:700;margin:16px 0 6px">New in-quarter forecast \u2014 $0 \u2192 FC (${newFcTotal > newFc.length ? "top " + newFc.length + " of " + newFcTotal : newFcTotal})</h3>
 ${newFcTable(newFc)}
-<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">Best Case movement (${fmtDash(bestCase.current_total)}, <span style="color:${buDeltaColor(bestCase.delta || 0)}">${signed(bestCase.delta || 0)} WoW</span>)</h3>
+${(() => {
+    const closed = sec.closed_since_prior || { rows: [], total: 0 };
+    const due = sec.due_soon || { rows: [], total: 0 };
+    const tLab = (t) => t === "cleared" ? "BU \u2192 $0" : t === "residual_below_booked" ? "Residual BU < booked" : t === "residual_at_or_above_booked" ? "Residual BU \u2265 booked" : t === "left_scope" ? "Left this set" : "\u2014";
+    const mdy = (iso) => {
+      const s = String(iso || "").slice(0, 10);
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+      return m ? m[2] + "-" + m[3] + "-" + m[1] : (iso || "\u2014");
+    };
+    const closedHtml = `
+<h3 style="font-size:14px;font-weight:700;margin:16px 0 6px">Closed since prior snapshot (${closed.total || 0})</h3>
+<p class="sub" style="margin:0 0 6px">Open last snapshot, closed now (DONE_DEAL or LTG = 0). ATR renewed = starting ATR \u2212 booked C/C.${closed.total ? " " + fmtDash(closed.booked_cc) + " booked C/C \u00b7 " + fmtDash(closed.prior_bu_fc) + " prior BU released \u00b7 " + (closed.cleared_count || 0) + " cleared to $0." : ""}</p>
+${(closed.rows || []).length ? `<table>
+<tr><th>Account</th><th>Region</th><th class="r">Prior BU</th><th class="r">Current BU</th><th class="r">Booked C/C</th><th class="r">ATR</th><th class="r">ATR renewed</th><th>Transfer</th></tr>
+${(closed.rows || []).map((d) => `<tr><td style="font-weight:500">${esc(d.account_name)}</td><td>${esc(d.region)}</td><td class="r">${fmtDash(d.prior_bu_fc)}</td><td class="r">${fmtDash(d.current_bu_fc)}</td><td class="r">${fmtDash(d.booked_cc)}</td><td class="r">${fmtDash(d.atr)}</td><td class="r">${fmtDash(d.atr_renewed)}</td><td>${esc(tLab(d.transfer))}</td></tr>`).join("\n")}
+</table>` : `<p style="font-size:11px;color:#9ca3af;margin:6px 0">No newly closed accounts between these snapshots.</p>`}`;
+    const dueTitle = due.from ? "Coming due \u2014 next 7 days from " + mdy(due.from) : "Coming due \u2014 next 7 days";
+    const dueHtml = `
+<h3 style="font-size:14px;font-weight:700;margin:16px 0 6px">${esc(dueTitle)} (${due.total || 0})</h3>
+<p class="sub" style="margin:0 0 6px">${due.from ? "Open renewals with a date from " + mdy(due.from) + " through " + mdy(due.to) + " (7 calendar days from the current snapshot). Top 20 by date." : "Open renewals due in the 7 calendar days after the current snapshot."}${due.total ? " " + fmtDash(due.atr) + " ATR \u00b7 " + fmtDash(due.bu_fc) + " remaining BU." : ""}</p>
+${(due.rows || []).length ? `<table>
+<tr><th>Account</th><th>Region</th><th>Renewal date</th><th class="r">Days</th><th class="r">ATR</th><th class="r">Remaining BU</th><th class="r">Booked C/C</th></tr>
+${(due.rows || []).map((d) => `<tr><td style="font-weight:500">${esc(d.account_name)}</td><td>${esc(d.region)}</td><td>${esc(mdy(d.next_renewal))}</td><td class="r">${d.days_until}</td><td class="r">${fmtDash(d.atr)}</td><td class="r">${fmtDash(d.bu_fc)}</td><td class="r">${fmtDash(d.booked_cc)}</td></tr>`).join("\n")}
+</table>` : `<p style="font-size:11px;color:#9ca3af;margin:6px 0">No open renewals due in this 7-day window.</p>`}`;
+    return closedHtml + dueHtml;
+  })()}
+<h3 style="font-size:14px;font-weight:700;margin:16px 0 6px">Best to worst remaining C/C</h3>
+<p class="sub" style="margin:0 0 8px">Remaining only \u2014 does not include booked C/C. Best = remaining BU + UPSIDE. Worst = remaining BU + DOWNSIDE.</p>
+<p style="font-size:12px;margin:0 0 10px">Best <strong>${fmtDash(bestCase.current_total)}</strong> (${signed(bestCase.delta || 0)} WoW) &nbsp;&middot;&nbsp; Remaining BU <strong>${fmtDash(rollup.current)}</strong> (${signed(rollup.delta || 0)} WoW) &nbsp;&middot;&nbsp; Worst <strong>${fmtDash(worstCase.current_total)}</strong> (${signed(worstCase.delta || 0)} WoW)</p>
+<h4 style="font-size:12px;font-weight:700;margin:12px 0 6px">What moved Best Case this week</h4>
 ${bestCaseTable(bestCase.top_increase || [], bestCase.top_decrease || [])}
-<h3 style="font-size:12px;font-weight:700;margin:16px 0 6px">Worst Case movement (${fmtDash(worstCase.current_total)}, <span style="color:${buDeltaColor(worstCase.delta || 0)}">${signed(worstCase.delta || 0)} WoW</span>)</h3>
+<h4 style="font-size:12px;font-weight:700;margin:16px 0 6px">What moved Worst Case this week</h4>
 ${worstCaseTable(worstCase.top_increase || [], worstCase.top_decrease || [])}`;
   const regionsForBlocks = regionFilter ? [regionFilter] : bu.regions.map((r) => r.region);
   const perRegionBlocks = regionsForBlocks.map((rname) => {
@@ -9011,14 +9216,14 @@ ${worstCaseTable(worstCase.top_increase || [], worstCase.top_decrease || [])}`;
     const rWcDown = (worstCase.top_decrease || []).filter((d) => d.region === rname);
     return `
 <h2>Region: ${esc(rname)}</h2>
-<p class="sub" style="margin-bottom:8px">${rMove.accounts} accounts \u00b7 BU FC ${fmtDash(rMove.current)} (${signed(rMove.delta)} WoW, ${pctS(rMove.delta_pct)})</p>
-<h3 style="font-size:12px;font-weight:700;margin:10px 0 6px">Worsened WoW (${rWorse.length})</h3>
+<p class="sub" style="margin-bottom:8px">${rMove.accounts} accounts \u00b7 Remaining BU ${fmtDash(rMove.current)} (${signed(rMove.delta)} WoW, ${pctS(rMove.delta_pct)})</p>
+<h3 style="font-size:14px;font-weight:700;margin:10px 0 6px">Worsened WoW (${rWorse.length})</h3>
 ${worsenedTable(rWorse)}
-<h3 style="font-size:12px;font-weight:700;margin:14px 0 6px">New in-quarter forecast (${rNew.length})</h3>
+<h3 style="font-size:14px;font-weight:700;margin:14px 0 6px">New in-quarter forecast (${rNew.length})</h3>
 ${newFcTable(rNew)}
-<h3 style="font-size:12px;font-weight:700;margin:14px 0 6px">Best Case movers</h3>
+<h3 style="font-size:14px;font-weight:700;margin:14px 0 6px">What moved Best Case</h3>
 ${bestCaseTable(rBcUp, rBcDown)}
-<h3 style="font-size:12px;font-weight:700;margin:14px 0 6px">Worst Case movers</h3>
+<h3 style="font-size:14px;font-weight:700;margin:14px 0 6px">What moved Worst Case</h3>
 ${worstCaseTable(rWcUp, rWcDown)}`;
   }).join("\n");
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Weekly 100K+ Regional Brief</title>
@@ -9047,6 +9252,7 @@ ${brief.warning ? `<p style="background:#fffbeb;border:1px solid #fde68a;border-
 <div class="kpi-row">
 ${kpiCards.map((c) => `<div class="kpi"><div class="label" style="color:${c.color}">${c.label}</div><div class="val">${c.val}</div><div class="detail"${c.detailColor ? ` style="color:${c.detailColor};font-weight:600"` : ""}>${esc(c.detail)}</div></div>`).join("\n")}
 </div>
+<p class="sub" style="margin-top:-12px;margin-bottom:20px">Same lens as Pacing: Booked C/C is QTD consumed on 100K+ Official (BAND column). Remaining BU is still-open Official forecast. Booked + remaining = ${fmtDash((rollup.booked || 0) + (rollup.current || 0))} expected landing${rollup.expected_delta != null ? " (" + signed(rollup.expected_delta) + " WoW)" : ""}.</p>
 ${overallBlock}
 ${perRegionBlocks}
 <p style="font-size:9px;color:#9ca3af;margin-top:24px;text-align:center">Generated ${genDate} &middot; Renewals Intelligence Studio &middot; Weekly 100K+ Regional Brief</p>
@@ -9088,31 +9294,41 @@ function WeeklyBriefTab() {
   };
   // Consume the app's shared filter state so the brief opens pre-scoped to
   // whatever the rest of the dashboard is narrowed to (same mechanism, not a
-  // parallel one). Single-valued app selections seed the brief's dimensions;
-  // the CCO defaults (band 100k+, current quarter) remain the fallback.
+  // parallel one). Multi-selects, dates, and search are forwarded verbatim.
   const { state } = useApp();
   const sf = state && state.filters || {};
-  // The brief's account scope is driven ENTIRELY by the app's global Filters
-  // bar (state.filters); the brief no longer has its own scope dropdowns. Each
-  // dimension is DERIVED from the shared filter state (not local component
-  // state) so editing the top Filters bar re-scopes and re-fetches the brief.
-  const firstOf = (arr) => Array.isArray(arr) && arr.length === 1 ? arr[0] : "__ALL__";
-  // A dimension scopes the brief only when EXACTLY ONE value is selected in the
-  // global bar; 0 or 2+ selections => "All" for that dimension (the endpoint
-  // takes one value per dimension and the brief is a single-cut summary).
-  const region = firstOf(sf.regions);
-  const segment = firstOf(sf.segments);
-  const owner = firstOf(sf.owners);
-  // Quarter: exactly one globally-selected quarter scopes the brief; empty, the
-  // default seed, or a multi-select all fall back to the current fiscal quarter
-  // (empty string => endpoint auto-picks it).
-  const quarter = Array.isArray(sf.quarters) && sf.quarters.length === 1 ? sf.quarters[0] : "";
-  // Account inclusion is driven by the app's ARR range filter (on ATR), NOT a
-  // fixed 100k+ band. Derive arr_min/arr_max from the global Filters bar and
-  // disable the band bucket (band=all) server-side. With no ARR filter set,
-  // the brief keeps its CCO default floor of $100K so it still opens as a
-  // 100K+ brief until the user narrows ARR from the top bar.
-  const DEFAULT_ARR_FLOOR = 1e5;
+  const joinList = (arr) => Array.isArray(arr) ? arr.filter((v) => v != null && String(v).trim() !== "").map(String) : [];
+  const csvList = (arr) => joinList(arr).join(",");
+  const regionsSel = joinList(sf.regions);
+  const segmentsSel = joinList(sf.segments);
+  const ownersSel = joinList(sf.owners);
+  const subRegionsSel = joinList(sf.subregions);
+  const csManagersSel = joinList(sf.csManagers);
+  const countriesSel = joinList(sf.countries);
+  const industriesSel = joinList(sf.industries);
+  const healthsSel = joinList(sf.healths);
+  const partnersSel = joinList(sf.partners);
+  const partnerTypesSel = joinList(sf.partnerTypes);
+  const quartersSel = joinList(sf.quarters);
+  const datesActive = !!(sf.dateFrom || sf.dateTo);
+  const searchQ = (sf.search || "").trim();
+  const regionsKey = regionsSel.join("\0");
+  const segmentsKey = segmentsSel.join("\0");
+  const ownersKey = ownersSel.join("\0");
+  const subRegionsKey = subRegionsSel.join("\0");
+  const csManagersKey = csManagersSel.join("\0");
+  const countriesKey = countriesSel.join("\0");
+  const industriesKey = industriesSel.join("\0");
+  const healthsKey = healthsSel.join("\0");
+  const partnersKey = partnersSel.join("\0");
+  const partnerTypesKey = partnerTypesSel.join("\0");
+  const quartersKey = quartersSel.join("\0");
+  const dateFrom = sf.dateFrom || "";
+  const dateTo = sf.dateTo || "";
+  // Pacing lens: 100K+ Official (BAND column), same as PacingTab. Global
+  // Filters still apply on top (region / segment / owner / CSM / ARR / dates).
+  // An explicit ARR range from the bar is forwarded; we do NOT substitute an
+  // ATR ≥ $100K floor — that was the $6.7M vs $8.5M booked miss.
   const _n = (v) => (v != null && v !== "" && isFinite(Number(v))) ? Number(v) : null;
   const _ranges = Array.isArray(sf.arrRanges) ? sf.arrRanges : [];
   let gArrMin = null, gArrMax = null;
@@ -9120,16 +9336,16 @@ function WeeklyBriefTab() {
     const mins = _ranges.map((r) => _n(r.min)).filter((v) => v != null);
     const maxs = _ranges.map((r) => _n(r.max)).filter((v) => v != null && v > 0 && isFinite(v));
     gArrMin = mins.length ? Math.min.apply(null, mins) : null;
-    // Only bound the top when EVERY selected range has a finite max (an
-    // open-ended top range means "no ceiling").
     gArrMax = (maxs.length && maxs.length === _ranges.length) ? Math.max.apply(null, maxs) : null;
   } else {
     gArrMin = _n(sf.arrMin);
     gArrMax = _n(sf.arrMax);
   }
   const arrFilterActive = gArrMin != null || gArrMax != null;
-  const arrMin = arrFilterActive ? gArrMin : DEFAULT_ARR_FLOOR;
+  const arrMin = arrFilterActive ? gArrMin : null;
   const arrMax = arrFilterActive ? gArrMax : null;
+  const rawBand = sf.band || "all";
+  const briefBand = (!rawBand || rawBand === "all" || rawBand === "100k_official") ? "100k+" : rawBand;
   const [currentId, setCurrentId] = useState("");
   const [priorId, setPriorId] = useState("");
   const [threshold, setThreshold] = useState(50000);
@@ -9139,46 +9355,185 @@ function WeeklyBriefTab() {
   const [minSwing, setMinSwing] = useState(0);
   const [minNewFc, setMinNewFc] = useState(0);
   const [brief, setBrief] = useState(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [listsLoading, setListsLoading] = useState(false);
   const [err, setErr] = useState("");
+  const [listsErr, setListsErr] = useState("");
+  const [reloadKey, setReloadKey] = useState(0);
   const didInit = useRef(false);
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setErr("");
+  const buildBriefQs = (extra) => {
     const qs = new URLSearchParams({ slot: "active", threshold: String(threshold || 0) });
-    if (currentId) qs.set("current", currentId);
-    if (priorId) qs.set("prior", priorId);
-    // Every filter is applied SERVER-side so all sections — including BOTH
-    // trend series — are scoped consistently. Each active dimension MUST be
-    // in the fetch params AND the effect deps below, or the trend would
-    // ignore the selection.
-    // sub_region and cs_manager are intentionally omitted: the global Filters
-    // bar has no equivalent dimensions, so the brief no longer scopes on them.
-    if (region && region !== "__ALL__") qs.set("region", region);
-    if (segment && segment !== "__ALL__") qs.set("segment", segment);
-    if (owner && owner !== "__ALL__") qs.set("owner", owner);
-    if (quarter) qs.set("quarter", quarter);
-    // Disable the coarse band bucket; the ARR range governs inclusion.
-    qs.set("band", "all");
+    Object.keys(extra || {}).forEach((k) => { if (extra[k] != null && extra[k] !== "") qs.set(k, String(extra[k])); });
+    const putCsv = (key, arr) => { const v = csvList(arr); if (v) qs.set(key, v); };
+    putCsv("region", regionsSel);
+    putCsv("sub_region", subRegionsSel);
+    putCsv("cs_manager", csManagersSel);
+    putCsv("segment", segmentsSel);
+    putCsv("owner", ownersSel);
+    putCsv("country", countriesSel);
+    putCsv("industry", industriesSel);
+    putCsv("health", healthsSel);
+    putCsv("partner", partnersSel);
+    putCsv("partner_type", partnerTypesSel);
+    if (quartersSel.length) qs.set("quarter", csvList(quartersSel));
+    if (dateFrom) qs.set("date_from", dateFrom);
+    if (dateTo) qs.set("date_to", dateTo);
+    if (searchQ) qs.set("search", searchQ);
+    qs.set("band", briefBand);
     if (arrMin != null) qs.set("arr_min", String(arrMin));
     if (arrMax != null) qs.set("arr_max", String(arrMax));
-    fetch("/api/renewals/weekly-brief?" + qs.toString(), { cache: "no-store" }).then((r) => r.json()).then((data) => {
-      if (cancelled) return;
-      if (!data.ok) throw new Error(data.detail || "Weekly brief load failed");
-      setBrief(data);
-      if (!didInit.current) {
-        didInit.current = true;
-        if (data.current && !currentId) setCurrentId(String(data.current.id));
-        if (data.prior && !priorId) setPriorId(String(data.prior.id));
+    return qs;
+  };
+  const parseBriefResponse = async (r) => {
+    let data = null;
+    try { data = await r.json(); } catch (_) {}
+    if (!r.ok || !data || !data.ok) {
+      const detail = data && data.detail;
+      const raw = typeof detail === "string" ? detail : (detail && (detail.detail || detail.error)) || (data && data.error) || ("Weekly brief load failed (HTTP " + r.status + ")");
+      const err = new Error(typeof raw === "string" ? raw : ("Weekly brief load failed (HTTP " + r.status + ")"));
+      err.status = r.status;
+      throw err;
+    }
+    return data;
+  };
+  const mergeBrief = (prev, next) => {
+    if (!next) return prev;
+    if (!prev) return next;
+    const prevSec = prev.sections || {};
+    const nextSec = next.sections || {};
+    const prevBu = prevSec.bu_movement || {};
+    const nextBu = nextSec.bu_movement || {};
+    return {
+      ...prev,
+      ...next,
+      sections: {
+        ...prevSec,
+        ...nextSec,
+        bu_movement: {
+          ...prevBu,
+          ...nextBu,
+          regions: (nextBu.regions && nextBu.regions.length) ? nextBu.regions : (prevBu.regions || []),
+          rollup: (nextBu.rollup && nextBu.rollup.current != null) ? nextBu.rollup : (prevBu.rollup || {}),
+          trend: (nextBu.trend && nextBu.trend.length) ? nextBu.trend : (prevBu.trend || [])
+        },
+        best_case: nextSec.best_case && (nextSec.best_case.top_increase || []).length + (nextSec.best_case.top_decrease || []).length
+          ? nextSec.best_case
+          : (nextSec.best_case && nextSec.best_case.current_total != null && !(prevSec.best_case && (prevSec.best_case.top_increase || []).length) ? nextSec.best_case : (prevSec.best_case || nextSec.best_case)),
+        worst_case: nextSec.worst_case && (nextSec.worst_case.top_increase || []).length + (nextSec.worst_case.top_decrease || []).length
+          ? nextSec.worst_case
+          : (nextSec.worst_case && nextSec.worst_case.current_total != null && !(prevSec.worst_case && (prevSec.worst_case.top_increase || []).length) ? nextSec.worst_case : (prevSec.worst_case || nextSec.worst_case))
       }
-    }).catch((e) => {
-      if (!cancelled) setErr(e.message || String(e));
-    }).finally(() => {
-      if (!cancelled) setLoading(false);
-    });
-    return () => { cancelled = true; };
-  }, [currentId, priorId, threshold, region, segment, owner, quarter, arrMin, arrMax]);
+    };
+  };
+  useEffect(() => {
+    let cancelled = false;
+    const controllers = [];
+    const fetchBrief = (path, qs, timeoutMs, hdrPart) => {
+      const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+      if (ctrl) controllers.push(ctrl);
+      const kill = setTimeout(() => { if (ctrl) ctrl.abort(); }, timeoutMs);
+      const headers = {};
+      if (hdrPart) headers["X-Renewals-Brief-Part"] = hdrPart;
+      return fetch(path + (qs && qs.toString() ? "?" + qs.toString() : ""), { cache: "no-store", signal: ctrl ? ctrl.signal : void 0, headers }).then(parseBriefResponse).finally(() => clearTimeout(kill));
+    };
+    const fetchPart = (qs, timeoutMs, hdrPart) => fetchBrief("/api/renewals/weekly-brief", qs, timeoutMs, hdrPart);
+    const weeksFromSnapshots = async () => {
+      const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+      if (ctrl) controllers.push(ctrl);
+      const kill = setTimeout(() => { if (ctrl) ctrl.abort(); }, 15e3);
+      let data = null;
+      try {
+        const r = await fetch("/api/renewals/snapshots?limit=60", { cache: "no-store", signal: ctrl ? ctrl.signal : void 0 });
+        data = await r.json().catch(() => null);
+        if (!r.ok || !data || !data.ok) {
+          const err = new Error((data && (data.detail || data.error)) || ("Snapshot list failed (HTTP " + r.status + ")"));
+          err.status = r.status;
+          throw err;
+        }
+      } finally {
+        clearTimeout(kill);
+      }
+      const items = (data.items || []).filter((s) => String(s.slot || "active").toLowerCase() === "active");
+      const all = items.map((s) => ({
+        id: s.id,
+        slot: s.slot,
+        filename: s.filename,
+        uploaded_at: s.uploaded_at,
+        effective_date: s.effective_date || s.uploaded_at,
+        row_count: s.row_count || 0
+      }));
+      // An upload still ingesting has no rows yet; skip it while parsed ones exist.
+      const parsed = all.filter((s) => s.row_count > 0);
+      const snapshots = parsed.length ? parsed : all;
+      // Default prior = about a week back (newest snapshot more than 6 days
+      // older than current), same rule as the server; else the one before.
+      const curMs = snapshots[0] ? Date.parse(snapshots[0].effective_date) : NaN;
+      const weekBack = Number.isFinite(curMs) ? snapshots.find((s, i) => i > 0 && Date.parse(s.effective_date) < curMs - 6 * 864e5) : null;
+      return { ok: true, snapshots, current: snapshots[0] || null, prior: weekBack || snapshots[1] || null, sections: null, meta_only: true, warning: snapshots.length ? null : "No snapshots with parsed rows are available yet." };
+    };
+    const loadWeekPicker = async () => {
+      // Fill Current/Prior from /snapshots first — that route exists even
+      // when /weekly-brief is missing (github_cx / older Python).
+      try {
+        return await weeksFromSnapshots();
+      } catch (snapErr) {
+        const qs = new URLSearchParams({ slot: "active" });
+        try {
+          return await fetchBrief("/api/renewals/weekly-brief/weeks", qs, 15e3, "meta");
+        } catch (e1) {
+          try {
+            return await fetchPart(qs, 15e3, "meta");
+          } catch (_) {
+            throw snapErr;
+          }
+        }
+      }
+    };
+    const metaOnly = !currentId;
+    if (metaOnly) setLoading(true);
+    else { setLoading(true); setErr(""); setListsErr(""); }
+    const run = async () => {
+      try {
+        if (metaOnly) {
+          const data = await loadWeekPicker();
+          if (cancelled) return;
+          setBrief((prev) => prev && prev.sections ? prev : data);
+          const nextCur = data.current ? String(data.current.id) : "";
+          const nextPri = data.prior ? String(data.prior.id) : "";
+          if (nextCur) setCurrentId(nextCur);
+          if (nextPri) setPriorId(nextPri);
+          didInit.current = true;
+          if (!nextCur) setLoading(false);
+          return;
+        }
+        const summary = await fetchPart(buildBriefQs({ current: currentId, ...(priorId ? { prior: priorId } : {}), part: "summary" }), 35e3, "summary");
+        if (cancelled) return;
+        setBrief(summary);
+        setLoading(false);
+        setListsLoading(true);
+        try {
+          const lists = await fetchPart(buildBriefQs({ current: currentId, ...(priorId ? { prior: priorId } : {}), part: "lists" }), 60e3, "lists");
+          if (cancelled) return;
+          setBrief((prev) => mergeBrief(prev, lists));
+          setListsErr("");
+        } catch (e) {
+          if (cancelled) return;
+          const aborted = e && (e.name === "AbortError" || /aborted/i.test(String(e.message || "")));
+          setListsErr(aborted ? "Account lists timed out. Headline numbers above are complete — retry or narrow Filters for the tables." : (e.message || String(e)));
+        } finally {
+          if (!cancelled) setListsLoading(false);
+        }
+      } catch (e) {
+        if (cancelled) return;
+        const aborted = e && (e.name === "AbortError" || /aborted/i.test(String(e.message || "")));
+        setErr(aborted ? "Weekly brief timed out. Try again, or narrow quarter / ARR in Filters." : (e.message || String(e)));
+        setLoading(false);
+        setListsLoading(false);
+      }
+    };
+    const delay = setTimeout(run, metaOnly ? 0 : 80);
+    return () => { cancelled = true; clearTimeout(delay); controllers.forEach((c) => c.abort()); };
+  }, [currentId, priorId, threshold, regionsKey, subRegionsKey, csManagersKey, segmentsKey, ownersKey, countriesKey, industriesKey, healthsKey, partnersKey, partnerTypesKey, quartersKey, dateFrom, dateTo, searchQ, arrMin, arrMax, briefBand, reloadKey]);
   const sec = brief && brief.sections;
   const bu = sec && sec.bu_movement || { regions: [], rollup: {}, trend: [] };
   const rollup = bu.rollup || {};
@@ -9189,6 +9544,9 @@ function WeeklyBriefTab() {
   const newFc = sec && sec.new_forecast || [];
   const regionRows = bu.regions || [];
   const snapshots = brief && brief.snapshots || [];
+  const listsPending = listsLoading || !!(brief && brief.lists_pending);
+  const regionAll = regionsSel.length !== 1;
+  const scopeLabel = regionsSel.length === 0 ? "all regions" : (regionsSel.length === 1 ? regionsSel[0] : regionsSel.length + " regions");
   const buDeltaColor = (n) => n > 0 ? "#ef4444" : n < 0 ? "#22c55e" : "#64748b";
   const upDeltaColor = (n) => n > 0 ? "#22c55e" : n < 0 ? "#ef4444" : "#64748b";
   const snapLabel = (s) => fmtDateTime(s.effective_date) + (s.row_count ? " \u00b7 " + Number(s.row_count).toLocaleString() + " rows" : "");
@@ -9196,7 +9554,7 @@ function WeeklyBriefTab() {
   const th = (txt, cls) => /* @__PURE__ */ React.createElement("th", { key: txt, className: "px-2 py-1.5 text-left font-semibold uppercase tracking-wider " + (cls || "") }, txt);
   // Shared payload for the download button (scope values are echoed by the
   // server too, but the threshold comes from the brief-local control).
-  const dlOpts = { region, segment, owner, quarter, band: "all", arr_min: arrMin, arr_max: arrMax, threshold };
+  const dlOpts = { region: csvList(regionsSel) || "__ALL__", segment: csvList(segmentsSel) || "__ALL__", owner: csvList(ownersSel) || "__ALL__", quarter: csvList(quartersSel), band: briefBand, arr_min: arrMin, arr_max: arrMax, threshold, date_from: dateFrom, date_to: dateTo };
   // ---- controls -----------------------------------------------------------
   // Only brief-specific controls live here: the snapshot pair to diff and the
   // large-mover threshold. All account scope comes from the global Filters bar.
@@ -9213,26 +9571,30 @@ function WeeklyBriefTab() {
   const mutedChip = (key, label) => /* @__PURE__ */ React.createElement("span", { key, className: "region-filter-chip region-filter-chip-muted" }, label);
   const groupLabel = (txt) => /* @__PURE__ */ React.createElement("span", { className: "text-[9px] uppercase tracking-wider text-gray-500 font-semibold shrink-0" }, txt);
   // Group 1 \u2014 Comparing: the snapshot pair being diffed (driven by the
-  // Current/Prior snapshot dropdowns). Informational.
-  const comparingVal = brief && brief.current ? (brief.prior ? fmtDateShort(brief.prior.effective_date) : "\u2014") + " \u2192 " + fmtDateShort(brief.current.effective_date) : "\u2014";
+  // Current/Prior snapshot dropdowns, not a leftover payload).
+  const curSnap = snapshots.find((s) => String(s.id) === String(currentId)) || (brief && brief.current) || null;
+  const priSnap = priorId ? (snapshots.find((s) => String(s.id) === String(priorId)) || null) : ((brief && brief.prior) || null);
+  const comparingVal = curSnap ? ((priSnap ? fmtDateShort(priSnap.effective_date) : "\u2014") + " \u2192 " + fmtDateShort(curSnap.effective_date)) : "\u2014";
   const comparingGroup = /* @__PURE__ */ React.createElement("div", { className: "wb-filter-group" }, groupLabel("Comparing"), mutedChip("pair", comparingVal));
   // Group 2 \u2014 Scope: account-inclusion filters sourced from the global bar.
-  // Band + Quarter always define the brief; Region/Segment/Owner appear when
-  // active. A multi-select in the global bar collapses to "All" for the brief,
-  // which the chip states plainly so it's never ambiguous.
   const dimChip = (key, label, arr) => {
     const a = Array.isArray(arr) ? arr : [];
     if (a.length === 1) return mutedChip(key, label + ": " + a[0]);
-    if (a.length > 1) return mutedChip(key, label + ": " + a.length + " selected \u00b7 brief shows All");
+    if (a.length > 1) return mutedChip(key, label + ": " + (a.length <= 3 ? a.join(", ") : a.length + " selected"));
     return null;
   };
   const scopeChips = [];
-  const arrChipLabel = arrFilterActive
-    ? ("ARR " + (arrMin != null ? "\u2265 " + fmtMoney(arrMin) : "") + (arrMin != null && arrMax != null ? " \u00b7 " : "") + (arrMax != null ? "\u2264 " + fmtMoney(arrMax) : ""))
-    : "ARR \u2265 " + fmtMoney(DEFAULT_ARR_FLOOR) + " (default)";
-  scopeChips.push(mutedChip("arr", arrChipLabel));
-  if (brief && brief.quarter) scopeChips.push(mutedChip("q", "Quarter " + brief.quarter + (brief.quarter_auto_selected ? " (auto)" : "")));
-  [dimChip("region", "Region", sf.regions), dimChip("seg", "Segment", sf.segments), dimChip("own", "Owner", sf.owners)].forEach((c) => { if (c) scopeChips.push(c); });
+  scopeChips.push(mutedChip("band", briefBand === "100k+" ? "100K+ Official" : "Band " + briefBand));
+  if (arrFilterActive) {
+    const arrChipLabel = "ARR " + (arrMin != null ? "\u2265 " + fmtMoney(arrMin) : "") + (arrMin != null && arrMax != null ? " \u00b7 " : "") + (arrMax != null ? "\u2264 " + fmtMoney(arrMax) : "");
+    scopeChips.push(mutedChip("arr", arrChipLabel));
+  }
+  if (datesActive) scopeChips.push(mutedChip("dates", "Dates " + (dateFrom || "\u2026") + " \u2013 " + (dateTo || "\u2026")));
+  if (searchQ) scopeChips.push(mutedChip("search", "Search: " + searchQ));
+  if (quartersSel.length && !isDefaultQuarters(quartersSel)) {
+    scopeChips.push(mutedChip("q", quartersSel.length === 1 ? "Quarter " + quartersSel[0] : "Quarters: " + (quartersSel.length <= 4 ? quartersSel.join(", ") : quartersSel.length + " selected")));
+  }
+  [dimChip("region", "Region", regionsSel), dimChip("sub", "Sub-region", subRegionsSel), dimChip("csm", "CSM", ownersSel), dimChip("csmMgr", "CSM Manager", csManagersSel), dimChip("seg", "Segment", segmentsSel), dimChip("country", "Country", countriesSel), dimChip("ind", "Industry", industriesSel), dimChip("health", "Health", healthsSel), dimChip("partner", "Partner", partnersSel), dimChip("ptype", "Partner type", partnerTypesSel)].forEach((c) => { if (c) scopeChips.push(c); });
   const scopeGroup = /* @__PURE__ */ React.createElement("div", { className: "wb-filter-group" }, groupLabel("Scope"), /* @__PURE__ */ React.createElement("div", { className: "region-filter-summary" }, scopeChips));
   // Group 3 \u2014 Large-mover cutoff: the threshold for flagging large movers.
   // Informational (adjusted via the Large threshold input); does NOT filter rows.
@@ -9242,77 +9604,88 @@ function WeeklyBriefTab() {
   // ---- Plain-English takeaway (the single most important line) ------------
   // States the headline WoW movement for the current scope in one sentence,
   // color-coded to the C/C convention (increase = worse = red).
-  const scopeLabel = region === "__ALL__" ? "all regions" : region;
   const tkDelta = rollup.delta || 0;
   const tkVerb = tkDelta > 0 ? "worsened by" : tkDelta < 0 ? "improved by" : "held roughly flat";
   const takeaway = /* @__PURE__ */ React.createElement("div", { className: "wb-takeaway", style: { borderLeft: "3px solid " + buDeltaColor(tkDelta), background: "rgba(148,163,184,0.10)", borderRadius: 8, padding: "8px 12px", fontSize: "12px", lineHeight: 1.5 } },
-    "This week, the BU forecast (C/C) for ",
+    "This week, the remaining BU forecast (C/C) for ",
     /* @__PURE__ */ React.createElement("b", null, scopeLabel),
     " ",
     /* @__PURE__ */ React.createElement("b", { style: { color: buDeltaColor(tkDelta) } }, tkVerb, tkDelta === 0 ? "" : " " + fmtMoney(Math.abs(tkDelta)) + (rollup.delta_pct == null || !isFinite(rollup.delta_pct) ? "" : " (" + Math.abs(rollup.delta_pct).toFixed(1) + "%)")),
-    ", to ",
+    ", to remaining ",
     /* @__PURE__ */ React.createElement("b", null, fmtC(rollup.current)),
+    (rollup.booked != null ? /* @__PURE__ */ React.createElement(React.Fragment, null, " (booked ", /* @__PURE__ */ React.createElement("b", null, fmtC(rollup.booked)), ")") : null),
     ". ",
+    listsPending ? "Account lists still loading." : /* @__PURE__ */ React.createElement(React.Fragment, null,
     /* @__PURE__ */ React.createElement("b", { style: { color: "#ef4444" } }, worsened.length),
     (worsened.length === 1 ? " account worsened" : " accounts worsened"),
     " \u00b7 ",
     /* @__PURE__ */ React.createElement("b", { style: { color: "#d97706" } }, newFc.length),
-    " new $0\u2192FC.");
+    " new $0\u2192FC",
+    (sec && sec.closed_since_prior && sec.closed_since_prior.total ? /* @__PURE__ */ React.createElement(React.Fragment, null, " \u00b7 ", /* @__PURE__ */ React.createElement("b", { style: { color: "#0d9488" } }, sec.closed_since_prior.total), " closed") : null),
+    "."));
+  const retry = () => { setErr(""); setListsErr(""); setLoading(true); setReloadKey((n) => n + 1); };
+  const snapHint = /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500" }, snapshots.length >= 2 ? "Latest week vs the previous week is already selected. Change these only if you want a different pair." : loading ? "Finding the latest weekly snapshots\u2026" : "Need two weekly snapshots before a week-over-week brief can run.");
+  const setupShell = (body) => /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3 space-y-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2 flex-wrap" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, "Weekly 100K+ Regional Brief"), dlBtn), snapHint, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-3 items-end" }, curSel, priorSel, thrInput), /* @__PURE__ */ React.createElement("div", { className: "wb-filter-strip" }, comparingGroup, scopeGroup, cutoffGroup), scopeHint), body);
+  const buildingBody = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-6 text-center space-y-2" }, /* @__PURE__ */ React.createElement("svg", { className: "mx-auto animate-spin", width: "28", height: "28", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2" }, /* @__PURE__ */ React.createElement("path", { d: "M21 12a9 9 0 11-6.219-8.56" })), /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, "Building this week's brief"), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500" }, comparingVal !== "\u2014" ? "Comparing " + comparingVal + ". This usually takes a few seconds." : "Loading the latest snapshot pair\u2026"));
+  const errIsTimeout = /timed out|did not finish/i.test(String(err || ""));
+  const errIsMissing = /not found|HTTP 404|\b404\b/i.test(String(err || ""));
+  const errTitle = errIsTimeout ? "The brief did not finish in time" : errIsMissing ? "Weekly Brief could not reach the server" : "Weekly Brief failed to load";
+  const errHint = errIsMissing ? "The dashboard loaded, but GET /api/renewals/weekly-brief is missing on this revision. Redeploy app/routes/renewals.py, restart the service, then hard-refresh." : "Retry the compare, or narrow quarter / ARR in Filters.";
+  if (err) return setupShell(/* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-5 space-y-2" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold text-red-600" }, errTitle), /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-gray-600" }, err), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500" }, errHint), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-indigo", type: "button", onClick: retry }, "Try again")));
+  if (loading) return setupShell(buildingBody);
+  if (!sec) return setupShell(/* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500 p-2" }, brief && brief.warning || "Need two weekly snapshots before a week-over-week brief can run."));
   // ---- Merged header: title + takeaway + controls + scope chips (one card) -
   const briefHeader = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3 space-y-2" },
     /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between gap-2 flex-wrap" },
       /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, "Weekly 100K+ Regional Brief"),
       dlBtn),
     takeaway,
+    snapHint,
     /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-3 items-end" }, curSel, priorSel, thrInput),
     /* @__PURE__ */ React.createElement("div", { className: "wb-filter-strip" }, comparingGroup, scopeGroup, cutoffGroup),
     scopeHint);
-  if (loading && !brief) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500" }, "Loading weekly brief\u2026"));
-  if (err) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-red-500" }, err));
-  if (!sec) return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, controls, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-gray-500" }, brief && brief.warning || "Upload at least two active CSV snapshots to compare week over week."));
   // ---- KPI tiles ----------------------------------------------------------
   const kpis = [
-    { label: "BU Forecast (C/C)", value: fmtC(rollup.current), delta: rollup.delta, deltaColor: buDeltaColor(rollup.delta || 0), accent: "#0ea5e9" },
-    { label: "Best Case", value: fmtC(bestCase.current_total), delta: bestCase.delta, deltaColor: buDeltaColor(bestCase.delta || 0), accent: "#8b5cf6" },
-    { label: "Worst Case", value: fmtC(worstCase.current_total), delta: worstCase.delta, deltaColor: buDeltaColor(worstCase.delta || 0), accent: "#0d9488" },
-    { label: "Worsened accounts", value: String(sec.worsened_total != null ? sec.worsened_total : (sec.worsened || []).length), sub: `${sec.worsened_large_total != null ? sec.worsened_large_total : (sec.worsened || []).filter((r) => r.is_large).length} \u2265 threshold`, accent: "#ef4444" },
-    { label: "New $0\u2192FC", value: String(sec.new_forecast_total != null ? sec.new_forecast_total : (sec.new_forecast || []).length), sub: `${sec.new_forecast_large_total != null ? sec.new_forecast_large_total : (sec.new_forecast || []).filter((r) => r.is_large).length} large`, accent: "#f59e0b" }
+    { label: "Booked C/C", value: fmtC(rollup.booked != null ? rollup.booked : 0), delta: rollup.booked_delta, deltaColor: buDeltaColor(rollup.booked_delta || 0), accent: "#0d9488" },
+    { label: "Remaining BU Forecast (C/C)", value: fmtC(rollup.current), delta: rollup.delta, deltaColor: buDeltaColor(rollup.delta || 0), accent: "#0ea5e9" },
+    { label: "Best Case remaining", value: fmtC(bestCase.current_total), delta: bestCase.delta, deltaColor: buDeltaColor(bestCase.delta || 0), accent: "#8b5cf6" },
+    { label: "Worst Case remaining", value: fmtC(worstCase.current_total), delta: worstCase.delta, deltaColor: buDeltaColor(worstCase.delta || 0), accent: "#64748b" },
+    { label: "Worsened accounts", value: listsPending ? "\u2026" : String(sec.worsened_total != null ? sec.worsened_total : (sec.worsened || []).length), sub: listsPending ? "loading lists" : `${sec.worsened_large_total != null ? sec.worsened_large_total : (sec.worsened || []).filter((r) => r.is_large).length} \u2265 threshold`, accent: "#ef4444" },
+    { label: "New $0\u2192FC", value: listsPending ? "\u2026" : String(sec.new_forecast_total != null ? sec.new_forecast_total : (sec.new_forecast || []).length), sub: listsPending ? "loading lists" : `${sec.new_forecast_large_total != null ? sec.new_forecast_large_total : (sec.new_forecast || []).filter((r) => r.is_large).length} large`, accent: "#f59e0b" },
+    { label: "Closed this week", value: listsPending ? "\u2026" : String((sec.closed_since_prior && sec.closed_since_prior.total) || 0), sub: listsPending ? "loading lists" : (sec.closed_since_prior ? fmtC(sec.closed_since_prior.booked_cc) + " booked C/C" : "\u2014"), accent: "#0d9488" },
+    { label: "Due in 7 days", value: listsPending ? "\u2026" : String((sec.due_soon && sec.due_soon.total) || 0), sub: listsPending ? "loading lists" : (sec.due_soon ? fmtC(sec.due_soon.atr) + " ATR" : "\u2014"), accent: "#6366f1" }
   ];
-  const kpiRow = /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-5 gap-2" }, kpis.map((c, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: "glass-kpi" }, /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-label" }, c.label), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-value", style: { color: c.accent } }, c.value), c.delta != null ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub", style: { color: c.deltaColor } }, signed(c.delta), " WoW") : c.sub ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub" }, c.sub) : null)));
+  const kpiRow = /* @__PURE__ */ React.createElement("div", { className: "space-y-1.5" },
+    /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 gap-2" }, kpis.map((c, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: "glass-kpi" }, /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-label" }, c.label), /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-value", style: { color: c.accent } }, c.value), c.delta != null ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub", style: { color: c.deltaColor } }, signed(c.delta), " WoW") : c.sub ? /* @__PURE__ */ React.createElement("div", { className: "glass-kpi-sub" }, c.sub) : null))),
+    /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500 px-0.5" }, "Same lens as Pacing: Booked C/C is QTD consumed on 100K+ Official (BAND column, not ATR \u2265 $100K). Remaining BU is still-open Official forecast. Booked + remaining = ", fmtC((rollup.booked || 0) + (rollup.current || 0)), " expected landing", rollup.expected_delta != null ? " (" + signed(rollup.expected_delta) + " WoW)." : "."));
   // ---- Section 1: BU movement by region ----------------------------------
   const buRegionCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
-    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold" }, "1 \u00b7 BU forecast movement by region"),
+    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2.5 border-b text-sm font-semibold" }, "Remaining BU forecast by region"),
     /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
-      /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Region", "Accounts", "Prior BU FC", "Current BU FC", "\u0394 $", "\u0394 %"].map((h, i) => th(h, i > 0 ? "text-right" : "")))),
+      /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Region", "Accounts", "Prior remaining", "Current remaining", "\u0394 $", "\u0394 %"].map((h, i) => th(h, i > 0 ? "text-right" : "")))),
       /* @__PURE__ */ React.createElement("tbody", null,
         regionRows.map((o) => /* @__PURE__ */ React.createElement("tr", { key: o.region, className: "glass-row-accent" }, cell(o.region, "font-medium"), cell(o.accounts, "text-right tabular-nums"), cell(fmtC(o.prior), "text-right tabular-nums"), cell(fmtC(o.current), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: buDeltaColor(o.delta) } }, signed(o.delta)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: buDeltaColor(o.delta) } }, pctS(o.delta_pct)))),
-        region === "__ALL__" && /* @__PURE__ */ React.createElement("tr", { className: "font-bold border-t-2", style: { borderColor: "var(--border)" } }, cell("Total"), cell(rollup.accounts || 0, "text-right tabular-nums"), cell(fmtC(rollup.prior), "text-right tabular-nums"), cell(fmtC(rollup.current), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: buDeltaColor(rollup.delta || 0) } }, signed(rollup.delta || 0)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: buDeltaColor(rollup.delta || 0) } }, pctS(rollup.delta_pct)))))));
-  // ---- Trend chart (BU vs Adjusted/ELT forecast over time) ----------------
+        regionAll && /* @__PURE__ */ React.createElement("tr", { className: "font-bold border-t-2", style: { borderColor: "var(--border)" } }, cell("Total"), cell(rollup.accounts || 0, "text-right tabular-nums"), cell(fmtC(rollup.prior), "text-right tabular-nums"), cell(fmtC(rollup.current), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: buDeltaColor(rollup.delta || 0) } }, signed(rollup.delta || 0)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums", style: { color: buDeltaColor(rollup.delta || 0) } }, pctS(rollup.delta_pct)))))));
+  // ---- Trend chart (remaining BU, QTD booked C/C, CS call over time) ----
   const trend = bu.trend || [];
   let trendCard = null;
   if (trend.length > 1) {
-    const BU_COLOR = "#0ea5e9", ADJ_COLOR = "#6366f1";
-    // BU_FC = forecasted churn/contraction; higher = worse. The gap
-    // (Adjusted \u2212 BU) shows how much the teams' calls move the number.
-    const trendRows = trend.map((t, i) => {
-      const buv = t.total_bu_fc || 0;
-      const adj = t.total_adjusted_fc != null ? t.total_adjusted_fc : buv;
-      const gap = t.gap != null ? t.gap : adj - buv;
-      const prevBu = i > 0 ? (trend[i - 1].total_bu_fc || 0) : null;
-      const d = prevBu == null ? null : buv - prevBu;
-      const dp = prevBu == null || prevBu === 0 ? null : d / Math.abs(prevBu) * 100;
-      return { date: (t.effective_date || "").slice(0, 10), bu: buv, adj, gap, d, dp };
-    });
+    // Theme: sky remaining-BU, indigo booked (app accent), emerald CS call
+    // (header gradient third stop). All solid so the three series stay distinct.
+    const BU_COLOR = "#0ea5e9", CC_COLOR = "#6366f1", CS_COLOR = "#10b981";
+    const trendRows = trend.map((t) => ({
+      date: (t.effective_date || "").slice(0, 10),
+      bu: t.total_bu_fc || 0,
+      cc: t.total_booked_cc || 0,
+      cs: t.total_cs_call || 0
+    }));
     const first = trendRows[0];
     const latest = trendRows[trendRows.length - 1];
-    const regionLabel = region === "__ALL__" ? "All regions" : region;
-    // ---- chart geometry (domain spans BOTH series) ----
+    const regionLabel = regionsSel.length === 0 ? "All regions" : (regionsSel.length === 1 ? regionsSel[0] : regionsSel.length + " regions");
     const w = 720, h = 300, pad = { t: 30, r: 24, b: 58, l: 68 };
     const iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
-    const allVals = trendRows.reduce((a, r) => { a.push(r.bu, r.adj); return a; }, []);
-    const dataMin = Math.min(...allVals), dataMax = Math.max(...allVals);
-    // Nice, human-friendly Y ticks (loose labeling) so the axis reads in
-    // round increments instead of raw data-max fractions.
+    const allVals = trendRows.reduce((a, r) => { a.push(r.bu, r.cc, r.cs); return a; }, []);
+    const dataMin = Math.min(0, ...allVals), dataMax = Math.max(...allVals);
     const niceNum = (x, round) => {
       if (!(x > 0)) return 1;
       const e = Math.floor(Math.log10(x)), f = x / Math.pow(10, e);
@@ -9336,75 +9709,47 @@ function WeeklyBriefTab() {
       gridEls.push(/* @__PURE__ */ React.createElement("text", { key: "gt" + i, x: pad.l - 8, y: gy + 3, textAnchor: "end", fontSize: 10, fill: "currentColor", className: "text-gray-500" }, fmtMoney(val)));
     }
     const buCoords = trendRows.map((r, i) => `${xAt(i).toFixed(1)},${yAt(r.bu).toFixed(1)}`).join(" ");
-    const adjCoords = trendRows.map((r, i) => `${xAt(i).toFixed(1)},${yAt(r.adj).toFixed(1)}`).join(" ");
-    const GAP_EPS = 0.5;
-    const anyDiv = trendRows.some((r) => Math.abs(r.gap) > GAP_EPS);
-    // Shade the area between the two lines. Where they coincide the band has
-    // zero height (invisible); where they diverge, the gap reads at a glance.
-    const bandEl = anyDiv ? /* @__PURE__ */ React.createElement("polygon", {
-      points: trendRows.map((r, i) => `${xAt(i).toFixed(1)},${yAt(r.adj).toFixed(1)}`).concat(trendRows.map((r, i) => `${xAt(trendRows.length - 1 - i).toFixed(1)},${yAt(trendRows[trendRows.length - 1 - i].bu).toFixed(1)}`)).join(" "),
-      fill: ADJ_COLOR, opacity: 0.14, stroke: "none"
-    }) : null;
-    // Labels: one per point. A single BU label where the lines coincide; a
-    // second (Adjusted) label ONLY where they diverge, offset so the two
-    // never overlap (higher point labelled above, lower point below). To keep
-    // the chart uncluttered, only first / last / divergence points are
-    // labelled (tooltip + table carry the rest).
-    const lastIdx = trendRows.length - 1;
-    const labelAll = trendRows.length <= 4;
+    const ccCoords = trendRows.map((r, i) => `${xAt(i).toFixed(1)},${yAt(r.cc).toFixed(1)}`).join(" ");
+    const csCoords = trendRows.map((r, i) => `${xAt(i).toFixed(1)},${yAt(r.cs).toFixed(1)}`).join(" ");
     const pointEls = [];
-    const labelEls = [];
     trendRows.forEach((r, i) => {
-      const bx = xAt(i), by = yAt(r.bu), ay = yAt(r.adj);
-      const isDiv = Math.abs(r.gap) > GAP_EPS;
-      const tip = `${r.date}\nBU FC ${fmtMoney(r.bu)}\nAdjusted (ELT) ${fmtMoney(r.adj)}\nGap (Adj\u2212BU) ${signed(r.gap)}` + (r.d == null ? "" : `\nBU WoW ${signed(r.d)} (${pctS(r.dp)})`);
-      // BU marker at every point; Adjusted marker only where it diverges.
-      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "bc" + i, cx: bx, cy: by, r: 3, fill: BU_COLOR }));
-      if (isDiv) pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "ac" + i, cx: bx, cy: ay, r: 3.8, fill: ADJ_COLOR, stroke: "#fff", strokeWidth: 1 }));
-      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "bh" + i, cx: bx, cy: by, r: 12, fill: "transparent" }, /* @__PURE__ */ React.createElement("title", null, tip)));
-      if (isDiv) pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "ah" + i, cx: bx, cy: ay, r: 12, fill: "transparent" }, /* @__PURE__ */ React.createElement("title", null, tip)));
-      if (labelAll || i === 0 || i === lastIdx || isDiv) {
-        if (isDiv) {
-          const topIsAdj = ay <= by;
-          const topY = Math.min(ay, by), botY = Math.max(ay, by);
-          labelEls.push(/* @__PURE__ */ React.createElement("text", { key: "lt" + i, x: bx, y: topY - 8, textAnchor: "middle", fontSize: 10, fontWeight: 700, fill: topIsAdj ? ADJ_COLOR : BU_COLOR }, fmtMoney(topIsAdj ? r.adj : r.bu)));
-          labelEls.push(/* @__PURE__ */ React.createElement("text", { key: "lb" + i, x: bx, y: botY + 15, textAnchor: "middle", fontSize: 10, fontWeight: 700, fill: topIsAdj ? BU_COLOR : ADJ_COLOR }, fmtMoney(topIsAdj ? r.bu : r.adj)));
-        } else {
-          labelEls.push(/* @__PURE__ */ React.createElement("text", { key: "lc" + i, x: bx, y: by - 8, textAnchor: "middle", fontSize: 10, fontWeight: 700, fill: BU_COLOR }, fmtMoney(r.bu)));
-        }
-      }
+      const bx = xAt(i);
+      const tip = `${r.date}\nRemaining BU FC ${fmtMoney(r.bu)}\nClosed / budget consumed ${fmtMoney(r.cc)}\nCS call (adjustment) ${fmtMoney(r.cs)}`;
+      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "bu" + i, cx: bx, cy: yAt(r.bu), r: 3, fill: BU_COLOR }));
+      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "cc" + i, cx: bx, cy: yAt(r.cc), r: 3, fill: CC_COLOR }));
+      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "cs" + i, cx: bx, cy: yAt(r.cs), r: 3, fill: CS_COLOR }));
+      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "h" + i, cx: bx, cy: yAt(r.bu), r: 14, fill: "transparent" }, /* @__PURE__ */ React.createElement("title", null, tip)));
+      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "h2" + i, cx: bx, cy: yAt(r.cc), r: 14, fill: "transparent" }, /* @__PURE__ */ React.createElement("title", null, tip)));
+      pointEls.push(/* @__PURE__ */ React.createElement("circle", { key: "h3" + i, cx: bx, cy: yAt(r.cs), r: 14, fill: "transparent" }, /* @__PURE__ */ React.createElement("title", null, tip)));
     });
     const xLabelEls = trendRows.map((r, i) => /* @__PURE__ */ React.createElement("text", { key: "x" + i, x: xAt(i), y: h - pad.b + 16, textAnchor: "middle", fontSize: 9, fill: "currentColor", className: "text-gray-500" }, r.date.slice(5)));
     const axisLine = /* @__PURE__ */ React.createElement("line", { x1: pad.l, y1: pad.t + ih, x2: w - pad.r, y2: pad.t + ih, stroke: "currentColor", strokeWidth: 1, className: "text-gray-300 dark:text-gray-600" });
-    const yTitle = /* @__PURE__ */ React.createElement("text", { x: 14, y: pad.t + ih / 2, textAnchor: "middle", fontSize: 10, fontWeight: 600, fill: "currentColor", className: "text-gray-500", transform: `rotate(-90 14 ${pad.t + ih / 2})` }, "Forecast (C/C)");
+    const yTitle = /* @__PURE__ */ React.createElement("text", { x: 14, y: pad.t + ih / 2, textAnchor: "middle", fontSize: 10, fontWeight: 600, fill: "currentColor", className: "text-gray-500", transform: `rotate(-90 14 ${pad.t + ih / 2})` }, "Amount ($)");
     const xTitle = /* @__PURE__ */ React.createElement("text", { x: pad.l + iw / 2, y: h - 4, textAnchor: "middle", fontSize: 10, fontWeight: 600, fill: "currentColor", className: "text-gray-500" }, "Snapshot week (effective date)");
-    const svg = /* @__PURE__ */ React.createElement("svg", { viewBox: `0 0 ${w} ${h}`, className: "wb-trend-chart", role: "img", "aria-label": `BU vs adjusted forecast over time for ${regionLabel}` }, gridEls, bandEl, axisLine, /* @__PURE__ */ React.createElement("polyline", { fill: "none", stroke: BU_COLOR, strokeWidth: 2.5, strokeLinejoin: "round", strokeLinecap: "round", points: buCoords }), /* @__PURE__ */ React.createElement("polyline", { fill: "none", stroke: ADJ_COLOR, strokeWidth: 2, strokeDasharray: "6 3", strokeLinejoin: "round", strokeLinecap: "round", points: adjCoords }), pointEls, labelEls, xLabelEls, yTitle, xTitle);
-    // ---- legend ----
+    const line = (pts, color, key) => /* @__PURE__ */ React.createElement("polyline", { key, fill: "none", stroke: color, strokeWidth: 2.5, strokeLinejoin: "round", strokeLinecap: "round", points: pts });
+    const svg = /* @__PURE__ */ React.createElement("svg", { viewBox: `0 0 ${w} ${h}`, className: "wb-trend-chart", role: "img", "aria-label": `Remaining BU, closed C/C, and CS call over time for ${regionLabel}` }, gridEls, axisLine, line(buCoords, BU_COLOR, "lbu"), line(ccCoords, CC_COLOR, "lcc"), line(csCoords, CS_COLOR, "lcs"), pointEls, xLabelEls, yTitle, xTitle);
+    const swatch = (color, label) => /* @__PURE__ */ React.createElement("span", { className: "wb-trend-legend-item" }, /* @__PURE__ */ React.createElement("span", { className: "wb-trend-swatch", style: { background: color } }), label);
     const legend = /* @__PURE__ */ React.createElement("div", { className: "wb-trend-legend" },
-      /* @__PURE__ */ React.createElement("span", { className: "wb-trend-legend-item" }, /* @__PURE__ */ React.createElement("span", { className: "wb-trend-swatch", style: { background: BU_COLOR } }), "BU forecast (system)"),
-      /* @__PURE__ */ React.createElement("span", { className: "wb-trend-legend-item" }, /* @__PURE__ */ React.createElement("span", { className: "wb-trend-swatch wb-trend-swatch-dash", style: { color: ADJ_COLOR } }), "Adjusted \u2014 ELT / calls (as-of)"));
-    // ---- headline callout (scannable: primary amounts, WoW as a separate
-    //      secondary line) ----
-    const gapColor = Math.abs(latest.gap) > GAP_EPS ? buDeltaColor(latest.gap) : "#64748b";
+      swatch(BU_COLOR, "Remaining BU FC (system)"),
+      swatch(CC_COLOR, "Closed / budget consumed (QTD C/C)"),
+      swatch(CS_COLOR, "CS call (as-of, no fallback)"));
     const headline = /* @__PURE__ */ React.createElement("div", { className: "wb-trend-headline" },
       /* @__PURE__ */ React.createElement("div", { className: "wb-trend-headline-primary" },
-        /* @__PURE__ */ React.createElement("span", null, "Latest BU ", /* @__PURE__ */ React.createElement("b", { style: { color: BU_COLOR } }, fmtC(latest.bu))),
-        /* @__PURE__ */ React.createElement("span", null, "Adjusted ", /* @__PURE__ */ React.createElement("b", { style: { color: ADJ_COLOR } }, fmtC(latest.adj))),
-        /* @__PURE__ */ React.createElement("span", null, "gap ", /* @__PURE__ */ React.createElement("b", { style: { color: gapColor } }, signed(latest.gap)))),
-      latest.d != null && /* @__PURE__ */ React.createElement("div", { className: "wb-trend-headline-wow", style: { color: buDeltaColor(latest.d) } }, "BU WoW ", signed(latest.d), " (", pctS(latest.dp), ")"),
+        /* @__PURE__ */ React.createElement("span", null, "Remaining BU ", /* @__PURE__ */ React.createElement("b", { style: { color: BU_COLOR } }, fmtC(latest.bu))),
+        /* @__PURE__ */ React.createElement("span", null, "Closed / consumed ", /* @__PURE__ */ React.createElement("b", { style: { color: CC_COLOR } }, fmtC(latest.cc))),
+        /* @__PURE__ */ React.createElement("span", null, "CS call ", /* @__PURE__ */ React.createElement("b", { style: { color: CS_COLOR } }, fmtC(latest.cs)))),
       /* @__PURE__ */ React.createElement("div", { className: "wb-trend-headline-sub" }, regionLabel, " \u00b7 ", first.date, " \u2192 ", latest.date));
-    // ---- companion data table (Week \u00b7 BU FC \u00b7 Adjusted FC \u00b7 gap) ----
     const tableEl = /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto mt-3" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
-      /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Week (date)", "BU FC", "Adjusted FC", "\u0394 (Adj\u2212BU)"].map((hh, i) => th(hh, i > 0 ? "text-right" : "")))),
+      /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Week (date)", "Remaining BU FC", "Closed / budget consumed", "CS call (adjustment)"].map((hh, i) => th(hh, i > 0 ? "text-right" : "")))),
       /* @__PURE__ */ React.createElement("tbody", null, trendRows.map((r, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" },
         cell(r.date, "tabular-nums"),
-        cell(fmtC(r.bu), "text-right tabular-nums"),
-        cell(fmtC(r.adj), "text-right tabular-nums"),
-        /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: r.gap === 0 ? "#9ca3af" : buDeltaColor(r.gap) } }, r.gap === 0 ? "\u2014" : signed(r.gap)))))));
+        /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: BU_COLOR } }, fmtC(r.bu)),
+        /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: CC_COLOR } }, fmtC(r.cc)),
+        /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: CS_COLOR } }, fmtC(r.cs)))))));
     trendCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface p-3" },
       /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-1" },
-        /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold" }, "BU vs adjusted (ELT) forecast over time"),
-        /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500" }, "Higher = more forecasted churn/contraction \u00b7 gap = Adj \u2212 BU")),
+        /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, "Remaining BU, closed C/C, and CS call over time"),
+        /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500" }, "Same 100K+ / Filters / quarter as the rest of the brief")),
       legend, headline, svg, tableEl);
   }
   // ---- "What happened" cell: two clearly-labeled source blocks -----------
@@ -9429,41 +9774,86 @@ function WeeklyBriefTab() {
   const worsenedCount = worsenedShown.length === worsenedTotal ? "(" + worsenedTotal + ")" : "(showing " + worsenedShown.length + " of " + worsenedTotal + ")";
   const worsenedCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
     /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b flex items-center justify-between gap-2 flex-wrap" },
-      /* @__PURE__ */ React.createElement("span", { className: "text-xs font-semibold" }, "2 \u00b7 Accounts that worsened WoW ", worsenedCount),
+      /* @__PURE__ */ React.createElement("span", { className: "text-sm font-semibold" }, "Accounts that worsened WoW ", worsenedCount),
       /* @__PURE__ */ React.createElement("label", { className: "flex items-center gap-1 text-[10px] text-gray-500 font-normal" }, "Min adverse swing $",
         /* @__PURE__ */ React.createElement("input", { className: "filter-input text-xs w-24", type: "number", step: "5000", min: "0", value: minSwing, onChange: (e) => setMinSwing(Number(e.target.value) || 0) }))),
     /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
       /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", "Prior BU FC", "Current BU FC", "Adverse swing", "What happened"].map((h, i) => th(h, i >= 2 && i <= 4 ? "text-right" : "")))),
-      /* @__PURE__ */ React.createElement("tbody", null, worsenedShown.length ? worsenedShown.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), cell(fmtC(d.prior_bu_fc), "text-right tabular-nums"), cell(fmtC(d.current_bu_fc), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#ef4444" } }, signed(d.swing)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: explainTitle(d) }, explainCell(d)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 6 }, minSwing > 0 && worsened.length ? "No accounts with adverse swing \u2265 " + fmtMoney(minSwing) + " in this scope." : "No worsened accounts in this scope."))))));
+      /* @__PURE__ */ React.createElement("tbody", null, worsenedShown.length ? worsenedShown.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), cell(fmtC(d.prior_bu_fc), "text-right tabular-nums"), cell(fmtC(d.current_bu_fc), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#ef4444" } }, signed(d.swing)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: explainTitle(d) }, explainCell(d)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 6 }, listsPending ? "Loading account lists\u2026" : minSwing > 0 && worsened.length ? "No accounts with adverse swing \u2265 " + fmtMoney(minSwing) + " in this scope." : "No worsened accounts in this scope."))))));
   // ---- Section 3: new $0->FC (with a client-side min-new-FC noise filter) --
   const newFcShown = newFc.filter((d) => (d.current_bu_fc || 0) >= (minNewFc || 0));
   const newFcTotal = sec.new_forecast_total != null ? sec.new_forecast_total : newFc.length;
   const newFcCount = newFcShown.length === newFcTotal ? "(" + newFcTotal + ")" : "(showing " + newFcShown.length + " of " + newFcTotal + ")";
   const newFcCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
     /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b flex items-center justify-between gap-2 flex-wrap" },
-      /* @__PURE__ */ React.createElement("span", { className: "text-xs font-semibold" }, "3 \u00b7 New in-quarter forecast \u2014 $0 \u2192 FC ", newFcCount),
+      /* @__PURE__ */ React.createElement("span", { className: "text-sm font-semibold" }, "New in-quarter forecast \u2014 $0 \u2192 FC ", newFcCount),
       /* @__PURE__ */ React.createElement("label", { className: "flex items-center gap-1 text-[10px] text-gray-500 font-normal" }, "Min new FC $",
         /* @__PURE__ */ React.createElement("input", { className: "filter-input text-xs w-24", type: "number", step: "5000", min: "0", value: minNewFc, onChange: (e) => setMinNewFc(Number(e.target.value) || 0) }))),
     /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
       /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", "New BU FC", "What happened"].map((h, i) => th(h, i === 2 ? "text-right" : "")))),
-      /* @__PURE__ */ React.createElement("tbody", null, newFcShown.length ? newFcShown.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#d97706" } }, fmtC(d.current_bu_fc)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: explainTitle(d) }, explainCell(d)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 4 }, minNewFc > 0 && newFc.length ? "No new forecasts \u2265 " + fmtMoney(minNewFc) + " in this scope." : "No new in-quarter forecasts in this scope."))))));
+      /* @__PURE__ */ React.createElement("tbody", null, newFcShown.length ? newFcShown.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color: "#d97706" } }, fmtC(d.current_bu_fc)), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-[10px] text-gray-500 max-w-[320px]", title: explainTitle(d) }, explainCell(d)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 4 }, listsPending ? "Loading account lists\u2026" : minNewFc > 0 && newFc.length ? "No new forecasts \u2265 " + fmtMoney(minNewFc) + " in this scope." : "No new in-quarter forecasts in this scope."))))));
   // ---- Best/Worst Case movement ------------------------------------------
   // C/C convention: an INCREASE in forecasted churn/contraction = worse = red;
   // a decrease = better = green (same as BU/worsened coloring).
-  const driverTable = (rows, color, emptyTxt, deltaLabel) => /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", deltaLabel || "\u0394"].map((h, i) => th(h, i === 2 ? "text-right" : "")))), /* @__PURE__ */ React.createElement("tbody", null, rows.length ? rows.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color } }, signed(d.delta)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 3 }, emptyTxt))));
-  const caseCard = (num, title, sectionData, deltaLabel) => {
-    const inc = sectionData.top_increase || [];
-    const dec = sectionData.top_decrease || [];
-    return /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
-      /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold flex items-center justify-between" }, /* @__PURE__ */ React.createElement("span", null, num + " \u00b7 " + title), /* @__PURE__ */ React.createElement("span", { className: "text-[10px] font-normal text-gray-500" }, "Total ", fmtC(sectionData.current_total), " \u00b7 ", /* @__PURE__ */ React.createElement("span", { style: { color: buDeltaColor(sectionData.delta || 0) } }, signed(sectionData.delta || 0), " WoW"))),
-      /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-3 p-3" },
-        /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-red-500 mb-1" }, "Top 5 driving increase (more C/C)"), driverTable(inc, "#ef4444", "None.", deltaLabel)),
-        /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-emerald-600 mb-1" }, "Top 5 driving decrease (less C/C)"), driverTable(dec, "#22c55e", "None.", deltaLabel))));
+  const driverTable = (rows, color, emptyTxt, deltaLabel) => /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", deltaLabel || "Change"].map((h, i) => th(h, i === 2 ? "text-right" : "")))), /* @__PURE__ */ React.createElement("tbody", null, rows.length ? rows.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 text-right tabular-nums font-semibold", style: { color } }, signed(d.delta)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 3 }, emptyTxt))));
+  const rangeCell = (label, hint, value, delta, accent) => /* @__PURE__ */ React.createElement("div", { className: "rounded-lg px-3 py-2", style: { background: "rgba(148,163,184,0.08)" } },
+    /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold uppercase tracking-wider", style: { color: accent } }, label),
+    /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500 mt-0.5" }, hint),
+    /* @__PURE__ */ React.createElement("div", { className: "text-lg font-bold tabular-nums mt-1" }, fmtC(value)),
+    /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold", style: { color: buDeltaColor(delta || 0) } }, signed(delta || 0), " WoW"));
+  const casesRow = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
+    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2.5 border-b" },
+      /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, "Best to worst remaining C/C"),
+      /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500 mt-0.5" }, "Remaining only \u2014 does not include booked C/C. Best = remaining BU + UPSIDE (least churn). Worst = remaining BU + DOWNSIDE (most churn). Same definitions as Pacing leftover Best / BU / Worst.")),
+    /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 sm:grid-cols-3 gap-2 p-3" },
+      rangeCell("Best Case", "If upside holds", bestCase.current_total, bestCase.delta, "#8b5cf6"),
+      rangeCell("Remaining BU", "Current bottoms-up", rollup.current, rollup.delta, "#0ea5e9"),
+      rangeCell("Worst Case", "If downside hits", worstCase.current_total, worstCase.delta, "#64748b")),
+    /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 lg:grid-cols-2 gap-3 px-3 pb-3" },
+      /* @__PURE__ */ React.createElement("div", null,
+        /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold mb-1" }, "What moved Best Case this week"),
+        /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-3" },
+          /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-red-500 mb-1" }, "Worse (more C/C)"), driverTable(bestCase.top_increase || [], "#ef4444", "None.", "Change")),
+          /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-emerald-600 mb-1" }, "Better (less C/C)"), driverTable(bestCase.top_decrease || [], "#22c55e", "None.", "Change")))),
+      /* @__PURE__ */ React.createElement("div", null,
+        /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold mb-1" }, "What moved Worst Case this week"),
+        /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-3" },
+          /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-red-500 mb-1" }, "Worse (more C/C)"), driverTable(worstCase.top_increase || [], "#ef4444", "None.", "Change")),
+          /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold text-emerald-600 mb-1" }, "Better (less C/C)"), driverTable(worstCase.top_decrease || [], "#22c55e", "None.", "Change"))))));
+  const closedSec = sec.closed_since_prior || { rows: [], total: 0 };
+  const closedRows = closedSec.rows || [];
+  const transferLabel = (t) => t === "cleared" ? "BU \u2192 $0" : t === "residual_below_booked" ? "Residual BU < booked" : t === "residual_at_or_above_booked" ? "Residual BU \u2265 booked" : t === "left_scope" ? "Left this set" : "\u2014";
+  const transferColor = (t) => t === "cleared" ? "#0d9488" : t === "left_scope" ? "#64748b" : "#d97706";
+  const closedCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
+    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b" },
+      /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, "Closed since prior snapshot", closedSec.total ? " (" + closedSec.total + ")" : ""),
+      /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500 mt-0.5" }, "Open last snapshot, closed now (DONE_DEAL or LTG = 0). ATR renewed = starting ATR \u2212 booked C/C. ", closedSec.total ? fmtC(closedSec.booked_cc) + " booked C/C \u00b7 " + fmtC(closedSec.prior_bu_fc) + " prior BU released \u00b7 " + (closedSec.cleared_count || 0) + " cleared to $0" + (closedSec.residual_count ? " \u00b7 " + closedSec.residual_count + " still have residual BU" : "") + (closedSec.left_scope_count ? " \u00b7 " + closedSec.left_scope_count + " left this set" : "") : "None in this compare.")),
+    /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
+      /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", "Prior BU", "Current BU", "Booked C/C", "ATR", "ATR renewed", "Transfer"].map((h, i) => th(h, i >= 2 && i <= 6 ? "text-right" : "")))),
+      /* @__PURE__ */ React.createElement("tbody", null, closedRows.length ? closedRows.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), cell(fmtC(d.prior_bu_fc), "text-right tabular-nums"), cell(fmtC(d.current_bu_fc), "text-right tabular-nums"), cell(fmtC(d.booked_cc), "text-right tabular-nums"), cell(fmtC(d.atr), "text-right tabular-nums"), cell(fmtC(d.atr_renewed), "text-right tabular-nums"), /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1 font-medium", style: { color: transferColor(d.transfer) } }, transferLabel(d.transfer)))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 8 }, listsPending ? "Loading account lists\u2026" : "No newly closed accounts between these snapshots."))))));
+  const dueSec = sec.due_soon || { rows: [], total: 0 };
+  const dueRows = dueSec.rows || [];
+  const fmtMDY = (iso) => {
+    const s = String(iso || "").slice(0, 10);
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    return m ? m[2] + "-" + m[3] + "-" + m[1] : (iso || "\u2014");
   };
-  const bestCaseCard = caseCard("4", "Best Case movement", bestCase, "\u0394 Best Case");
-  const worstCaseCard = caseCard("5", "Worst Case movement", worstCase, "\u0394 Worst Case");
-  const casesRow = /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 lg:grid-cols-2 gap-3" }, bestCaseCard, worstCaseCard);
-  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, briefHeader, brief.warning && /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300" }, brief.warning), kpiRow, buRegionCard, trendCard, worsenedCard, newFcCard, casesRow);
+  const dueFrom = fmtMDY(dueSec.from);
+  const dueTitle = dueSec.from
+    ? "Coming due \u2014 next 7 days from " + dueFrom
+    : "Coming due \u2014 next 7 days";
+  const dueSub = dueSec.from
+    ? "Open renewals with a date from " + dueFrom + " through " + fmtMDY(dueSec.to) + " (7 calendar days from the current snapshot). Showing the first 20 by date."
+    : "Open renewals due in the 7 calendar days after the current snapshot.";
+  const dueCountLabel = dueSec.total > dueRows.length ? " (showing " + dueRows.length + " of " + dueSec.total + ")" : (dueSec.total ? " (" + dueSec.total + ")" : "");
+  const dueCard = /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
+    /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2.5 border-b" },
+      /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, dueTitle, dueCountLabel),
+      /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500 mt-0.5" }, dueSub, dueSec.total ? " \u00b7 " + fmtC(dueSec.atr) + " ATR \u00b7 " + fmtC(dueSec.bu_fc) + " remaining BU" : "")),
+    /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
+      /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" }, ["Account", "Region", "Renewal date", "Days", "ATR", "Remaining BU", "Booked C/C"].map((h, i) => th(h, i >= 3 ? "text-right" : "")))),
+      /* @__PURE__ */ React.createElement("tbody", null, dueRows.length ? dueRows.map((d, i) => /* @__PURE__ */ React.createElement("tr", { key: i, className: "glass-row-accent" }, cell(d.account_name, "font-medium"), cell(d.region), cell(fmtMDY(d.next_renewal)), cell(d.days_until, "text-right tabular-nums"), cell(fmtC(d.atr), "text-right tabular-nums"), cell(fmtC(d.bu_fc), "text-right tabular-nums"), cell(fmtC(d.booked_cc), "text-right tabular-nums"))) : /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { className: "px-2 py-3 text-gray-500", colSpan: 7 }, listsPending ? "Loading account lists\u2026" : "No open renewals due in this 7-day window."))))));
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, briefHeader, brief.warning && /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300" }, brief.warning), listsErr && /* @__PURE__ */ React.createElement("div", { className: "rounded-lg bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200/80 dark:ring-amber-800/40 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300 flex items-center justify-between gap-2 flex-wrap" }, /* @__PURE__ */ React.createElement("span", null, listsErr), /* @__PURE__ */ React.createElement("button", { className: "smallbtn smallbtn-indigo", type: "button", onClick: retry }, "Retry lists")), kpiRow, buRegionCard, trendCard, worsenedCard, newFcCard, closedCard, dueCard, casesRow);
 }
 function PacingTab() {
   const { state, actions } = useApp();
@@ -9477,7 +9867,7 @@ function PacingTab() {
     bestExpected: "Booked C/C + remaining Best Case (BU FC + UPSIDE). Missing UPSIDE counts as 0.",
     worstExpected: "Booked C/C + remaining Worst Case (BU FC + DOWNSIDE). Missing DOWNSIDE counts as 0.",
     projectedLanding: "Three landings, same booked C/C. Best Case = BU + UPSIDE, BU FC = BU, Worst Case = BU + DOWNSIDE. Blank UPSIDE/DOWNSIDE count as 0.",
-    fullTarget: "Maximum C/C loss budget for the quarter (not a quota to hit).",
+    fullTarget: "Maximum C/C target for the quarter (not a quota to hit).",
     vsCap: "BU FC landing \u2212 full-quarter target. Same as leftover BU \u2212 leftover budget. Status stays on BU.",
     vsCapBest: "Best Case landing \u2212 full-quarter target. Same as leftover Best \u2212 leftover budget.",
     vsCapWorst: "Worst Case landing \u2212 full-quarter target. Same as leftover Worst \u2212 leftover budget.",
@@ -9493,8 +9883,9 @@ function PacingTab() {
     projected: "Expected C/C \u00f7 loss budget. If pending BU holds, where you land vs the cap.",
     leftover: "Leftover budget = cap \u2212 booked. Leftover BU = pending forecast. Difference = vs cap.",
     remaining: "Open-book Bottoms-Up C/C forecast. Not ELT calls.",
-    target: "Your region C/C $ loss budget. Saves with planning data.",
-    status: "Landing is the constraint when leftover BU exceeds leftover budget. Realized pace is a back-load diagnostic, not a pass."
+    target: "Your region C/C $ target. Saves with planning data.",
+    status: "Landing is the constraint when leftover BU exceeds leftover budget. Realized pace is a back-load diagnostic, not a pass.",
+    landingCol: "Booked C/C + remaining for this case. Best = BU + UPSIDE, BU FC = BU, Worst = BU + DOWNSIDE (blank = 0)."
   };
   const regionSelectOptions = useMemo(() => PACING_REGIONS.map((r) => ({ label: r, value: r })), []);
   const [selectedRegions, setSelectedRegions] = useState([]);
@@ -9721,15 +10112,17 @@ function PacingTab() {
   const vsCapSub = (gap) => gap == null ? { txt: "Set a target", color: "#64748b" } : gap > 0 ? { txt: "Over cap", color: "#ef4444" } : gap < 0 ? { txt: "Under cap", color: "#16a34a" } : { txt: "At cap", color: "#64748b" };
   const lossBudgetSub = targeted.length ? targeted.length + " of " + rows.length + " regions" : "Set region targets";
   const pendingSub = total.pendingN.toLocaleString() + " pending";
-  const projectedLandingRow = (title, landing, remaining, remainingLabel, gap, projectedPct, expectedTip, vsCapTip, statusSub) => /* @__PURE__ */ React.createElement("div", null,
-    /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold uppercase tracking-wider text-gray-500 mb-1.5 inline-flex items-center gap-1" }, title, infoIcon(title, expectedTip)),
-    /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2" },
-      kpiCard("Expected C/C", fmtC(landing), remainingLabel + " " + fmtC(remaining) + " \u00b7 " + pendingSub, "#0ea5e9", expectedTip),
-      kpiCard("Projected consumption", fmtPct0(projectedPct), total.target == null ? "Set region targets" : "Expected \u00f7 loss budget", projectedColor(projectedPct), TIPS.projected),
-      kpiCard("Loss budget", total.target == null ? "\u2014" : fmtC(total.target), targeted.length ? lossBudgetSub : "Set region targets", "#8b5cf6", TIPS.fullTarget),
-      kpiCard("vs cap", gap == null ? "\u2014" : signed(gap), statusSub, gapColor(gap), vsCapTip)));
-  const cell = (txt, cls) => /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 " + (cls || "") }, txt);
-  const th = (txt, cls, info) => /* @__PURE__ */ React.createElement("th", { className: "px-2 py-1.5 text-left font-semibold uppercase tracking-wider text-[9px] text-gray-500 " + (cls || ""), title: info || undefined }, info ? /* @__PURE__ */ React.createElement("span", { className: "inline-flex items-center gap-0.5" }, txt, infoIcon(txt, info)) : txt);
+  const landingCell = (value, sub, accent) => /* @__PURE__ */ React.createElement("div", { className: "pacing-landing-cell" },
+    /* @__PURE__ */ React.createElement("div", { className: "pacing-landing-value", style: { color: accent || undefined } }, value),
+    sub ? /* @__PURE__ */ React.createElement("div", { className: "pacing-landing-sub", style: { color: typeof sub === "object" ? sub.color : undefined } }, typeof sub === "object" ? sub.txt : sub) : null);
+  const projectedLandingRow = (title, baseline, landing, remaining, remainingLabel, gap, projectedPct, expectedTip, vsCapTip, statusSub) => /* @__PURE__ */ React.createElement("div", { className: "pacing-landing-row" + (baseline ? " is-baseline" : "") },
+    /* @__PURE__ */ React.createElement("div", { className: "pacing-landing-rail" }, title, infoIcon(title, expectedTip)),
+    landingCell(fmtC(landing), remainingLabel + " " + fmtC(remaining) + " \u00b7 " + pendingSub, "#0ea5e9"),
+    landingCell(fmtPct0(projectedPct), total.target == null ? "Set region targets" : "Expected \u00f7 loss budget", projectedColor(projectedPct)),
+    landingCell(total.target == null ? "\u2014" : fmtC(total.target), targeted.length ? lossBudgetSub : "Set region targets", "#8b5cf6"),
+    landingCell(gap == null ? "\u2014" : signed(gap), statusSub, gapColor(gap)));
+  const cell = (txt, cls) => /* @__PURE__ */ React.createElement("td", { className: cls || "" }, txt);
+  const th = (txt, cls, info) => /* @__PURE__ */ React.createElement("th", { className: (cls || ""), title: info || undefined }, /* @__PURE__ */ React.createElement("span", { className: "pacing-th-inner" }, txt, info ? infoIcon(txt, info) : null));
   const otherN = ((pending.Other && pending.Other.n) || 0) + ((booked.Other && booked.Other.n) || 0);
   const missingNote = missingTargets.length ? missingTargets.join(", ") + (missingTargets.length === 1 ? " has" : " have") + " no target \u2014 excluded from budget totals" : null;
   const regionScopeLabel = activeRegions.length === PACING_REGIONS.length ? "All regions" : activeRegions.join(", ");
@@ -9761,65 +10154,74 @@ function PacingTab() {
           kpiCard("Budget consumed", fmtPct0(total.budgetConsumedPct), total.target == null ? "Set region targets" : fmtC(total.bookedCC) + " of " + fmtC(total.target) + " budget", budgetConsumedColor(total.budgetConsumedPct), TIPS.budgetConsumed),
           kpiCard("Closed renewal", fmtPct0(total.bookClosedPct), bookClosedSub, "#0ea5e9", TIPS.bookClosed),
           kpiCard("Quarter complete", fmtPct0(quarterCompletePct), regionScopeLabel, "#64748b", TIPS.quarterComplete),
-          kpiCard("Pacing gap", signedPp(total.pacingGapPp), { txt: totStatus.txt, color: totStatus.color }, paceGapColor(total.pacingGapPp), TIPS.pacingGap))),
-      /* @__PURE__ */ React.createElement("div", { className: "space-y-3" },
-        /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold uppercase tracking-wider text-gray-500 inline-flex items-center gap-1" }, "Projected landing (closed + pending)", infoIcon("Projected landing", TIPS.projectedLanding)),
-        projectedLandingRow("Best Case", total.expectedBest, total.remainingBest, "Remaining Best", total.gapBest, total.projectedBest, TIPS.bestExpected, TIPS.vsCapBest, vsCapSub(total.gapBest)),
-        projectedLandingRow("BU FC", total.expected, total.remaining, "Remaining BU", total.gapFull, total.projectedPct, TIPS.expected, TIPS.vsCap, totStatus),
-        projectedLandingRow("Worst Case", total.expectedWorst, total.remainingWorst, "Remaining Worst", total.gapWorst, total.projectedWorst, TIPS.worstExpected, TIPS.vsCapWorst, vsCapSub(total.gapWorst))),
+          kpiCard("Pacing gap", signedPp(total.pacingGapPp), (function () {
+            const pp = total.pacingGapPp;
+            if (pp == null) return { txt: "vs calendar", color: "#64748b" };
+            if (pp > 5) return { txt: "Ahead of calendar", color: "#ef4444" };
+            if (pp > 0) return { txt: "Slightly ahead of calendar", color: "#d97706" };
+            if (pp < -5) return { txt: "Behind calendar", color: "#16a34a" };
+            if (pp < 0) return { txt: "Slightly behind calendar", color: "#16a34a" };
+            return { txt: "On calendar", color: "#64748b" };
+          })(), paceGapColor(total.pacingGapPp), TIPS.pacingGap))),
+      /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
+        /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-[10px] font-semibold uppercase tracking-wider text-gray-500 inline-flex items-center gap-1" }, "Projected landing (closed + pending)", infoIcon("Projected landing", TIPS.projectedLanding)),
+        /* @__PURE__ */ React.createElement("div", { className: "pacing-landing-body" },
+          /* @__PURE__ */ React.createElement("div", { className: "pacing-landing-cols" },
+            /* @__PURE__ */ React.createElement("div", { className: "pacing-landing-rail-spacer" }),
+            /* @__PURE__ */ React.createElement("div", { className: "pacing-landing-colh" }, "Expected C/C", infoIcon("Expected C/C", TIPS.landingCol)),
+            /* @__PURE__ */ React.createElement("div", { className: "pacing-landing-colh" }, "Projected %", infoIcon("Projected consumption", TIPS.projected)),
+            /* @__PURE__ */ React.createElement("div", { className: "pacing-landing-colh" }, "Target C/C", infoIcon("Target C/C", TIPS.fullTarget)),
+            /* @__PURE__ */ React.createElement("div", { className: "pacing-landing-colh" }, "vs cap", infoIcon("vs cap", TIPS.vsCap))),
+          projectedLandingRow("Best Case", false, total.expectedBest, total.remainingBest, "Remaining Best", total.gapBest, total.projectedBest, TIPS.bestExpected, TIPS.vsCapBest, vsCapSub(total.gapBest)),
+          projectedLandingRow("BU FC", true, total.expected, total.remaining, "Remaining BU", total.gapFull, total.projectedPct, TIPS.expected, TIPS.vsCap, totStatus),
+          projectedLandingRow("Worst Case", false, total.expectedWorst, total.remainingWorst, "Remaining Worst", total.gapWorst, total.projectedWorst, TIPS.worstExpected, TIPS.vsCapWorst, vsCapSub(total.gapWorst)))),
       leftoverStory ? /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500 inline-flex items-center gap-1" }, infoIcon("Leftover budget vs leftover BU", TIPS.leftover), leftoverStory) : null),
     (missingNote || otherN > 0) && /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-gray-500 space-y-0.5" },
       missingNote ? /* @__PURE__ */ React.createElement("div", null, missingNote) : null,
       otherN > 0 ? /* @__PURE__ */ React.createElement("div", null, "Other region: ", otherN, " accounts not in AMER / EMEA / APAC / LATAM \u2014 excluded from totals.") : null),
     /* @__PURE__ */ React.createElement("div", { className: "glass-card-surface overflow-hidden" },
       /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b text-xs font-semibold inline-flex items-center gap-1 flex-wrap" }, "By region \u00b7 ", quarter, " \u00b7 ", bandLabel, " \u00b7 ", regionScopeLabel, infoIcon("Scope", TIPS.scope)),
-      /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "min-w-full text-[11px]" },
+      /* @__PURE__ */ React.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ React.createElement("table", { className: "pacing-table min-w-full text-[11px]" },
         /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { className: "glass-thead" },
           th("Region"),
-          th("Loss budget $", "text-right", TIPS.target),
+          th("Target C/C", "text-right", TIPS.target),
           th("Booked C/C", "text-right", TIPS.booked),
           th("Consumed", "text-right", TIPS.budgetConsumed),
-          th("Closed renewal", "text-right", TIPS.bookClosed),
-          th("Qtr complete", "text-right", TIPS.quarterComplete),
-          th("Pacing gap", "text-right", TIPS.pacingGap),
+          th("Closed", "text-right", TIPS.bookClosed),
+          th("Gap", "text-right", TIPS.pacingGap),
           th("Status", "", TIPS.status),
-          th("Best Case", "text-right", TIPS.bestExpected),
+          th("Best", "text-right pacing-range-start", TIPS.bestExpected),
           th("BU FC", "text-right", TIPS.expected),
-          th("Worst Case", "text-right", TIPS.worstExpected),
-          th("vs cap", "text-right", TIPS.vsCap),
-          th("Remaining BU", "text-right", TIPS.remaining))),
+          th("Worst", "text-right", TIPS.worstExpected),
+          th("vs cap", "text-right", TIPS.vsCap))),
         /* @__PURE__ */ React.createElement("tbody", null,
           rows.map((r) => {
             const st = landingStatus(r);
             return /* @__PURE__ */ React.createElement("tr", { key: r.region, className: "glass-row-accent" },
               cell(r.region, "font-medium"),
-              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right" }, /* @__PURE__ */ React.createElement("input", { className: "filter-input text-xs w-28 text-right tabular-nums", type: "number", step: "1000", min: "0", placeholder: "\u2014", value: r.target == null ? "" : r.target, onChange: (e) => setTarget(r.region, e.target.value) })),
+              /* @__PURE__ */ React.createElement("td", { className: "text-right" }, /* @__PURE__ */ React.createElement("input", { className: "filter-input pacing-target-input text-right tabular-nums", type: "number", step: "1000", min: "0", placeholder: "\u2014", value: r.target == null ? "" : r.target, disabled: !canUpdateData(), onChange: (e) => setTarget(r.region, e.target.value) })),
               cell(fmtC(r.bookedCC), "text-right tabular-nums"),
-              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums font-semibold", style: { color: budgetConsumedColor(r.budgetConsumedPct) } }, fmtPct0(r.budgetConsumedPct)),
-              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: "#0ea5e9" } }, fmtPct0(r.bookClosedPct)),
-              cell(fmtPct0(quarterCompletePct), "text-right tabular-nums text-gray-500"),
-              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: paceGapColor(r.pacingGapPp) } }, signedPp(r.pacingGapPp)),
-              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5", style: { color: st.color } }, st.txt),
-              cell(fmtC(r.expectedBest), "text-right tabular-nums"),
+              /* @__PURE__ */ React.createElement("td", { className: "text-right tabular-nums font-semibold", style: { color: budgetConsumedColor(r.budgetConsumedPct) } }, fmtPct0(r.budgetConsumedPct)),
+              /* @__PURE__ */ React.createElement("td", { className: "text-right tabular-nums", style: { color: "#0ea5e9" } }, fmtPct0(r.bookClosedPct)),
+              /* @__PURE__ */ React.createElement("td", { className: "text-right tabular-nums", style: { color: paceGapColor(r.pacingGapPp) } }, signedPp(r.pacingGapPp)),
+              /* @__PURE__ */ React.createElement("td", { className: "pacing-status", style: { color: st.color } }, st.txt),
+              cell(fmtC(r.expectedBest), "text-right tabular-nums pacing-range-start"),
               cell(fmtC(r.expected), "text-right tabular-nums"),
               cell(fmtC(r.expectedWorst), "text-right tabular-nums"),
-              /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: gapColor(r.gapFull) } }, r.gapFull == null ? "\u2014" : signed(r.gapFull)),
-              cell(fmtC(r.remaining), "text-right tabular-nums"));
+              /* @__PURE__ */ React.createElement("td", { className: "text-right tabular-nums", style: { color: gapColor(r.gapFull) } }, r.gapFull == null ? "\u2014" : signed(r.gapFull)));
           }),
           rows.length > 1 && /* @__PURE__ */ React.createElement("tr", { className: "font-bold border-t-2", style: { borderColor: "var(--border)" } },
             cell("Total"),
             cell(total.target == null ? "\u2014" : fmtC(total.target), "text-right tabular-nums"),
             cell(fmtC(total.bookedCC), "text-right tabular-nums"),
-            /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: budgetConsumedColor(total.budgetConsumedPct) } }, fmtPct0(total.budgetConsumedPct)),
-            /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: "#0ea5e9" } }, fmtPct0(total.bookClosedPct)),
-            cell(fmtPct0(quarterCompletePct), "text-right tabular-nums text-gray-500"),
-            /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: paceGapColor(total.pacingGapPp) } }, signedPp(total.pacingGapPp)),
-            /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5", style: { color: totStatus.color } }, totStatus.txt),
-            cell(fmtC(total.expectedBest), "text-right tabular-nums"),
+            /* @__PURE__ */ React.createElement("td", { className: "text-right tabular-nums", style: { color: budgetConsumedColor(total.budgetConsumedPct) } }, fmtPct0(total.budgetConsumedPct)),
+            /* @__PURE__ */ React.createElement("td", { className: "text-right tabular-nums", style: { color: "#0ea5e9" } }, fmtPct0(total.bookClosedPct)),
+            /* @__PURE__ */ React.createElement("td", { className: "text-right tabular-nums", style: { color: paceGapColor(total.pacingGapPp) } }, signedPp(total.pacingGapPp)),
+            /* @__PURE__ */ React.createElement("td", { className: "pacing-status", style: { color: totStatus.color } }, totStatus.txt),
+            cell(fmtC(total.expectedBest), "text-right tabular-nums pacing-range-start"),
             cell(fmtC(total.expected), "text-right tabular-nums"),
             cell(fmtC(total.expectedWorst), "text-right tabular-nums"),
-            /* @__PURE__ */ React.createElement("td", { className: "px-2 py-1.5 text-right tabular-nums", style: { color: gapColor(total.gapFull) } }, total.gapFull == null ? "\u2014" : signed(total.gapFull)),
-            cell(fmtC(total.remaining), "text-right tabular-nums")))))),
+            /* @__PURE__ */ React.createElement("td", { className: "text-right tabular-nums", style: { color: gapColor(total.gapFull) } }, total.gapFull == null ? "\u2014" : signed(total.gapFull))))))),
     /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-gray-500" }, "Three clocks: budget consumed (C/C $), closed renewal (ATR), quarter complete (calendar). Landing = booked + remaining. Best Case = BU + UPSIDE, Worst Case = BU + DOWNSIDE (blank = 0). Favorable only when leftover BU is also under leftover budget. Zendesk FY ends 31 Jan."),
     floatTip ? ReactDOM.createPortal(/* @__PURE__ */ React.createElement("div", { className: "pacing-float-tip", style: { left: floatTip.left, top: floatTip.top, transform: floatTip.placeUp ? "translateY(-100%)" : undefined } }, floatTip.text), document.body) : null
   );

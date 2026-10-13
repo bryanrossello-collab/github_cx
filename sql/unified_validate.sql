@@ -116,7 +116,8 @@ GSdata AS (
         REGION_GC,
         DAYS_SINCE_LAST_CS_ENGAGED_GC,
         LAST_CS_ENGAGEMENT_DATE_GC,
-        PARTNER_MANAGED_ACCOUNT_GC AS partner_managed
+        PARTNER_MANAGED_ACCOUNT_GC AS partner_managed,
+        LAST_CSM_RENEWAL_NOTES_GC
     FROM cleansed.gainsight.GAINSIGHT_COMPANY_BCV
 ),
 
@@ -229,6 +230,8 @@ main_data AS (
             ELSE (CASE WHEN c6.net_arr_usd >= pm.band_cutoff THEN '100k+' ELSE '<100k' END)
         END AS band,
         gs.DAYS_SINCE_LAST_CS_ENGAGED_GC AS days_since_last_CS_touch,
+        -- Account-level Gainsight text: ANY_VALUE so GROUP BY ALL does not hash the CLOB.
+        ANY_VALUE(gs.LAST_CSM_RENEWAL_NOTES_GC) AS last_csm_renewal_notes,
         CASE WHEN s.quarter_diff = 0 THEN c6.RENEWAL_DONE_DEAL_C ELSE NULL END AS done_deal,
         CASE
             WHEN s.quarter_diff <= 0 THEN c6.FC_DICTATED_BY
@@ -389,6 +392,7 @@ SELECT
     BILLING_COUNTRY,
     cc_reason,
     days_since_last_CS_touch,
+    last_csm_renewal_notes,
     product_lines,
     forecast_summary,
     partner,

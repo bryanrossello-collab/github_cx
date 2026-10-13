@@ -18,6 +18,7 @@ Mirrors the Signal CX `Database` class pattern:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -27,6 +28,17 @@ from typing import Optional
 import asyncpg
 
 logger = logging.getLogger(__name__)
+
+# Weekly Brief / Pacing 100K+ Official matcher on the BAND column (mirrors the
+# client's matchesBand("100k_official")). The partial index built by
+# migrate_weekly_brief_official_index only serves queries that repeat this
+# predicate verbatim, so weekly_brief.py formats its filter from here too.
+OFFICIAL_BAND_PREDICATE = (
+    "(UPPER(REGEXP_REPLACE(COALESCE({col}, ''), '[ $,]', '', 'g')) LIKE '%100K+%' "
+    "OR UPPER(REGEXP_REPLACE(COALESCE({col}, ''), '[ $,]', '', 'g')) LIKE '%>100K%' "
+    "OR UPPER(REGEXP_REPLACE(COALESCE({col}, ''), '[ $,]', '', 'g')) "
+    "LIKE '%100KANDABOVE%')"
+)
 
 
 SCHEMA_SQL = """
@@ -180,6 +192,10 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_upload
     ON account_snapshots (csv_upload_id);
 CREATE INDEX IF NOT EXISTS idx_snapshots_quarter
     ON account_snapshots (year_quarter);
+CREATE INDEX IF NOT EXISTS idx_snapshots_upload_eff
+    ON account_snapshots (csv_upload_id, effective_date DESC);
+CREATE INDEX IF NOT EXISTS idx_snapshots_upload_quarter_atr
+    ON account_snapshots (csv_upload_id, year_quarter, atr);
 
 -- ---------------------------------------------------------------------------
 -- Per-account ELT Forecast decomposition (CS + Renewals).
@@ -249,15 +265,53 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
 
--- Forward-compatible columns for databases bootstrapped before v3.3.
-ALTER TABLE notes ADD COLUMN IF NOT EXISTS owner_email TEXT;
-ALTER TABLE notes ADD COLUMN IF NOT EXISTS last_edited_by TEXT;
-ALTER TABLE notes ADD COLUMN IF NOT EXISTS last_edited_display TEXT;
-ALTER TABLE account_forecasts ADD COLUMN IF NOT EXISTS account_id TEXT;
-ALTER TABLE account_forecasts ADD COLUMN IF NOT EXISTS cs_updated_at TIMESTAMPTZ;
-ALTER TABLE account_forecasts ADD COLUMN IF NOT EXISTS cs_updated_by TEXT;
-ALTER TABLE account_forecasts ADD COLUMN IF NOT EXISTS rn_updated_at TIMESTAMPTZ;
-ALTER TABLE account_forecasts ADD COLUMN IF NOT EXISTS rn_updated_by TEXT;
+-- Forward-compatible columns for tables created before the column existed
+-- (CREATE TABLE IF NOT EXISTS never adds them). The Weekly Brief cache columns
+-- must stay here, committed on every boot, so a failed 005 backfill cannot
+-- roll them away and 500 the brief.
+--
+-- Only missing columns get an ALTER: ALTER TABLE takes ACCESS EXCLUSIVE even
+-- with IF NOT EXISTS, so running all of them on every boot deadlocked
+-- instances that started together and queued every reader of a busy table
+-- (account_snapshots during a long brief query or index build) behind it.
+DO $$
+DECLARE
+    c RECORD;
+BEGIN
+    FOR c IN
+        SELECT * FROM (VALUES
+            ('notes', 'owner_email', 'TEXT'),
+            ('notes', 'last_edited_by', 'TEXT'),
+            ('notes', 'last_edited_display', 'TEXT'),
+            ('account_forecasts', 'account_id', 'TEXT'),
+            ('account_forecasts', 'cs_updated_at', 'TIMESTAMPTZ'),
+            ('account_forecasts', 'cs_updated_by', 'TEXT'),
+            ('account_forecasts', 'rn_updated_at', 'TIMESTAMPTZ'),
+            ('account_forecasts', 'rn_updated_by', 'TEXT'),
+            ('csv_uploads', 'snapshot_row_count', 'INTEGER'),
+            ('csv_uploads', 'snapshot_effective_date', 'TIMESTAMPTZ'),
+            ('csv_uploads', 'snapshot_distinct_accounts', 'INTEGER'),
+            ('csv_uploads', 'snapshot_atr_total', 'NUMERIC(18,2)'),
+            ('account_snapshots', 'cc', 'NUMERIC(18,2)'),
+            ('account_snapshots', 'next_renewal', 'DATE'),
+            ('account_snapshots', 'done_deal', 'BOOLEAN'),
+            ('account_snapshots', 'forecast_summary', 'TEXT'),
+            ('account_snapshots', 'days_since_touch', 'INTEGER')
+        ) AS t(tbl, col, typ)
+    LOOP
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = c.tbl::regclass
+              AND attname = c.col
+              AND NOT attisdropped
+        ) THEN
+            EXECUTE format(
+                'ALTER TABLE %I ADD COLUMN IF NOT EXISTS %I %s',
+                c.tbl, c.col, c.typ
+            );
+        END IF;
+    END LOOP;
+END $$;
 """
 
 
@@ -281,12 +335,69 @@ SEED_FILES = [
 # the pool default. Env-overridable via DB_INGEST_TIMEOUT_S.
 INGEST_COMMAND_TIMEOUT_S = int(os.environ.get("DB_INGEST_TIMEOUT_S", "600"))
 
+# Snapshot retention, applied after each successful Snowflake refresh: every
+# upload from the last SNAPSHOT_KEEP_ALL_DAYS, then the newest upload per ISO
+# week (UTC) until SNAPSHOT_KEEP_WEEKLY_WEEKS, then nothing.
+SNAPSHOT_KEEP_ALL_DAYS = 30
+SNAPSHOT_KEEP_WEEKLY_WEEKS = 52
+
 # Advisory-lock namespace for ingest. Concurrent ingests of the SAME upload can
 # race (e.g. the Snowflake Run-now background ingest vs the /parsed-data
 # on-demand ingest the dashboard triggers when rows are still 0). Without a lock
 # both transactions see 0 existing rows and both COPY the full set, doubling
 # account_snapshots. A per-upload transaction lock serializes them.
 _INGEST_LOCK_NS = 0x52454E57  # "RENW"
+
+
+def _utc_iso(ts_sql: str) -> str:
+    """SQL rendering a timestamptz as Python-style UTC ISO text, whatever the
+    session TimeZone is."""
+    return (
+        f"to_char(({ts_sql}) AT TIME ZONE 'UTC', "
+        "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"+00:00\"')"
+    )
+
+
+_LEASE_CLAIM_SQL = f"""
+    INSERT INTO renewals_meta (key, value, updated_at)
+    VALUES ($1,
+            ($2::jsonb || jsonb_build_object(
+                'started_at', {_utc_iso("NOW()")},
+                'expires_at', {_utc_iso("NOW() + make_interval(secs => $3)")}))::text,
+            NOW())
+    ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = NOW()
+        WHERE COALESCE(
+            (renewals_meta.value::jsonb ->> 'expires_at')::timestamptz <= NOW(),
+            TRUE)
+    RETURNING 1
+"""
+
+_LEASE_RELEASE_SQL = f"""
+    UPDATE renewals_meta
+    SET value = (value::jsonb || jsonb_build_object(
+                    'expires_at', {_utc_iso("NOW()")},
+                    'released_at', {_utc_iso("NOW()")}))::text,
+        updated_at = NOW()
+    WHERE key = $1 AND value::jsonb ->> 'job_id' = $2
+"""
+
+
+def _snapshot_record_stats(records) -> tuple[int, float]:
+    """Distinct account_id + ATR sum from ingest tuples (no extra SQL)."""
+    accts: set[str] = set()
+    atr_sum = 0.0
+    for rec in records or []:
+        acct = rec[3] if len(rec) > 3 else None
+        if acct:
+            accts.add(str(acct))
+        atr = rec[7] if len(rec) > 7 else None
+        if atr is not None:
+            try:
+                atr_sum += float(atr)
+            except (TypeError, ValueError):
+                pass
+    return (len(accts), atr_sum)
 
 
 class DatabaseUnavailable(RuntimeError):
@@ -510,6 +621,194 @@ class Database:
                     "004_user_activity",
                 )
         logger.info("Applied user-activity migration 004_user_activity")
+
+    async def migrate_weekly_brief_perf(self) -> None:
+        """Cache snapshot row counts + add Weekly Brief lookup indexes.
+
+        Columns are added in SCHEMA_SQL (separate committed transaction) so
+        this backfill can fail without taking Weekly Brief down. Indexes +
+        the ledger row are applied even if the COUNT(*) backfill times out.
+        """
+        async with self.pool.acquire() as conn:
+            done = await conn.fetchval(
+                "SELECT 1 FROM schema_migrations WHERE version = $1",
+                "005_weekly_brief_perf",
+            )
+            if done:
+                return
+
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_snapshots_upload_eff
+                    ON account_snapshots (csv_upload_id, effective_date DESC);
+                CREATE INDEX IF NOT EXISTS idx_snapshots_upload_quarter_atr
+                    ON account_snapshots (csv_upload_id, year_quarter, atr);
+                """,
+                timeout=120,
+            )
+            await conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES ($1) "
+                "ON CONFLICT (version) DO NOTHING",
+                "005_weekly_brief_perf",
+            )
+
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE csv_uploads u
+                    SET snapshot_row_count = c.n,
+                        snapshot_effective_date = c.eff
+                    FROM (
+                        SELECT csv_upload_id, COUNT(*)::int AS n,
+                               MAX(effective_date) AS eff
+                        FROM account_snapshots
+                        GROUP BY csv_upload_id
+                    ) c
+                    WHERE u.id = c.csv_upload_id
+                      AND (u.snapshot_row_count IS DISTINCT FROM c.n
+                           OR u.snapshot_effective_date IS DISTINCT FROM c.eff)
+                    """,
+                    timeout=600,
+                )
+        except Exception:
+            logger.exception(
+                "005 snapshot-count backfill failed; weekly brief will use live counts"
+            )
+            return
+        logger.info("Applied weekly-brief perf migration 005_weekly_brief_perf")
+
+    async def migrate_weekly_brief_trend(self) -> None:
+        """Index for Weekly Brief as-of calls. Additive; never DROP.
+
+        Applied even if 005 already ran (separate ledger version). Failure
+        must not mark the app unready — the brief still works without it.
+        """
+        async with self.pool.acquire() as conn:
+            done = await conn.fetchval(
+                "SELECT 1 FROM schema_migrations WHERE version = $1",
+                "006_weekly_brief_trend",
+            )
+            if done:
+                return
+
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_call_events_account_atr_eff
+                    ON account_call_events
+                    (account_id, rounded_atr, effective_date DESC);
+                """,
+                timeout=120,
+            )
+            await conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES ($1) "
+                "ON CONFLICT (version) DO NOTHING",
+                "006_weekly_brief_trend",
+            )
+        logger.info("Applied weekly-brief trend migration 006_weekly_brief_trend")
+
+    async def migrate_weekly_brief_scope(self) -> None:
+        """Indexes for Weekly Brief region / date filters. Additive; never DROP.
+
+        Applied even if 006 already ran (separate ledger version). Failure
+        must not mark the app unready — the brief still works without them.
+        """
+        async with self.pool.acquire() as conn:
+            done = await conn.fetchval(
+                "SELECT 1 FROM schema_migrations WHERE version = $1",
+                "007_weekly_brief_scope",
+            )
+            if done:
+                return
+
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_snapshots_upload_region
+                    ON account_snapshots (csv_upload_id, region);
+                CREATE INDEX IF NOT EXISTS idx_snapshots_upload_renewal
+                    ON account_snapshots (csv_upload_id, next_renewal);
+                """,
+                timeout=120,
+            )
+            await conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES ($1) "
+                "ON CONFLICT (version) DO NOTHING",
+                "007_weekly_brief_scope",
+            )
+        logger.info("Applied weekly-brief scope migration 007_weekly_brief_scope")
+
+    async def migrate_snapshot_list_cache(self) -> None:
+        """Cache columns for admin snapshot history. Additive; never DROP."""
+        async with self.pool.acquire() as conn:
+            done = await conn.fetchval(
+                "SELECT 1 FROM schema_migrations WHERE version = $1",
+                "008_snapshot_list_cache",
+            )
+            if done:
+                return
+
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                ALTER TABLE csv_uploads
+                    ADD COLUMN IF NOT EXISTS snapshot_distinct_accounts INTEGER;
+                ALTER TABLE csv_uploads
+                    ADD COLUMN IF NOT EXISTS snapshot_atr_total NUMERIC(18,2);
+                """,
+                timeout=30,
+            )
+            await conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES ($1) "
+                "ON CONFLICT (version) DO NOTHING",
+                "008_snapshot_list_cache",
+            )
+        logger.info("Applied snapshot list cache migration 008_snapshot_list_cache")
+
+    async def migrate_weekly_brief_official_index(self) -> None:
+        """Partial index over 100K+ Official rows for the Weekly Brief.
+
+        Official rows are ~1-2% of a ~279k-row upload, but the band match is
+        a regex no plain index can serve, so without this every brief query
+        reads whole uploads and the trend reads the whole table. Additive;
+        never DROP. One instance builds it; the one-off build blocks ingest
+        writes on account_snapshots, never reads.
+        """
+        version = "009_weekly_brief_official_index"
+        async with self.pool.acquire() as conn:
+            done = await conn.fetchval(
+                "SELECT 1 FROM schema_migrations WHERE version = $1", version,
+            )
+            if done:
+                return
+            # Autocommit, not a transaction: if Cloud Run kills this instance
+            # mid-build, Postgres still finishes and commits the running
+            # statement, and the session lock keeps other instances off until
+            # then. A graceful shutdown cancels the build instead; the next boot
+            # retries. The pool's release reset (RESET ALL +
+            # pg_advisory_unlock_all) clears both the lock and the SET.
+            got_lock = await conn.fetchval(
+                "SELECT pg_try_advisory_lock(hashtext($1))", version,
+            )
+            if not got_lock:
+                logger.info("%s is being built by another instance", version)
+                return
+            await conn.execute("SET statement_timeout = 0")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_snapshots_official_upload_renewal "
+                "ON account_snapshots (csv_upload_id, next_renewal) "
+                "INCLUDE (bu_fc, cc, account_id, atr, year_quarter, effective_date) "
+                "WHERE " + OFFICIAL_BAND_PREDICATE.format(col="band"),
+                timeout=900,
+            )
+            await conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES ($1) "
+                "ON CONFLICT (version) DO NOTHING",
+                version,
+            )
+        logger.info("Applied weekly-brief official-band index %s", version)
 
     async def _backfill_call_events_from_forecasts(self, conn) -> int:
         from app.call_keys import build_call_key
@@ -770,6 +1069,112 @@ class Database:
                 "SELECT value FROM renewals_meta WHERE key = $1", key
             )
 
+    async def try_claim_lease(self, key: str, holder: dict, ttl_s: float) -> bool:
+        """Claim the ``renewals_meta`` lease row ``key`` when it is free or its
+        ``expires_at`` has passed. A single statement, so two instances racing
+        for it cannot both win. Times come from the database clock."""
+        async with self.pool.acquire() as conn:
+            won = await conn.fetchval(
+                _LEASE_CLAIM_SQL, key, json.dumps(holder), float(ttl_s)
+            )
+        return bool(won)
+
+    async def release_lease(self, key: str, job_id: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(_LEASE_RELEASE_SQL, key, job_id)
+
+    async def read_lease(self, key: str) -> Optional[dict]:
+        """The lease holder, with ``active`` = unexpired by the database clock."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT value,
+                       COALESCE((value::jsonb ->> 'expires_at')::timestamptz > NOW(),
+                                FALSE) AS active
+                FROM renewals_meta WHERE key = $1
+                """,
+                key,
+            )
+        if row is None:
+            return None
+        holder = json.loads(row["value"])
+        holder["active"] = bool(row["active"])
+        return holder
+
+    async def latest_upload_state(self, slot: str) -> dict:
+        """When ``slot`` last received data (the newest upload that parsed
+        rows) and that upload's row count."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT uploaded_at, snapshot_row_count
+                FROM csv_uploads
+                WHERE slot = $1 AND COALESCE(snapshot_row_count, 0) > 0
+                ORDER BY uploaded_at DESC, id DESC
+                LIMIT 1
+                """,
+                slot,
+            )
+        if row is None:
+            return {"synced_at": None, "row_count": None}
+        return {"synced_at": row["uploaded_at"], "row_count": int(row["snapshot_row_count"])}
+
+    async def prune_snapshot_history(
+        self,
+        slot: str = "active",
+        *,
+        keep_all_days: int = SNAPSHOT_KEEP_ALL_DAYS,
+        keep_weekly_weeks: int = SNAPSHOT_KEEP_WEEKLY_WEEKS,
+    ) -> list[int]:
+        """Thin ``slot``'s history: keep every upload from the last
+        ``keep_all_days``, then the newest upload per ISO week (UTC) up to
+        ``keep_weekly_weeks``, and delete the rest. A week's survivor is an
+        upload that parsed rows whenever the week has one. The newest upload
+        by effective date and the newest by upload time (the one the dashboard
+        serves) are never deleted.
+
+        Each delete cascades to the upload's ~280k ``account_snapshots`` rows,
+        so uploads go one statement at a time to keep each lock and WAL burst
+        bounded. Returns the deleted ids."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH u AS (
+                    SELECT id, uploaded_at,
+                           COALESCE(snapshot_effective_date, uploaded_at) AS eff,
+                           COALESCE(snapshot_row_count, 0) > 0 AS has_rows
+                    FROM csv_uploads
+                    WHERE slot = $1
+                ), ranked AS (
+                    SELECT id, eff,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY date_trunc('week', eff AT TIME ZONE 'UTC')
+                               ORDER BY has_rows DESC, eff DESC, id DESC
+                           ) AS week_rank,
+                           ROW_NUMBER() OVER (ORDER BY eff DESC, id DESC) AS eff_rank,
+                           ROW_NUMBER() OVER (ORDER BY uploaded_at DESC, id DESC) AS upload_rank
+                    FROM u
+                )
+                SELECT id FROM ranked
+                WHERE eff_rank > 1 AND upload_rank > 1
+                  AND eff < NOW() - make_interval(days => $2)
+                  AND (week_rank > 1 OR eff < NOW() - make_interval(weeks => $3))
+                ORDER BY eff
+                """,
+                slot, int(keep_all_days), int(keep_weekly_weeks),
+            )
+        deleted: list[int] = []
+        for r in rows:
+            async with self.pool.acquire() as conn:
+                status = await conn.execute(
+                    "DELETE FROM csv_uploads WHERE id = $1 AND slot = $2",
+                    r["id"], slot,
+                    timeout=INGEST_COMMAND_TIMEOUT_S,
+                )
+            if status == "DELETE 1":
+                deleted.append(int(r["id"]))
+        return deleted
+
     async def persist_source_csv(
         self,
         *,
@@ -924,6 +1329,23 @@ class Database:
                     timeout=INGEST_COMMAND_TIMEOUT_S,
                 )
                 if existing and int(existing) == len(records):
+                    n_acct, atr_sum = _snapshot_record_stats(records)
+                    await conn.execute(
+                        """
+                        UPDATE csv_uploads
+                        SET snapshot_row_count = COALESCE(snapshot_row_count, $2),
+                            snapshot_effective_date = COALESCE(snapshot_effective_date, $3),
+                            snapshot_distinct_accounts = COALESCE(snapshot_distinct_accounts, $4),
+                            snapshot_atr_total = COALESCE(snapshot_atr_total, $5)
+                        WHERE id = $1
+                        """,
+                        csv_upload_id,
+                        len(records),
+                        effective_date,
+                        n_acct,
+                        atr_sum,
+                        timeout=INGEST_COMMAND_TIMEOUT_S,
+                    )
                     logger.info(
                         "ingest_snapshot: csv_upload_id=%d already materialized "
                         "(%d rows); skipping re-ingest", csv_upload_id, int(existing),
@@ -938,6 +1360,23 @@ class Database:
                     "account_snapshots",
                     records=records,
                     columns=ingest.SNAPSHOT_COLUMNS,
+                    timeout=INGEST_COMMAND_TIMEOUT_S,
+                )
+                n_acct, atr_sum = _snapshot_record_stats(records)
+                await conn.execute(
+                    """
+                    UPDATE csv_uploads
+                    SET snapshot_row_count = $2,
+                        snapshot_effective_date = $3,
+                        snapshot_distinct_accounts = $4,
+                        snapshot_atr_total = $5
+                    WHERE id = $1
+                    """,
+                    csv_upload_id,
+                    len(records),
+                    effective_date,
+                    n_acct,
+                    atr_sum,
                     timeout=INGEST_COMMAND_TIMEOUT_S,
                 )
         logger.info(

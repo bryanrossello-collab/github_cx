@@ -107,7 +107,8 @@ Renewals Studio/
 │       ├── __init__.py
 │       ├── health.py               ← /healthz, /readyz
 │       ├── admin.py                ← /admin/db-status, /admin/csv-uploads
-│       └── renewals.py             ← /api/renewals/*
+│       ├── renewals.py             ← /api/renewals/* (except weekly brief)
+│       └── weekly_brief.py         ← GET /api/renewals/weekly-brief
 ├── migrations/
 │   └── 001_init.sql                ← initial schema
 ├── seeds/
@@ -147,9 +148,27 @@ csv_uploads(
     uploaded_at, uploaded_by, note)
 ```
 
-Every CSV upload creates a new row in `csv_uploads`. The data-source
-endpoints serve the newest matching row per slot. **History is retained
-forever** unless an admin explicitly deletes it via the admin UI.
+Every CSV upload or Snowflake pull creates a new row in `csv_uploads`. The
+data-source endpoints serve the newest matching row per slot.
+
+**Active-slot retention (Session 38).** After every successful Snowflake
+refresh (Run-now or automatic), `Database.prune_snapshot_history` keeps
+every active snapshot from the last 30 days, then the newest snapshot per
+UTC ISO week (Monday start) for 52 weeks, and deletes everything else. The
+deletes cascade to `account_snapshots`. Within a week it prefers snapshots
+that parsed rows. The newest snapshot by effective date and the newest by
+upload time are never deleted. The historical slot is never pruned. Admins
+can still delete uploads by hand. The windows are `SNAPSHOT_KEEP_ALL_DAYS` /
+`SNAPSHOT_KEEP_WEEKLY_WEEKS` in `app/database.py`.
+
+`renewals_meta` keys used by the Snowflake refresh (TEXT holding JSON):
+`snowflake_config` (admin overrides, now including `auto_refresh_hours`),
+`snowflake_last_refresh` (last job result, no email), `snowflake_refresh_lease` (the
+cross-instance lock: `job_id`, `kind`, `by`, `started_at`, `expires_at`,
+`released_at`), and `snowflake_auto_refresh` (last automatic attempt,
+result, error, `cooldown_until`, and the `skip` map of visitor email →
+skip-until). The last two hold emails, so they are only exposed through
+the owner-gated `GET /api/renewals/snowflake-config`.
 
 ---
 
@@ -171,12 +190,26 @@ forever** unless an admin explicitly deletes it via the admin UI.
 | `public/admin.html` | New file. Token-gated CSV upload + history UI. |
 | `Dockerfile` | python:3.12-slim, multi-stage, tini, non-root, healthcheck on `/healthz`. |
 | Validation | 8 structural tests pass (config precedence, SSL mode, banner-doesn't-leak, all routes, SQL schema, notes serialization, rename audit). No live Postgres validation done — that happens on the user's Cloud Run. |
+| Weekly Brief | Session 37: 100K+ Official partial index (migration 009, built once at boot after "Startup complete") takes the summary from ~28s cold in production to well under 1s. Boot no longer runs an unconditional `ALTER TABLE` per column. Current/Prior load from `GET /snapshots` first (Session 34). Session 38: the default Prior is the newest snapshot at least 6 days older than Current (falls back to the previous one), and the trend has one point per week for 12 weeks. A pinned id that retention deleted falls back to the default with a warning. Route lives in `app/routes/weekly_brief.py`. **Server restart required.** |
+| Snowflake auto-refresh | Session 38, stale-while-revalidate. The dashboard calls `POST /api/renewals/refresh/auto` once per page load. When the newest snapshot is older than the cadence (default 48h; editable on `/admin`; 0 = off), it pulls from Snowflake in the background with that visitor's Okta token. One run at a time across instances (lease in `renewals_meta`). An automatic pull under 90% of the current row count is rejected. Failures pause automatic runs (10 min / 30 min / 1h) and skip that visitor for a while. Every successful refresh then thins old active snapshots (§1.3). Cache-buster `v=20261008a`. **Server restart required.** |
 | `renewals-studio.zip` | 2.3 MB. Rebuilt with v3. |
 
 ### 2.2 Outstanding items
 
-None known. If you discover something is broken, add it here before
-asking the user.
+Offline last-week vs latest CSV compare (closed deals / BU→$0 vs residual
+BU vs booked C/C) — waiting on the user to drop those two files.
+
+Session 38 is deployed, but the first prune has not run yet. It runs
+after the next successful refresh: automatically on the first visit
+after 2026-10-10 14:33 UTC, or on an earlier Run-now. On production
+(checked 2026-10-08, 15 active snapshots) it deletes active snapshots
+15, 20, 21, 23 and 25 (Aug 12–31). Each has a newer snapshot in the same
+week. Expect roughly 1.4M `account_snapshots` rows removed in the
+background, one upload per DELETE. Afterwards, confirm with
+`GET /api/renewals/snapshots` and remove this note.
+
+If you discover something else is broken, add it here before asking the
+user.
 
 ### 2.3 Conversation log summary
 
@@ -692,6 +725,359 @@ Session 20 — 2026-08-19 (cache-buster v=20260819h)
 - Open question / TODO: none.
 ```
 
+```
+Session 21 — 2026-08-19 (cache-buster v=20260819i)
+- User asked for: make Best / BU / Worst projected landing less repetitive
+  while keeping 4-across × 3-down (1 grouped surface, shared column
+  headers, left case rail, BU as baseline).
+- Delivered: one glass-card-surface matrix; column labels once; left rail
+  for Best Case / BU FC / Worst Case; BU row indigo fill + rail tick.
+  Values and vs-cap colors unchanged (Best is not painted green).
+  Frontend-only.
+- Verified: node --check clean. Cache-buster h → i.
+- Open question / TODO: none.
+```
+
+```
+Session 22 — 2026-08-19 (cache-buster v=20260819j)
+- User asked for: fix crowded wrapping Pacing table headers; rename
+  Loss budget → Target C/C ($).
+- Delivered: nowrap header row with aligned label+ⓘ, 10px / 0.04em
+  tracking, min-width + overflow-x. Landing matrix column renamed
+  Target C/C to match. Frontend-only.
+- Verified: node --check clean. Cache-buster i → j.
+- Open question / TODO: none.
+```
+
+```
+Session 23 — 2026-08-19 (cache-buster v=20260819k)
+- User asked for: drop the permanent horizontal scrollbar on the Pacing
+  region table and tighten that layout.
+- Delivered: removed 1080px min-width; dropped Qtr complete (same on
+  every row, already a KPI) and Remaining BU (already on landing
+  subtitles; BU FC − booked). Narrower target input, tighter padding,
+  status can wrap, Best/BU/Worst grouped. Overflow-x only if the
+  window is truly narrow. Frontend-only.
+- Verified: node --check clean. Cache-buster j → k.
+- Open question / TODO: none.
+```
+
+```
+Session 24 — 2026-08-21 (cache-buster v=20260821c)
+- User asked for: Weekly Brief sections for (1) deals that closed since
+  the prior snapshot, with booked C/C, ATR renewed (ATR − booked C/C),
+  and whether remaining BU went to $0 vs still residual; (2) open
+  renewals due in the next 14 calendar days from the current snapshot
+  date, titled with that as-of date. File compare of last-week vs
+  latest CSVs waits on the user dropping those files.
+- Delivered: additive sections.closed_since_prior + sections.due_soon
+  on GET /api/renewals/weekly-brief (same account maps, extra
+  atr/cc/done_deal/next_renewal/LTG columns). Closed = was open on
+  prior and is DONE_DEAL or LTG=0 now (or left the scoped set).
+  Transfer flags: cleared / residual_below_booked /
+  residual_at_or_above_booked / left_scope. Due-soon uses
+  NEXT_RENEWAL_DATE in [snapshot date, snapshot date + 14]. Tab +
+  HTML export: KPI tiles, section 6 + 7. Python restart required.
+- Open question / TODO: offline last-week vs latest CSV compare when
+  the user provides the two files.
+```
+
+```
+Session 25 — 2026-08-21 (cache-buster v=20260821d)
+- User asked for: (1) CS Manager on the Filters bar; (2) Weekly Brief
+  rename BU Forecast → Remaining BU Forecast, add Booked C/C KPI + WoW
+  to match Pacing; (3) drop numbered section prefixes, enlarge headers;
+  (4) Coming due = 7 calendar days, top 20; (5) clearer Best/Worst Case.
+- Delivered: CS Manager MultiSelect on the inline Filters bar (and next
+  to Owner in the modal). Weekly Brief rollup now includes booked /
+  booked_delta / expected (booked + remaining). KPI row: Booked C/C +
+  Remaining BU + Best/Worst remaining + identity line. Coming due
+  WEEKLY_BRIEF_DUE_SOON_DAYS=7, cap=20. Best-to-worst remaining range
+  strip with Worse/Better movers. Section headers unnumbered, text-sm.
+  Python restart required (booked rollup + due-soon window).
+- Open question / TODO: none. Residual — brief booked is QTD CC on the
+  Active snapshot's scoped rows (ATR floor), Pacing booked is Historical
+  100K+ Official, so the two booked tiles can still differ.
+```
+
+```
+Session 26 — 2026-08-27 (cache-buster v=20260827a)
+- User asked for: Weekly Brief still crashes sporadically; inspect and
+  make the path as optimized as possible, then re-review.
+- Delivered: removed the per-row LATERAL+regexp trend join (the 30s
+  pool timeout / 90s SET LOCAL no-op crash). Trend is now SUM(bu_fc)
+  GROUP BY plus a Python as-of over accounts that have call events.
+  Snapshot list uses cached row_count/effective_date (EXISTS only if
+  cache is empty). Quarter labels from current + generated spellings
+  + prior (not DISTINCT across 12 uploads). Queries run in a
+  transaction with SET LOCAL 45s and asyncpg timeout=45s. Index
+  006 idx_call_events_account_atr_eff. Frontend: 120ms debounce, skip
+  hydrate refetch, 50s abort. SERVER RESTART REQUIRED.
+- Open question / TODO: none. Residual — first tab open still hydrates
+  snapshot dropdown IDs from the first response (no second fetch).
+```
+
+```
+Session 27 — 2026-08-27 (cache-buster v=20260827b)
+- User asked for: convert Weekly Brief trend graph + table from
+  BU vs Adjusted (ELT) to remaining BU FC, Closed/budget consumed
+  (QTD C/C $), and CS-call adjustment total.
+- Delivered: trend points add total_booked_cc + total_cs_call.
+  CS call is as-of CS forecast only (no Renewals, $0 if no CS
+  call). Three solid theme lines (sky / indigo / emerald) +
+  matching table; download brief mirrors. Legacy
+  total_adjusted_fc/gap still on the wire. SERVER RESTART REQUIRED.
+- Open question / TODO: none.
+```
+
+```
+Session 28 — 2026-08-27 (cache-buster v=20260827c)
+- User asked for: Weekly Brief times out more consistently after the
+  three-line trend change.
+- Delivered: meta=true snapshot prefetch; asyncio.gather of current /
+  prior / trend on three pool connections; client abort 90s (full) /
+  15s (meta). SERVER RESTART REQUIRED.
+- Open question / TODO: landing still said “upload CSVs” while the
+  brief was building; 279k-row uploads still timed out.
+```
+
+```
+Session 29 — 2026-08-31 (cache-buster v=20260831a)
+- User asked for: landing is confusing (two weeks already picked, then
+  “upload CSVs”) and the brief still times out.
+- Delivered: (1) UI — while loading, show “Building this week's brief”
+  + “latest vs previous is already selected”; timeout gets Try again;
+  “upload CSVs” only when fewer than two snapshots. (2) SQL — quarter
+  filter uses labels found on current/prior (`=` when one label), not
+  ~13 generated spellings that skipped the index; server default
+  arr_min=100000 when band=all. SERVER RESTART REQUIRED.
+- Open question / TODO: none. Residual — first open still does meta
+  then full fetch; DISTINCT year_quarter on one 279k upload is cheap
+  vs the old seq scan.
+```
+
+```
+Session 30 — 2026-08-31 (cache-buster v=20260831b)
+- User asked for: align Weekly Brief closed/budget-consumed with
+  Pacing ($6.7M vs $8.5M) and apply Filters on that same lens.
+- Delivered: Brief booked + remaining + trend now use 100K+ Official
+  (BAND column, same matcher as Pacing), not ATR ≥ $100K. Global
+  Filters (region / segment / owner / CSM / quarter / ARR / other
+  bands) still scope the brief. Copy updated. SERVER RESTART REQUIRED.
+- Open question / TODO: none. With Filters at All, Brief booked C/C
+  should match Pacing Budget consumed $ on 100K+ Official.
+```
+
+```
+Session 31 — 2026-09-16 (cache-buster v=20260916a)
+- User asked for: Weekly Brief must respect the top Filters bar (scope /
+  compare looked hardcoded) and stop timing out so it loads every time.
+- Delivered: (1) Filters — all top-bar dimensions (multi-select region /
+  segment / owner / CSM / country / …), Dates (`date_from`/`date_to` on
+  next_renewal), search, and the actual quarter list are forwarded. No more
+  “exactly one or All” collapse and no auto-Q3 when dates/quarters are set.
+  Comparing chip follows the Current/Prior dropdowns, not a leftover
+  payload. (2) Reliability — never DISTINCT year_quarter on 279k rows
+  (LIMIT 1 probes instead). `part=summary` is SQL GROUP BY KPIs (no
+  per-account dump); `part=lists` fills movers/closed/due-soon after. Client
+  paints KPIs as soon as summary lands; list timeout no longer blanks the
+  brief. Index 007 (csv_upload_id, region) + (csv_upload_id, next_renewal).
+  SERVER RESTART REQUIRED.
+- Open question / TODO: none. Residual — unscoped Official across all
+  default quarters can still make the lists phase slow; headlines should
+  still appear.
+```
+
+```
+Session 32 — 2026-09-16 (cache-buster v=20260916b)
+- User asked for: (1) /admin Snapshot history failing; (2) Filters
+  quarter must follow adjusted fiscal quarter of the renewal date.
+- Delivered: (1) `GET /api/renewals/snapshots` reads only cached
+  `csv_uploads` stats — no live COUNT/SUM on 279k `account_snapshots`.
+  Ingest now writes `snapshot_distinct_accounts` + `snapshot_atr_total`
+  (migration 008). Existing uploads show row_count immediately; accounts
+  / ATR fill on the next ingest. Admin falls back to `/admin/csv-uploads`
+  if the snapshots call fails. (2) Client `makeRowMatcher` + Filters
+  quarter facet + Region/Historical Filters.quarters matchers classify
+  by Zendesk FY of NEXT_RENEWAL_DATE (FY27 = Feb 2026–Jan 2027; Jan 2026
+  = FY26Q1). Weekly Brief `_wb_quarter_clause` uses the same date ranges.
+  Dates filter still intersects. Pacing still uses its own local quarter
+  picker (`ignoreQuarters`). Notes keys still use CSV FISCAL_QUARTER.
+  SERVER RESTART REQUIRED.
+- Open question / TODO: none. Residual — older uploads show — for
+  distinct accounts / ATR until re-ingested; Pacing local quarter still
+  uses CSV labels.
+```
+
+```
+Session 33 — 2026-09-16 (cache-buster v=20260916c)
+- User asked for: Weekly Brief tab stuck on “did not finish in time /
+  Not Found” with empty snapshot dropdowns and no further loading.
+- Delivered: that screen was a FastAPI 404, not a timeout. Week picker
+  no longer sends `?meta=true` plus the full Filters query string.
+  Backend: omitting `current` (or GET `/weekly-brief/weeks`, or header
+  `X-Renewals-Brief-Part: meta`) returns snapshot ids only. Client
+  fills Current/Prior from that, then `/snapshots` if the brief route
+  404s; error copy distinguishes missing route vs timeout.
+  SERVER RESTART REQUIRED.
+- Open question / TODO: none. Residual — if production Python is a
+  tree without `/weekly-brief` at all (e.g. github_cx), the week
+  dropdowns can still fill from `/snapshots` but KPIs need the
+  weekly-brief route redeployed.
+```
+
+```
+Session 34 — 2026-09-16 (cache-buster v=20260916d)
+- User asked for: Weekly Brief still 404s with empty Current snapshot
+  after the Session 33 fix (screenshot still showed the old timeout title).
+- Delivered: week picker now reads `GET /api/renewals/snapshots` FIRST so
+  Current/Prior fill even when `/weekly-brief` is missing. index.html
+  intercepts a stale app.js 404 on the week-picker URL and synthesizes
+  the same payload. Route moved to `app/routes/weekly_brief.py` and
+  included from both `app/main.py` and `github_cx/app/main.py`.
+  SERVER RESTART REQUIRED.
+- Open question / TODO: none. Residual — KPIs still need
+  weekly_brief.py on the running Python; dropdowns should fill from
+  /snapshots regardless.
+```
+
+```
+Session 35 — 2026-09-16 (no cache-buster change; Python only)
+- User asked for: can I test locally? (production /admin and the Weekly
+  Brief week picker both returned {"detail":"Not Found"}).
+- Delivered: ran the app locally against the existing local Postgres
+  (`renewals` DB, 13 uploads / 438k account_snapshots) on :8089.
+  Migrations 005-008 applied on boot. That exposed a REAL bug the
+  sandbox could not catch: `_wb_quarter_clause` and `_wb_filter_sql`
+  bound `'2026-08-01'` strings to `$n::date` params, and asyncpg's date
+  codec raises `DataError: 'str' object has no attribute 'toordinal'`
+  => every `part=summary` / `part=lists` call 500'd. Both now pass real
+  `datetime.date` objects (`_wb_parse_date` for date_from/date_to).
+  Verified end-to-end in the browser: week dropdowns fill, KPIs render
+  (Booked $726K / Remaining BU $38.2M / 763 accounts), region table and
+  three-line trend draw, filtered+dated+region-scoped summary returns
+  200 in ~1.2s cold / ~25ms warm.
+- Also: `/admin` + `/admin/` now served from `app/routes/admin.py` (not
+  only app/main.py) so a partial deploy still gets the HTML page; the
+  dashboard Admin button points at `/admin.html`.
+- Open question / TODO: production still runs a revision without
+  weekly_brief.py or the admin page route — deploy app/, public/, and
+  migrations 005-008 from THIS tree (never github_cx/).
+```
+
+```
+Session 36 — 2026-10-01 (no code change)
+- User asked for: audit Gitea vs local and connect this folder to the
+  Gitea repo.
+- Delivered: every app file on gitea/main is byte-identical to local;
+  both __init__.py files are clean (the NUL corruption is gone) and the
+  foreign-app files (issues/scoring/cios/cohort) are deleted. The
+  .deploy image pin was 8b2ca14 = tip content commit, so production runs
+  this tree. Remotes renamed: `origin` = Gitea, `github` = github_cx
+  (pom-git reads `origin` to pick the Pomerium domain). Local branch
+  `gitea-main` tracks origin/main; histories are unrelated to the GitHub
+  branch, so push to Gitea from a worktree on gitea-main. Removed retired
+  seeds/active.csv, seeds/historical.csv, sql/AGENTS.md and the legacy
+  active/historical SQL (693e62d).
+- Open question / TODO: none. Keep .deploy/*, catalog-info.yaml and .done
+  in Gitea — they are platform files that only live there.
+```
+
+```
+Session 37 — 2026-10-01 (no cache-buster change; Python + migration)
+- User asked for: Weekly Brief still shows "The brief did not finish in
+  time" in production (dropdowns now fill: 279k-row uploads).
+- Root cause: the 100K+ Official band match is a REGEXP_REPLACE no index
+  can serve. The trend's `csv_upload_id = ANY(12 ids)` read the whole
+  account_snapshots table (3.35M rows, ~5.2 GB), and the rollups read
+  whole uploads. Production summary took 28.2s cold / 14.7s warm against
+  the client's 35s abort, and it grew with every Run-now upload. A second
+  cause: SCHEMA_SQL ran 17 unconditional `ALTER TABLE ... ADD COLUMN IF NOT
+  EXISTS` on every boot. ALTER takes ACCESS EXCLUSIVE even when the column
+  exists, so a cold start during any slow brief query queued every other
+  account_snapshots read behind it. Two instances booting together also
+  deadlocked, and the loser landed in schema-error, which downgrades users
+  to "standard" on that instance.
+- Delivered: (1) migration 009 adds a partial index over Official rows only,
+  built by `Database.migrate_weekly_brief_official_index` as the LAST boot
+  step: autocommit, `pg_try_advisory_lock` so one instance builds it,
+  `statement_timeout = 0`, ledger row written after the build. The
+  predicate is shared via `OFFICIAL_BAND_PREDICATE` so query and index
+  stay byte-identical. (2) The column ALTERs now run inside a DO block
+  only for columns missing from pg_attribute, so boot takes zero ACCESS
+  EXCLUSIVE locks on an up-to-date database.
+- Verified on a production-shape copy (12 uploads x 279k rows, 5.2 GB,
+  1,440 accounts with CS-call history): live Gitea code took 11-12s for
+  summary and 17-19s for lists; this tree took 0.02-0.07s and 0.13-0.15s.
+  Output was identical apart from generated_at. Two instances booting
+  together: one builds the index, the other logs "being built by another
+  instance", with no deadlock. While a lock or a long brief query is held
+  on account_snapshots, the new boot finishes in 0.5s and readers are
+  unaffected, while the old boot hung and blocked readers. Dev DB
+  (`renewals`) boots clean with summary at 0.40s.
+  Deployed as 7911954 (Tekton pin 5c27865). Production, current 29 vs
+  prior 28: summary 11s on a cold cache then 0.8-1.2s, lists 0.9-1.1s.
+  One lists call returned a 503 right after the rollout; the next calls
+  were all 200. The Cloud Run spec has no custom probes, so a new instance
+  can take traffic before its pool opens and answers 503 + Retry-After
+  for its first seconds (pre-existing, by design).
+  SERVER RESTART REQUIRED.
+- Open question / TODO: none. Residual — (1) the first boot after deploy
+  builds the index once (est. 1-3 min on the shared Cloud SQL). During
+  that build the brief stays slow and ingest writes on account_snapshots
+  wait; a graceful shutdown mid-build cancels it and the next boot
+  retries. (2) Non-Official bands still scan the scoped uploads.
+  (3) Client summary abort (35s) is still below the server's 45s.
+```
+
+```
+Session 38 — 2026-10-08 (cache-buster v=20261008a; Python + frontend)
+- User asked for: automate the Snowflake refresh with App Foundry
+  "Pattern B": a Postgres cache with last_synced_at, stale-while-
+  revalidate on a 48h cadence, refreshed with the visiting user's token.
+  Decisions: any signed-in user may trigger it; the Weekly Brief stays
+  weekly (prior about 7 days back, one trend point per week); retention
+  keeps 30 days of snapshots, then one per week for 52 weeks.
+- Delivered: (1) `POST /api/renewals/refresh/auto` (§5.11). It answers
+  fresh / stale / running / started / disabled. When stale, it claims a
+  cross-instance lease and runs the same background job as Run-now with
+  kind=auto (`uploaded_by` = `snowflake:auto`). Run-now takes the same
+  lease, so a second instance answers 409 instead of pulling twice.
+  (2) Guards: an automatic pull with under 90% of the current snapshot's
+  rows is rejected before ingest. Failures pause automatic runs and skip
+  that visitor: login failure 10 min / 24h, row guard 1h / 7d, anything
+  else 30 min / 24h. The token is read per request, never logged or
+  stored. (3) Retention after every successful refresh (§1.3).
+  (4) Weekly Brief: default prior = newest snapshot older than current
+  minus 6 days; trend = one point per week; the dropdown lists 60. The
+  `/snapshots` fallback in app.js and index.html uses the same rule. A
+  pinned id that retention deleted falls back with a warning. (5) UI:
+  index.html fires the trigger once per load, shows "Refreshing…" in the
+  Data-as-of badge while any instance runs, polls every 15s, then shows a
+  "Fresh Snowflake data is ready · Reload" toast. /admin gets an
+  Automatic refresh cadence field and a status line (next due, last run,
+  by whom, error, paused until, skipped visitors).
+- Verified locally against a copy of the dev DB, with two instances and
+  the Snowflake connector stubbed. Concurrent triggers start exactly one
+  run; the other instance reports running and Run-now gets 409. Row
+  guard, login failure, cooldown, skip, cadence 0, simulated mode, PUT
+  validation and expired-lease takeover all behave as above. The prune
+  deleted exactly the predicted uploads. Badge, toast and the /admin
+  section work in the browser. Weekly point selection was unit-tested on
+  48h, daily and gapped series. SERVER RESTART REQUIRED.
+  Deployed as 5a0855d (Tekton pin eec8f6e). Production after rollout:
+  auto-refresh enabled at 48h, next due 2026-10-10 14:33 UTC; the week
+  picker defaults to 32 vs 30 (the old rule picked 31); summary 1.0s cold
+  / 0.6s warm with 9 weekly trend points (19, 22, 24, 26, 27, 28, 29, 30,
+  32); lists 0.7s; `POST /refresh/auto` answers fresh.
+- Open question / TODO: first prune pending (§2.2). Residual — (1) a
+  refresh needs a visitor with a valid token, so nothing refreshes while
+  nobody opens the app; (2) SIGTERM only marks the instance not-ready
+  (pre-existing), so a run killed mid-way holds the lease until it
+  expires after 45 min; (3) the first production prune removes 5
+  snapshots (§2.2).
+```
+
 ---
 
 ## 3. Communication protocol
@@ -969,45 +1355,59 @@ Brief). Compares two `account_snapshots` (week-over-week), scoped to the
 
 Query params (all optional):
 `slot` (default `active`), `current`/`prior` (pin a `csv_upload_id` pair;
-default = latest active snapshot vs the immediately-preceding one),
-`quarter` (any label spelling — `Q3\`27`, `FY27Q3`, `2027Q3`; default =
-auto-detected current fiscal quarter), `band` (default `100k+`),
+default = latest active snapshot vs the newest snapshot older than current
+minus 6 days, else the immediately-preceding one while there is under a
+week of history; a pinned id that no longer exists falls back to that
+default and the response carries a `warning` naming it),
+`quarter` (comma-separated labels — `Q3\`27`, `FY27Q3`, `2027Q3`; default =
+auto-detected current fiscal quarter **only when no quarters and no dates**
+are sent). Parsed FY labels become inclusive ``next_renewal`` date ranges
+under the Zendesk FY calendar (FY ends January; FY27 = Feb 2026–Jan 2027;
+Jan 2026 = FY26Q1) — **not** a match on the CSV ``year_quarter`` label.
+Unparsed leftover labels still use index-friendly ``year_quarter`` equality.
+`band` (default `100k+`),
 `threshold` (default `50000` — the "large mover" cutoff for explanations),
-and the **shared filters** `region`, `sub_region`, `cs_manager`, `segment`,
-`owner` (each `''`/`__ALL__` = all for that dimension) plus an ARR range
-`arr_min`/`arr_max` (numeric, on `s.atr`). **Every filter is applied
-server-side to EVERY section AND BOTH trend series** via the same
-`($expr = $N)` pattern, so the whole brief is uniformly scoped. The
-`available_*` option lists are computed UNfiltered (band + quarter only) so
-the UI selectors stay fully populated. Each active dimension must be in the
-frontend fetch params + effect deps or the sections/trend won't refresh.
+`part` (`summary` = SQL KPI rollup, `lists` = account movers, `full` =
+both / legacy; omit `current` or send `part=meta` / header
+`X-Renewals-Brief-Part: meta` / `GET /weekly-brief/weeks` for the week
+picker only), `date_from`/`date_to` (inclusive on `next_renewal`),
+`search`, and the **shared filters** `region`, `sub_region`, `cs_manager`,
+`segment`, `owner`, `country`, `industry`, `health`, `partner`,
+`partner_type` (each accepts a comma list; `''`/`__ALL__` = all for that
+dimension) plus an ARR range `arr_min`/`arr_max` (numeric, on `s.atr`).
+**Every filter is applied server-side to EVERY section AND the trend
+series.** Auto-current-quarter is skipped when the Filters bar sent dates
+or a quarter list.
 
-**Frontend scope sourcing (as of Session 4):** the endpoint contract is
-unchanged, but the Weekly Brief tab no longer has its own scope dropdowns.
-It sources scope **entirely from the app's global Filters bar**
-(`state.filters`): `region`/`segment`/`owner` are each passed only when
-**exactly one** value is selected globally (0 or 2+ ⇒ that dimension is
-"All"); `quarter` is passed only when exactly one global quarter is
-selected (else the endpoint auto-picks the current fiscal quarter); `band`
-is derived from `filters.band` (unset/`all`/100K-family ⇒ `100k+`, else the
-global band verbatim). `sub_region` and `cs_manager` are **no longer sent**
-(the global bar has no equivalent — the endpoint still accepts/ignores
-them). The brief keeps only its own controls: current/prior snapshot
-selectors and the large-mover threshold.
+**Frontend scope sourcing (as of Session 33):** the Weekly Brief tab
+forwards the **entire** global Filters bar: multi-selects as comma lists,
+`dateFrom`/`dateTo` as `date_from`/`date_to`, search, ARR, and the live
+quarter array (including the default FY seed). Comparing chips follow the
+Current/Prior **dropdowns**, not a stale payload. Fetch is two-phase:
+week picker (`GET /weekly-brief/weeks?slot=active`, then `/weekly-brief`,
+then `/snapshots`) → `part=summary` (KPIs) → `part=lists` (tables). A
+lists timeout keeps the headline numbers on screen. A missing brief route
+is shown as a 404, not as a timeout.
 
-**Two trend series:** each trend point carries `total_bu_fc` (system
-bottoms-up) AND `total_adjusted_fc` (the ELT / calls-adjusted total) plus
-their `gap` (= adjusted − BU). The adjusted total applies, per in-scope
-account, the latest call (`cs_forecast + renewals_forecast`) from
-`account_call_events` whose `effective_date <= that snapshot's
-effective_date` (as-of reconstruction), else falls back to `bu_fc`. Calls
-are matched to snapshot accounts on `account_id` + `rounded_atr` +
-**normalized quarter** (NOT the raw `call_key` string) because the stored
-call_key encodes the quarter in the app's spelling (`FY27Q4`) while the
-snapshot column uses another (`Q4\`27` / `QQ4\`27`). The match is one
-`LEFT JOIN LATERAL` over the `(call_key, effective_date DESC)` index, bounded
-by the already band+quarter+filter-scoped account set (a few hundred rows
-across a handful of snapshots).
+**Weekly trend points (Session 38):** point k is the newest snapshot older
+than current minus (7k − 1) days, deduped, up to `WEEKLY_BRIEF_TREND_LIMIT`
+(12) points within 12 weeks, plus the prior when it was pinned off-grid
+(`_wb_weekly_points`). The one day of slack keeps last week's run counted
+as a week back when it landed a few hours later in the day. The dropdown
+list (`snapshots`) is separate and capped at `WEEKLY_BRIEF_PICKER_LIMIT`
+(60).
+
+**Three trend series:** each trend point carries `total_bu_fc` (remaining
+system bottoms-up), `total_booked_cc` (QTD booked C/C on that snapshot —
+Closed / budget consumed $), and `total_cs_call` (sum of as-of **CS Call
+only**; accounts with no CS call contribute $0; Renewals call is not
+included). Legacy `total_adjusted_fc` / `gap` (ELT = CS+Renewals, else BU)
+are still emitted so the wire stays additive. Calls are matched on
+`account_id` + `rounded_atr` + **normalized quarter**. The BU and booked
+series are cheap `SUM(...) GROUP BY csv_upload_id`. CS call is rebuilt in
+Python over accounts that have call events. There is **no**
+`LEFT JOIN LATERAL`. An index `(account_id, rounded_atr, effective_date DESC)`
+backs the event fetch.
 
 ```json
 {
@@ -1028,6 +1428,7 @@ across a handful of snapshots).
                    "delta": 555000.0, "delta_pct": 14.2, "accounts": 389}],
       "rollup":  {"current": ..., "prior": ..., "delta": ..., "delta_pct": ..., "accounts": ...},
       "trend":   [{"upload_id": 1, "effective_date": "...", "total_bu_fc": 3907552.0,
+                   "total_booked_cc": 1200000.0, "total_cs_call": 850000.0,
                    "total_adjusted_fc": 4013050.6, "gap": 105498.6}, ...]
     },
     "worsened":     [{"account_id", "account_name", "region", "current_bu_fc",
@@ -1040,7 +1441,22 @@ across a handful of snapshots).
     "best_case":  {"current_total", "prior_total", "delta", "delta_pct",
                    "top_increase": [...5], "top_decrease": [...5]},
     "worst_case": {"current_total", "prior_total", "delta", "delta_pct",
-                   "top_increase": [...5], "top_decrease": [...5]}
+                   "top_increase": [...5], "top_decrease": [...5]},
+    "closed_since_prior": {
+      "rows": [{"account_id", "account_name", "region", "prior_bu_fc",
+                "current_bu_fc", "booked_cc", "atr", "atr_renewed",
+                "residual_bu", "bu_cleared", "left_scope", "transfer",
+                "next_renewal?"}],
+      "total": 12, "booked_cc": 0, "prior_bu_fc": 0, "residual_bu": 0,
+      "atr": 0, "atr_renewed": 0, "cleared_count": 0, "residual_count": 0,
+      "left_scope_count": 0
+    },
+    "due_soon": {
+      "from": "2026-08-20", "to": "2026-09-03", "days": 14,
+      "rows": [{"account_id", "account_name", "region", "next_renewal",
+                "days_until", "atr", "bu_fc", "booked_cc"}],
+      "total": 8, "atr": 0, "bu_fc": 0, "booked_cc": 0
+    }
   }
 }
 ```
@@ -1074,24 +1490,94 @@ Semantics (must stay consistent with the dashboard):
   drivers in both the tab and the export. (The prior signed `upside`/`downside`
   movement sections were replaced by these.)
 
-Additive and read-only — no schema change, frozen shapes untouched.
-**Performance:** every per-snapshot read is filtered to band + quarter (+
-shared filters) in SQL (~hundreds of rows), only the single `UPSIDE` key is
-extracted from `raw_row` (never the whole JSONB blob), and the trend (BU +
-adjusted) is one grouped query with a single indexed `LATERAL` per row over
-the recent-snapshot window — safe for ~50k-row snapshots.
+Additive and read-only — frozen shapes untouched (`part` / `lists_pending` /
+extra filter echo keys are additive).
+**Performance:** snapshot week-selector uses cached `csv_uploads.snapshot_row_count`
+/ `snapshot_effective_date`. **Never** `DISTINCT year_quarter` on a 279k-row
+upload — quarter labels are probed with `year_quarter = $n LIMIT 1`.
+`part=summary` is `SUM … GROUP BY region` (plus a cheap BU/CC trend); CS-call
+as-of and per-account dumps wait for `part=lists`. Indexes include
+`(csv_upload_id, year_quarter, atr)`, `(csv_upload_id, region)`,
+`(csv_upload_id, next_renewal)`, and call-events as-of.
+Default band is **100K+ Official** (BAND column, same matcher as Pacing),
+not ATR ≥ $100K. `band=all` without an ARR range also pins Official.
+The Official match is a regex no plain index can serve, so migration 009
+adds the partial index `idx_snapshots_official_upload_renewal`
+`(csv_upload_id, next_renewal) INCLUDE (bu_fc, cc, account_id, atr,
+year_quarter, effective_date) WHERE <Official predicate>` (~1-2% of rows,
+a few MB). The trend becomes an index-only scan instead of a full-table
+scan. **The planner only uses it when the query repeats the predicate
+byte-for-byte** — both sides format `OFFICIAL_BAND_PREDICATE` from
+`app/database.py`; never hand-edit the copy in `weekly_brief.py`. Other
+bands (`gt12k`, ARR ranges) still scan the scoped uploads.
+Pool `command_timeout`
+is 30s; brief queries override to 45s. Frontend: meta (15s) then summary
+(35s) then lists (60s); KPIs render as soon as summary lands.
 
 **Frontend (`WeeklyBriefTab` in `public/vendor/app.js`):** consumes the
 app's shared `state.filters` (via `useApp()`) to seed region / segment /
 owner / quarter defaults, exposes selectors for region / sub-region / CS
 manager / segment / owner / quarter / band (populated from `available_*`),
 renders an **"applied filters" removable-chip strip** reusing the Region
-tab's `region-filter-chip*` classes, and draws a **dual-line trend** (BU vs
-Adjusted, distinct colors + legend + per-point tooltips showing both values
-and the gap) with a companion `Week · BU FC · Adjusted FC · Δ(Adj−BU)`
+tab's `region-filter-chip*` classes, and draws a **three-line trend**
+(remaining BU / QTD booked C/C / CS call; sky, indigo, emerald) with a
+companion `Week · Remaining BU FC · Closed / budget consumed · CS call`
 table. `generateWeeklyBriefHtml` mirrors the same amounts table + applied
 filters in the downloadable brief. Chart/legend styles live with the other
 `.wb-trend-*` rules in `public/index.html`.
+
+### 5.11 Snowflake refresh (`app/routes/refresh.py`)
+
+App Foundry has no stored Snowflake service credentials. Every pull uses
+the visiting user's Okta token from `x-pomerium-idp-access-token`
+(`authenticator='oauth'`), read per request, never logged or stored. So a
+refresh has to be triggered by a visit (App Foundry "Pattern B",
+stale-while-revalidate). The dashboard always serves the cached snapshot
+from Postgres and never waits on Snowflake.
+
+**`POST /api/renewals/refresh/auto`** (any signed-in user; guests get 401).
+`public/index.html` calls it once per page load. Every response carries
+`{ok, status, hours, last_synced_at, due_at}`, where `last_synced_at` is
+the `uploaded_at` of the newest active upload with parsed rows.
+
+| `status` | `reason` | Meaning |
+| --- | --- | --- |
+| `fresh` | — | Newest snapshot is younger than `hours` |
+| `started` | — | This request claimed the lease and started a background pull (`job_id`, `started_at`) |
+| `running` | — | Some instance is already refreshing (`started_at`) |
+| `stale` | `no_token` | Due, but the request carried no token |
+| `stale` | `cooldown` | Due, but automatic runs are paused after a failure (`retry_after`) |
+| `stale` | `not_eligible` | Due, but this visitor's token failed recently and is skipped |
+| `disabled` | `off` / `simulated` | Cadence is 0, or Snowflake runs in simulated mode |
+
+The checks run in that order: disabled, fresh, local job running, token,
+cooldown, visitor skip, lease. Freshness is checked again after the lease
+is claimed, in case another instance just finished. The run itself is the
+Run-now job with `kind="auto"`: `uploaded_by` = `snowflake:auto`, filename
+`Snowflake Auto-Refresh_<UTC yyyymmdd_HHMM>Z.csv`. An automatic pull with
+fewer than 90% of the current snapshot's rows raises `RowGuardError` before
+ingest, so the current snapshot stays. Failures set a global cooldown and
+skip the visitor: `SnowflakeConnectError` 10 min / 24h, `RowGuardError`
+1h / 7d, anything else 30 min / 24h. Success clears the cooldown.
+
+**Lease.** Run-now and auto both claim `renewals_meta.snowflake_refresh_lease`
+with one atomic `INSERT … ON CONFLICT DO UPDATE … WHERE expires_at <= NOW()`
+on the DB clock (45 min TTL). Release matches on `job_id`. A second
+instance answers `running` (auto) or 409 `refresh_in_progress` with
+`{job_id, started_at, kind}` (Run-now). An instance killed mid-run holds
+the lease until it expires.
+
+**Additive fields.** `GET /api/renewals/refresh-status` (no auth) adds
+`kind` (`manual` / `auto`), `settings.auto_refresh_hours`, and `auto`:
+`{enabled, hours, last_synced_at, due_at, last_attempt_at,
+last_finished_at, last_result, cooldown_until, retention: {keep_all_days,
+keep_weekly_weeks}}` with no emails. It reports `running` from the lease
+when another instance is refreshing. `GET /api/renewals/snowflake-config`
+(owner) adds the same `auto` block plus `last_attempt_by`, `last_error` and
+`skipped_users`, and `auto_defaults.auto_refresh_hours` (48).
+`PUT /api/renewals/snowflake-config` (owner) accepts `auto_refresh_hours`
+from 0 to 2160 (0 = off; blank or null keeps the stored value; anything
+else returns 400).
 
 ---
 

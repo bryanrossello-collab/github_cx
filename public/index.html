@@ -743,6 +743,13 @@
         font-size: 0.78rem;
       }
 
+      .filter-active-chips {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+        padding: 0 0 2px;
+      }
       .filter-panel {
         padding: 0.35rem 1rem;
         display: flex;
@@ -853,6 +860,7 @@
 
       /* Vibe ARR range filter — embedded in left sidebar above CS Manager */
       #vibe-arr-filter {
+        display: none !important;
         width: 100%;
         box-sizing: border-box;
       }
@@ -1092,6 +1100,47 @@
         border-color: rgba(52, 211, 153, 0.35);
         background: rgba(52, 211, 153, 0.12);
       }
+      #vibe-fresh-data-toast {
+        position: fixed;
+        right: 20px;
+        bottom: 20px;
+        z-index: 9999;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 10px 10px 14px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--ink);
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.18);
+        font-size: 12px;
+      }
+      #vibe-fresh-data-toast button {
+        font: inherit;
+        cursor: pointer;
+        border-radius: 8px;
+      }
+      #vibe-fresh-data-toast [data-act="reload"] {
+        padding: 5px 10px;
+        border: 1px solid rgba(16, 185, 129, 0.35);
+        background: rgba(16, 185, 129, 0.1);
+        color: #059669;
+        font-weight: 600;
+      }
+      .dark #vibe-fresh-data-toast [data-act="reload"] {
+        color: #34d399;
+        border-color: rgba(52, 211, 153, 0.35);
+        background: rgba(52, 211, 153, 0.12);
+      }
+      #vibe-fresh-data-toast [data-act="dismiss"] {
+        padding: 2px 6px;
+        border: 0;
+        background: transparent;
+        color: var(--ink-muted);
+        font-size: 15px;
+        line-height: 1;
+      }
       #vibe-user-menu-trigger {
         display: flex;
         align-items: center;
@@ -1154,6 +1203,11 @@
         color: #4f46e5;
         background: rgba(79, 70, 229, 0.12);
         border: 1px solid rgba(79, 70, 229, 0.25);
+      }
+      .vibe-user-role.update {
+        color: #0284c7;
+        background: rgba(2, 132, 199, 0.12);
+        border: 1px solid rgba(2, 132, 199, 0.25);
       }
       .vibe-user-role.standard {
         color: #6366f1;
@@ -2000,22 +2054,7 @@
 
       /* Region tab — deterministic layout (avoid broken Tailwind flex/grid). */
       .region-filter-bar {
-        width: 100%;
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-      }
-      .region-filter-bar-head {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        padding: 11px 14px;
-        flex-wrap: wrap;
-        margin-bottom: 0;
-        background: linear-gradient(135deg, rgba(99, 102, 241, 0.10), rgba(16, 185, 129, 0.07));
-        border: 1px solid rgba(99, 102, 241, 0.28);
-        border-radius: 12px;
-        box-shadow: 0 1px 2px rgba(99, 102, 241, 0.08);
+        display: none !important;
       }
       html.dark .region-filter-bar-head {
         background: linear-gradient(135deg, rgba(99, 102, 241, 0.20), rgba(16, 185, 129, 0.12));
@@ -2070,8 +2109,7 @@
       }
       .region-filter-bar:has(.region-filter-sections) .region-filter-sections {
         border: 1px solid rgba(99, 102, 241, 0.28);
-        border-top: none;
-        border-radius: 0 0 12px 12px;
+        border-radius: 12px;
         background: linear-gradient(180deg, rgba(99, 102, 241, 0.055), rgba(99, 102, 241, 0.02));
         padding: 12px;
       }
@@ -2504,6 +2542,126 @@
         align-items: center;
         gap: 6px;
       }
+
+      /* Pacing: Best / BU / Worst landing as one grouped matrix */
+      .pacing-landing-cols,
+      .pacing-landing-row {
+        display: grid;
+        grid-template-columns: 6.75rem repeat(4, minmax(0, 1fr));
+        align-items: stretch;
+        min-width: 640px;
+      }
+      .pacing-landing-body { overflow-x: auto; }
+      .pacing-landing-cols {
+        border-bottom: 1px solid var(--border);
+        background: var(--surface);
+      }
+      .pacing-landing-row + .pacing-landing-row {
+        border-top: 1px solid var(--border);
+      }
+      .pacing-landing-row.is-baseline {
+        background: rgba(99, 102, 241, 0.06);
+      }
+      .dark .pacing-landing-row.is-baseline {
+        background: rgba(99, 102, 241, 0.12);
+      }
+      .pacing-landing-rail,
+      .pacing-landing-rail-spacer {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 0.65rem 0.7rem 0.65rem 0.85rem;
+        border-left: 3px solid transparent;
+        font-size: 0.62rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--ink-muted);
+        line-height: 1.25;
+      }
+      .pacing-landing-row.is-baseline .pacing-landing-rail {
+        border-left-color: rgb(99, 102, 241);
+        color: rgb(79, 70, 229);
+      }
+      .dark .pacing-landing-row.is-baseline .pacing-landing-rail {
+        color: rgb(165, 180, 252);
+      }
+      .pacing-landing-colh {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 0.45rem 0.75rem;
+        font-size: 0.56rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        font-weight: 700;
+        color: var(--ink-muted);
+        white-space: nowrap;
+      }
+      .pacing-landing-cell {
+        padding: 0.55rem 0.75rem;
+        min-width: 0;
+      }
+      .pacing-landing-value {
+        font-size: 1.1rem;
+        font-weight: 700;
+        line-height: 1.15;
+        font-variant-numeric: tabular-nums;
+      }
+      .pacing-landing-sub {
+        font-size: 0.58rem;
+        font-weight: 600;
+        color: var(--ink-muted);
+        margin-top: 0.15rem;
+      }
+
+      .pacing-table {
+        width: 100%;
+        table-layout: auto;
+        border-collapse: collapse;
+      }
+      .pacing-table thead th {
+        white-space: nowrap;
+        vertical-align: bottom;
+        padding: 6px 8px;
+        font-size: 10px;
+        letter-spacing: 0.03em;
+        font-weight: 700;
+        text-transform: uppercase;
+        color: var(--ink-muted);
+        border-bottom: 1px solid var(--border);
+        line-height: 1.2;
+      }
+      .pacing-th-inner {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        white-space: nowrap;
+      }
+      .pacing-table thead th.text-right .pacing-th-inner {
+        justify-content: flex-end;
+        width: 100%;
+      }
+      .pacing-table tbody td {
+        padding: 6px 8px;
+        white-space: nowrap;
+        vertical-align: middle;
+      }
+      .pacing-table td.pacing-status {
+        white-space: normal;
+        max-width: 8.25rem;
+        line-height: 1.25;
+      }
+      .pacing-target-input {
+        width: 5.25rem;
+        max-width: 100%;
+        padding: 3px 6px;
+        font-size: 11px;
+      }
+      .pacing-table .pacing-range-start {
+        border-left: 1px solid var(--border);
+        padding-left: 10px;
+      }
     </style>
   </head>
   <body class="theme-transition">
@@ -2523,7 +2681,66 @@
     <script src="vendor/vibe-session-lock.js"></script>
 
     <!-- App (compiled from app.jsx by ./build.sh) -->
-    <script src="vendor/app.js?v=20260819h"></script>
+    <script>
+      /* Week picker must not depend on /weekly-brief. Stale app.js still
+         calls that route for Current/Prior; rewrite a 404 into /snapshots. */
+      (function () {
+        if (typeof window.fetch !== "function") return;
+        var orig = window.fetch.bind(window);
+        function isWeekPicker(url) {
+          var u = String(url || "");
+          if (u.indexOf("/api/renewals/weekly-brief") === -1) return false;
+          if (/[?&]current=/.test(u)) return false;
+          return true;
+        }
+        function asBrief(data) {
+          var items = (data && data.items) || [];
+          var all = items.filter(function (s) {
+            return String(s.slot || "active").toLowerCase() === "active";
+          }).map(function (s) {
+            return {
+              id: s.id, slot: s.slot, filename: s.filename,
+              uploaded_at: s.uploaded_at,
+              effective_date: s.effective_date || s.uploaded_at,
+              row_count: s.row_count || 0
+            };
+          });
+          var parsed = all.filter(function (s) { return s.row_count > 0; });
+          var snaps = parsed.length ? parsed : all;
+          // Same weekly default as the server: newest snapshot more than
+          // 6 days older than current, else the one right before it.
+          var curMs = snaps[0] ? Date.parse(snaps[0].effective_date) : NaN;
+          var weekBack = null;
+          for (var i = 1; i < snaps.length && isFinite(curMs); i++) {
+            if (Date.parse(snaps[i].effective_date) < curMs - 6 * 864e5) { weekBack = snaps[i]; break; }
+          }
+          return {
+            ok: true, slot: "active", snapshots: snaps,
+            current: snaps[0] || null, prior: weekBack || snaps[1] || null,
+            sections: null, meta_only: true,
+            warning: snaps.length ? null : "No snapshots with parsed rows are available yet."
+          };
+        }
+        window.fetch = function (input, init) {
+          var url = typeof input === "string" ? input : (input && input.url) || "";
+          var p = orig(input, init);
+          if (!isWeekPicker(url)) return p;
+          return p.then(function (r) {
+            if (r.status !== 404) return r;
+            return orig("/api/renewals/snapshots?limit=60", { cache: "no-store" }).then(function (sr) {
+              return sr.json().then(function (data) {
+                if (!sr.ok || !data || !data.ok) return r;
+                return new Response(JSON.stringify(asBrief(data)), {
+                  status: 200,
+                  headers: { "Content-Type": "application/json" }
+                });
+              });
+            }).catch(function () { return r; });
+          });
+        };
+      })();
+    </script>
+    <script src="vendor/app.js?v=20261008a"></script>
 
     <!--
       Container-mode toolbar tweaks. Mounted after the React app so we can
@@ -2946,8 +3163,14 @@
         function roleLabel(role) {
           if (role === 'owner') return 'Owner';
           if (role === 'admin') return 'Admin';
+          if (role === 'update') return 'Update';
           if (role === 'standard') return 'Standard';
           return 'Guest';
+        }
+
+        function canUpdateData(user) {
+          const u = user || window.__renewalsCurrentUser || _currentUser;
+          return !!(u && (u.role === 'update' || u.role === 'admin' || u.role === 'owner'));
         }
 
         function canEditRawNotes() {
@@ -2971,6 +3194,65 @@
         let _dataAsOfLastFetch = 0;
         let _dataAsOfCache = null;
 
+        // Stale-while-revalidate: once per page load, ask the server whether
+        // the Snowflake data is past its refresh cadence. The server decides
+        // (cadence, cooldowns, one run at a time) and pulls in the background
+        // with this visitor's token; the page keeps the cached snapshot and
+        // offers a reload once the new one lands.
+        let _autoRefreshAsked = false;
+        let _refreshWatchTimer = null;
+
+        async function requestAutoRefresh() {
+          if (_autoRefreshAsked) return;
+          _autoRefreshAsked = true;
+          try {
+            const res = await fetch('/api/renewals/refresh/auto', { method: 'POST', cache: 'no-store' });
+            if (!res.ok) return;
+            const data = await res.json();
+            if (data && (data.status === 'started' || data.status === 'running')) {
+              _dataAsOfCache = null;
+              watchRefresh();
+              ensureDataAsOfBadge();
+            }
+          } catch (_) {}
+        }
+
+        function watchRefresh() {
+          if (_refreshWatchTimer) return;
+          const startedAt = Date.now();
+          _refreshWatchTimer = setInterval(async function () {
+            let st = null;
+            try {
+              const res = await fetch('/api/renewals/refresh-status', { cache: 'no-store' });
+              if (res.ok) st = await res.json();
+            } catch (_) {}
+            if (!st) return;
+            _dataAsOfCache = st;
+            _dataAsOfLastFetch = Date.now();
+            ensureDataAsOfBadge();
+            if (st.status === 'running' && Date.now() - startedAt < 30 * 60 * 1000) return;
+            clearInterval(_refreshWatchTimer);
+            _refreshWatchTimer = null;
+            if (st.status === 'done') showFreshDataToast();
+          }, 15000);
+        }
+
+        function showFreshDataToast() {
+          if (document.getElementById('vibe-fresh-data-toast')) return;
+          const el = document.createElement('div');
+          el.id = 'vibe-fresh-data-toast';
+          el.setAttribute('role', 'status');
+          el.innerHTML = '<span>Fresh Snowflake data is ready.</span>' +
+            '<button type="button" data-act="reload">Reload</button>' +
+            '<button type="button" data-act="dismiss" aria-label="Dismiss">\u00d7</button>';
+          el.addEventListener('click', function (e) {
+            const act = e.target && e.target.getAttribute && e.target.getAttribute('data-act');
+            if (act === 'reload') window.location.reload();
+            else if (act === 'dismiss') el.remove();
+          });
+          document.body.appendChild(el);
+        }
+
         function fmtRelativeAgo(iso) {
           try {
             const then = new Date(iso).getTime();
@@ -2988,16 +3270,18 @@
         async function ensureDataAsOfBadge() {
           const rightBlock = document.querySelector('.header-right-block');
           if (!rightBlock) return;
+          requestAutoRefresh();
           try {
             const now = Date.now();
-            const stale = !_dataAsOfCache || (now - _dataAsOfLastFetch) > 60000
-              || (_dataAsOfCache && _dataAsOfCache.status === 'running');
+            const wasRunning = !!(_dataAsOfCache && _dataAsOfCache.status === 'running');
+            const stale = !_dataAsOfCache || (now - _dataAsOfLastFetch) > (wasRunning ? 15000 : 60000);
             if (stale) {
               const res = await fetch('/api/renewals/refresh-status', { cache: 'no-store' });
               if (res.ok) { _dataAsOfCache = await res.json(); _dataAsOfLastFetch = now; }
             }
             const status = _dataAsOfCache && _dataAsOfCache.status;
             const running = status === 'running';
+            if (running) watchRefresh();
             let asOf = _dataAsOfCache && (_dataAsOfCache.data_as_of || _dataAsOfCache.finished_at);
             // Fallback: active snapshot effective date (no refresh run yet).
             if (!asOf) {
@@ -3067,7 +3351,7 @@
             rightBlock.insertBefore(wrap, rightBlock.firstChild);
 
             document.getElementById('vibe-admin-view-btn').addEventListener('click', function () {
-              window.location.href = '/admin';
+              window.location.href = '/admin.html';
             });
             document.getElementById('vibe-user-menu-trigger').addEventListener('click', function (ev) {
               ev.stopPropagation();
@@ -3078,7 +3362,7 @@
             });
             document.querySelector('[data-vibe-dd-admin]').addEventListener('click', function () {
               closeUserMenuDropdown();
-              window.location.href = '/admin';
+              window.location.href = '/admin.html';
             });
             document.querySelector('[data-vibe-dd-resync]').addEventListener('click', function () {
               closeUserMenuDropdown();
@@ -3115,6 +3399,7 @@
 
         function updateUserMenu() {
           const user = _currentUser || { role: 'guest', displayName: 'Guest', email: '' };
+          window.__renewalsCanUpdate = canUpdateData(user);
           const isAdmin = user.role === 'admin' || user.role === 'owner';
           const display = user.displayName || user.email || 'Guest';
 
@@ -3122,6 +3407,8 @@
           const ddAdmin = document.querySelector('[data-vibe-dd-admin]');
           if (adminBtn) adminBtn.style.display = isAdmin ? 'inline-flex' : 'none';
           if (ddAdmin) ddAdmin.style.display = isAdmin ? 'block' : 'none';
+          const ddResync = document.querySelector('[data-vibe-dd-resync]');
+          if (ddResync) ddResync.style.display = canUpdateData(user) ? 'block' : 'none';
 
           document.querySelectorAll('[data-vibe-user-avatar]').forEach(function (el) {
             el.textContent = userInitials(user);
@@ -3157,6 +3444,10 @@
         // after a session expired and background saves were silently rejected.
         let _resyncInFlight = false;
         async function resyncLocalNotes() {
+          if (!canUpdateData()) {
+            alert('Your Standard role is view-only and cannot save notes to the server.');
+            return;
+          }
           if (_resyncInFlight) return;
           _resyncInFlight = true;
           try {
@@ -3175,7 +3466,7 @@
               if (who.ok) {
                 const wd = await who.json();
                 const role = wd && wd.user && wd.user.role;
-                signedIn = role === 'standard' || role === 'admin' || role === 'owner';
+                signedIn = role === 'update' || role === 'admin' || role === 'owner';
               }
             } catch (_) {}
             if (!signedIn) {
@@ -3277,6 +3568,7 @@
         }
 
         function schedulePlanningPut() {
+          if (!canUpdateData()) return;
           if (_planningSuppressPut) return;
           if (!_planningLoaded) {
             _planningPutQueued = true;
@@ -3530,33 +3822,14 @@
           syncArrChipUI(panel);
         }
 
-        function ensureArrFilterSidebar() {
-          const anchor = findArrSidebarAnchor();
-          if (!anchor) return false;
+        function removeArrFilterSidebar() {
+          const panel = document.getElementById('vibe-arr-filter');
+          if (panel && panel.parentElement) panel.parentElement.removeChild(panel);
+        }
 
-          let panel = document.getElementById('vibe-arr-filter');
-          const placePanel = function () {
-            if (anchor.classList && anchor.classList.contains('region-filter-sections')) {
-              anchor.appendChild(panel);
-              return;
-            }
-            anchor.parentElement.insertBefore(panel, anchor);
-          };
-          if (!panel) {
-            panel = buildArrFilterPanel();
-            wireArrFilterPanel(panel);
-            placePanel();
-          } else if (anchor.classList && anchor.classList.contains('region-filter-sections')) {
-            if (panel.parentElement !== anchor) anchor.appendChild(panel);
-            else wireArrFilterPanel(panel);
-            syncArrChipUI(panel);
-          } else if (panel.parentElement !== anchor.parentElement || panel.nextElementSibling !== anchor) {
-            placePanel();
-          } else {
-            wireArrFilterPanel(panel);
-            syncArrChipUI(panel);
-          }
-          return true;
+        function ensureArrFilterSidebar() {
+          removeArrFilterSidebar();
+          return false;
         }
 
         function getFilteredAccountNames() {
@@ -3680,6 +3953,7 @@
         }
 
         async function saveAcctFc(payload) {
+          if (!canUpdateData()) return null;
           if (!payload || !payload.account_id) return null;
           try {
             const res = await fetch(
@@ -4224,14 +4498,17 @@
           const owner = (note && note.ownerEmail) ? String(note.ownerEmail).toLowerCase() : '';
           const me = (_currentUser && _currentUser.email) ? String(_currentUser.email).toLowerCase() : '';
           const isAdmin = _currentUser && (_currentUser.role === 'admin' || _currentUser.role === 'owner');
-          const locked = owner && me && owner !== me && !isAdmin;
-          const areas = modal.querySelectorAll('textarea, input[type="text"]');
+          const viewOnly = !canUpdateData();
+          const locked = viewOnly || (owner && me && owner !== me && !isAdmin);
+          const areas = modal.querySelectorAll('textarea, input[type="text"], input[inputmode="decimal"]');
           areas.forEach(function (el) {
-            if (el.hasAttribute('data-vibe-cs-input') || el.hasAttribute('data-vibe-rn-input')) return;
-            if (el.hasAttribute('data-vibe-elt-readonly')) return;
+            if (!viewOnly) {
+              if (el.hasAttribute('data-vibe-cs-input') || el.hasAttribute('data-vibe-rn-input')) return;
+              if (el.hasAttribute('data-vibe-elt-readonly')) return;
+            }
             if (locked) {
               el.setAttribute('readonly', 'true');
-              el.title = 'Only ' + (note.editedByDisplay || owner) + ' can edit this note';
+              el.title = viewOnly ? 'Standard role is view-only' : ('Only ' + (note.editedByDisplay || owner) + ' can edit this note');
             }
           });
           if (locked) {
@@ -4243,7 +4520,9 @@
               const host = modal.querySelector('.acct-modal-main') || modal;
               host.insertBefore(banner, host.firstChild);
             }
-            banner.textContent = 'This note belongs to ' + (note.editedByDisplay || owner) + '. You can view but not edit.';
+            banner.textContent = viewOnly
+              ? 'View only. Your Standard role cannot save notes or forecast calls.'
+              : ('This note belongs to ' + (note.editedByDisplay || owner) + '. You can view but not edit.');
           }
         }
 

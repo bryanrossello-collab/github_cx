@@ -30,7 +30,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from app.config import get_settings
 from app.database import Database, DatabaseUnavailable
 from app.logging_setup import configure_logging
-from app.routes import admin, auth_api, health, refresh, renewals
+from app.routes import admin, auth_api, health, refresh, renewals, weekly_brief
 from app.auth import guest_user, resolve_user
 
 # Paths that never need a DB-provisioned identity. Skipping auth here avoids a
@@ -151,6 +151,28 @@ async def _bring_db_online(app: FastAPI, db: Database) -> None:
         return
 
     try:
+        await db.migrate_weekly_brief_perf()
+    except Exception:
+        # Indexes/backfill are optional. Do not mark the app unready — the
+        # brief still works with live COUNT/MAX subqueries.
+        logger.exception("Weekly brief perf migration failed; continuing")
+
+    try:
+        await db.migrate_weekly_brief_trend()
+    except Exception:
+        logger.exception("Weekly brief trend index failed; continuing")
+
+    try:
+        await db.migrate_weekly_brief_scope()
+    except Exception:
+        logger.exception("Weekly brief scope indexes failed; continuing")
+
+    try:
+        await db.migrate_snapshot_list_cache()
+    except Exception:
+        logger.exception("Snapshot list cache columns failed; continuing")
+
+    try:
         profiles = settings.bootstrap_admin_profiles()
         if profiles:
             n = await db.seed_bootstrap_admins(profiles)
@@ -190,6 +212,13 @@ async def _bring_db_online(app: FastAPI, db: Database) -> None:
     app.state.seeded = seeded
     app.state.started_at = datetime.now(timezone.utc).isoformat()
     logger.info("Startup complete: DB online, seeded=%s", seeded)
+
+    # Last on purpose: the one-off build scans every upload (minutes on a
+    # multi-GB table), and nothing above should wait on it.
+    try:
+        await db.migrate_weekly_brief_official_index()
+    except Exception:
+        logger.exception("Weekly brief official-band index failed; continuing")
 
 
 def _begin_drain(app: FastAPI) -> None:
@@ -301,6 +330,7 @@ def create_app() -> FastAPI:
     app.include_router(admin.router)
     app.include_router(renewals.router)
     app.include_router(renewals.legacy_router)
+    app.include_router(weekly_brief.router)
     app.include_router(refresh.router)
 
     # ----- Static frontend -------------------------------------------------
@@ -316,6 +346,7 @@ def create_app() -> FastAPI:
         return FileResponse(PUBLIC_DIR / "index.html", media_type="text/html")
 
     @app.get("/admin", include_in_schema=False)
+    @app.get("/admin/", include_in_schema=False)
     async def admin_root() -> FileResponse:
         return FileResponse(PUBLIC_DIR / "admin.html", media_type="text/html")
 

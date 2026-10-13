@@ -15,7 +15,7 @@
   var fetchPatched = false;
 
   function isAuthedUser(user) {
-    return !!(user && (user.role === 'standard' || user.role === 'admin' || user.role === 'owner'));
+    return !!(user && (user.role === 'standard' || user.role === 'update' || user.role === 'admin' || user.role === 'owner'));
   }
 
   function shouldEnforce() {

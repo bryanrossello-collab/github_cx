@@ -67,6 +67,7 @@ HEADER_ALIASES: dict[str, list[str]] = {
     "renewal_manager":  ["manager_renewal", "renewal_manager"],
     "products":         ["product_lines", "products"],
     "forecast_summary": ["forecast_summary"],
+    "last_csm_renewal_notes": ["last_csm_renewal_notes", "last_csm_renewal_notes_gc"],
     "cc_reason":        ["cc_reason"],
     "partner":          ["partner_name", "partner"],
     "partner_type":     ["partner_type_c", "partner_type"],

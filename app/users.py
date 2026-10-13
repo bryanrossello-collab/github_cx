@@ -13,7 +13,7 @@ import asyncpg
 class UserRecord:
     email: str
     display_name: str
-    role: str  # 'standard' | 'admin' | 'owner'
+    role: str  # 'standard' | 'update' | 'admin' | 'owner'
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     last_seen_at: Optional[datetime] = None
